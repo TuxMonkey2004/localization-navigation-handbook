@@ -67,8 +67,11 @@
 
 \maketitle
 
-% 表格斑马纹（封面之后生效）
-\rowcolors{2}{structurecolor!4}{white}
+% 表格斑马纹：只在 table 环境内生效。
+% 注意：不能在全局启用 \rowcolors——它会给数学 array（cases/bmatrix/matrix/aligned）
+% 的每一行插入颜色盒，导致 \left...\right 定界符无法正常伸缩（括号变小或消失）。
+\AtBeginEnvironment{table}{\rowcolors{2}{structurecolor!4}{white}}
+\AtEndEnvironment{table}{\rowcolors{1}{}{}}
 
 \frontmatter
 \input{chapters/preface.tex}
