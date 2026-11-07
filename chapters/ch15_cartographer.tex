@@ -1,0 +1,353 @@
+% 本章使用 TikZ 的 arrows.meta / positioning 库（main.tex 与 tests 均已加载，此行幂等无害）
+\usetikzlibrary{arrows.meta, positioning}
+
+\chapter{2D 激光 SLAM：Cartographer}\label{ch:15-cartographer}
+
+\chapterintro{Cartographer 是 Google 在 2016 年开源的激光 SLAM 系统\cite{hess2016cartographer}，也是 RoboMaster 赛场上最常用的 2D 建图方案之一。它把前面几章的知识组装成了一个完整可运行的工程：用``子图''组织地图，用``帧到子图匹配''做前端，用``分支定界''在离散位姿空间里快速找到最优位姿，用``位姿图优化''做全局闭环。本章会按这个顺序逐层拆开：先看系统架构与子图概念，再完整推导扫描匹配的得分函数、双线性插值及其雅可比，然后重点推导分支定界的``上界''为什么成立、为什么能剪枝，最后讲全局 SLAM、IMU/里程计的作用与关键参数。读完本章，你应该能对着 Cartographer 的配置文件说清每个参数在调什么。}
+
+\section{Cartographer 的定位与系统架构}\label{sec:15-arch}
+
+在 Cartographer 之前，2D 激光 SLAM 的主流有两种：Gmapping\cite{grisetti2007gmapping} 用粒子滤波（第~\ref{ch:10-global-loc}~章的粒子滤波在这里被用来``同时定位与建图''），Hector 用无回环的扫描匹配。三者的对比如表~\ref{tab:15-compare}。
+
+\begin{table}[htbp]
+  \centering
+  \caption{三种 2D 激光 SLAM 方案的对比}\label{tab:15-compare}
+  \footnotesize
+  \begin{tabular}{p{0.14\linewidth}p{0.18\linewidth}p{0.20\linewidth}p{0.34\linewidth}}
+    \toprule
+    方案 & 核心方法 & 回环 & 特点与局限 \\
+    \midrule
+    Gmapping & 粒子滤波 + 扫描匹配 & 有（粒子重采样） & 小场景效果好；粒子数随地图增大而增多，大场景计算与内存吃紧 \\
+    Hector & 高斯-牛顿扫描匹配 & 无 & 不需要里程计；但无回环，长距离必漂移 \\
+    Cartographer & 子图 + 分支定界 + 位姿图 & 有（子图间约束） & 大场景实时、回环可靠；配置参数多，需调参 \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+Cartographer 的整体数据流如图~\ref{fig:15-arch}，可以按第~\ref{ch:11-slam-framework}~章的语境一分成两半：
+\begin{itemize}
+  \item \textbf{Local SLAM（前端）}：把每一帧 scan 与当前子图做扫描匹配，求出相对位姿，然后把 scan 插入子图。它连续运行、频率高。
+  \item \textbf{Global SLAM（后端）}：每当一个子图``完成''，就把它与其他历史子图做约束搜索（回环检测），并把所有约束丢进位姿图优化。它低频运行，负责全局一致。
+\end{itemize}
+
+\begin{figure}[htbp]
+  \centering
+  \begin{tikzpicture}[font=\small]
+    \node[block] (s)     at (0,0)    {传感器\\{\footnotesize scan / IMU / odom}};
+    \node[block2] (local) at (3.6,0)  {Local SLAM\\{\footnotesize 扫描匹配 + 插入}};
+    \node[block] (sub)   at (7.2,0)  {子图\\{\footnotesize 概率栅格}};
+    \node[block2] (gs)    at (7.2,-1.9) {Global SLAM\\{\footnotesize 约束 + 位姿图}};
+    \node[block] (out)   at (3.6,-1.9) {优化后位姿\\{\footnotesize 地图 / TF}};
+    \draw[arrow] (s) -- node[label,above]{scan} (local);
+    \draw[arrow] (local) -- node[label,above]{插入} (sub);
+    \draw[arrow] (sub) -- node[label,right]{完成的子图} (gs);
+    \draw[arrow] (gs) -- node[label,below]{全局修正} (out);
+    \draw[arrow, dashed] (out.north) -- node[label,left,align=center]{初值} (local.south);
+    \node[label, anchor=west, align=left] at (9.3,0) {前端：\\局部一致};
+    \node[label, anchor=west, align=left] at (9.3,-1.9) {后端：\\全局一致};
+  \end{tikzpicture}
+  \caption{Cartographer 的系统架构。传感器数据进入 Local SLAM 做帧到子图匹配并插入子图；子图完成后进入 Global SLAM 做约束构建与位姿图优化，优化结果反过来给前端提供位姿初值，并发布地图与 TF。}\label{fig:15-arch}
+\end{figure}
+
+\section{子图：地图的基本单位}\label{sec:15-submap}
+
+\begin{definition}[子图]
+子图（submap）是 Cartographer 中地图的基本单位：它是一张以概率栅格形式存储的局部地图，由连续插入的若干帧 scan 融合而成。每个子图有自己的局部坐标系，子图内的栅格存的是``被占据的 log-odds 值''（与第~\ref{ch:14-mapping}~章完全一致）。当插入的 scan 达到设定数量（参数 \lstinline{num_range_data}，默认 90）后，该子图``完成''，不再更新。
+\end{definition}
+
+用子图而不是一张全局大地图，有三个好处：第一，插入 scan 时只需查局部栅格，内存可控；第二，每个子图有独立的``原点''，避免全局地图越来越大导致的数值精度问题；第三，全局优化时只需要调整``子图位姿''（每个子图一个位姿），变量数大大减少——一张由 20 个子图拼成的地图，位姿图只有 20 多个节点，而不是几千帧。
+
+子图的概率更新沿用第~\ref{ch:14-mapping}~章的 log-odds 公式：射线穿过的格子加``空闲''增量，命中格子加``占据''增量。查询时用
+\begin{equation}
+p(m)=\frac{1}{1+e^{-l(m)}},\qquad \mathrm{odds}(m)=\frac{p(m)}{1-p(m)}=e^{l(m)} .
+\end{equation}
+
+\section{扫描匹配：把 scan 对齐到子图}\label{sec:15-match}
+
+\subsection{得分函数}
+
+设当前 scan 有 $K$ 个点，在 scan 系下的坐标为 $\bm{h}_k=(h_{k,x},h_{k,y})$。要估计的是 scan 系到子图系的位姿 $\xi=(t_x,t_y,\theta)$，写成二维刚体变换
+\begin{equation}
+T_\xi\bm{h}_k=\bm{R}(\theta)\bm{h}_k+\bm{t}
+=\begin{bmatrix}\cos\theta&-\sin\theta\\ \sin\theta&\cos\theta\end{bmatrix}\bm{h}_k+\begin{bmatrix}t_x\\ t_y\end{bmatrix}.
+\end{equation}
+把变换后的点拿到子图上查概率，得分定义为所有点概率之和：
+\begin{equation}
+S(\xi)=\sum_{k=1}^{K}M_{\mathrm{smooth}}\big(T_\xi\bm{h}_k\big),
+\label{eq:15-score}
+\end{equation}
+其中 $M_{\mathrm{smooth}}$ 是子图栅格的双线性插值版本。$S$ 越大，说明``按这个位姿把 scan 放上去，点落在已占据格子里的越多''，位姿越可能正确。Cartographer 要找的就是
+\begin{equation}
+\xi^{\star}=\argmax_{\xi} S(\xi).
+\label{eq:15-argmax}
+\end{equation}
+
+\subsection{双线性插值及其导数}
+
+栅格是离散的，点 $\bm{p}=(x,y)$ 一般落在四个格子中间。最近邻插值会让得分函数变成阶梯状、处处不可导，梯度法就没法用；双线性插值给出连续可导的得分面，所以是标配。
+
+设栅格分辨率为 $r$，把 $\bm{p}$ 换算成栅格坐标：
+\begin{equation}
+\frac{x}{r}=x_0+u,\qquad \frac{y}{r}=y_0+v,\qquad x_0=\left\lfloor\frac{x}{r}\right\rfloor,\ y_0=\left\lfloor\frac{y}{r}\right\rfloor,\ u,v\in[0,1).
+\end{equation}
+记四个相邻格子的概率为 $M_{00}=M(x_0,y_0)$、$M_{10}=M(x_0+1,y_0)$、$M_{01}=M(x_0,y_0+1)$、$M_{11}=M(x_0+1,y_0+1)$。先沿 $x$ 方向插值两次，再沿 $y$ 方向插值一次：
+\begin{align}
+M_{\mathrm{smooth}}(\bm{p})
+&=(1-v)\Big[(1-u)M_{00}+uM_{10}\Big]+v\Big[(1-u)M_{01}+uM_{11}\Big]\notag\\
+&=(1-u)(1-v)M_{00}+u(1-v)M_{10}+(1-u)vM_{01}+uvM_{11}.
+\label{eq:15-bilinear}
+\end{align}
+式~\eqref{eq:15-bilinear} 就是双线性插值：四个角的权重是``到对角的距离''之积，离哪个角越近权重越大。
+
+对 $\bm{p}$ 求偏导时要注意链式法则：$\partial u/\partial x=1/r$、$\partial v/\partial y=1/r$，而 $x_0,y_0$ 在格子内部是常数。于是
+\begin{align}
+\frac{\partial M_{\mathrm{smooth}}}{\partial x}
+&=\frac{1}{r}\Big[(1-v)\big(M_{10}-M_{00}\big)+v\big(M_{11}-M_{01}\big)\Big],
+\label{eq:15-dMdx}\\
+\frac{\partial M_{\mathrm{smooth}}}{\partial y}
+&=\frac{1}{r}\Big[(1-u)\big(M_{01}-M_{00}\big)+u\big(M_{11}-M_{10}\big)\Big].
+\label{eq:15-dMdy}
+\end{align}
+这两个式子是后面雅可比的``上游''：它们告诉你``点移动一点，得分变多少''。
+
+\subsection{非线性最小二乘与雅可比}
+
+把式~\eqref{eq:15-argmax} 的求最大值改写为求最小值：定义残差
+\begin{equation}
+r_k(\xi)=1-M_{\mathrm{smooth}}\big(T_\xi\bm{h}_k\big)\in\R,
+\end{equation}
+则 $\min_\xi\sum_k r_k^2$ 与 $\max_\xi S$ 等价（常数 $K$ 不影响极值点）。对残差做高斯-牛顿迭代，需要残差对位姿的雅可比。链式法则分成两段：\textbf{点对位姿}、\textbf{得分对点}。
+
+第一段：变换后的点对位姿求导。记 $\bm{R}'\bm{h}_k$ 为旋转矩阵对 $\theta$ 求导再作用在点上的结果：
+\begin{equation}
+\frac{\partial (T_\xi\bm{h}_k)}{\partial t_x}=\begin{bmatrix}1\\0\end{bmatrix},\qquad
+\frac{\partial (T_\xi\bm{h}_k)}{\partial t_y}=\begin{bmatrix}0\\1\end{bmatrix},\qquad
+\frac{\partial (T_\xi\bm{h}_k)}{\partial\theta}=\begin{bmatrix}-(h_x\sin\theta+h_y\cos\theta)\\ h_x\cos\theta-h_y\sin\theta\end{bmatrix}.
+\end{equation}
+注意最后一项可以写成 $\bm{J}_2\bm{R}(\theta)\bm{h}_k$，其中
+\begin{equation}
+\bm{J}_2=\begin{bmatrix}0&-1\\1&0\end{bmatrix}
+\end{equation}
+是``逆时针转 $90^{\circ}$''的矩阵。合并成 $2\times3$ 的矩阵：
+\begin{equation}
+\frac{\partial (T_\xi\bm{h}_k)}{\partial\xi}
+=\begin{bmatrix}\bm{I}_2 & \bm{J}_2\bm{R}(\theta)\bm{h}_k\end{bmatrix}\in\R^{2\times3}.
+\label{eq:15-dT-dxi}
+\end{equation}
+
+第二段：把得分梯度式~\eqref{eq:15-dMdx}、式~\eqref{eq:15-dMdy} 与式~\eqref{eq:15-dT-dxi} 相乘，得到残差对位姿的 $1\times3$ 雅可比：
+\begin{equation}
+\bm{J}_k=\frac{\partial r_k}{\partial\xi}
+=-\Big[\frac{\partial M}{\partial x},\ \frac{\partial M}{\partial y}\Big]
+\begin{bmatrix}\bm{I}_2 & \bm{J}_2\bm{R}\bm{h}_k\end{bmatrix}\in\R^{1\times3}.
+\label{eq:15-jac}
+\end{equation}
+它的每一列分别对应``平移 $x$、平移 $y$、旋转 $\theta$ 一点点，得分变多少''。有了 $\bm{J}_k$，高斯-牛顿方程就是（残差是一维，信息矩阵取 1）：
+\begin{equation}
+\Big(\sum_{k}\bm{J}_k^{\top}\bm{J}_k\Big)\delta\bm{\xi}
+=-\sum_{k}\bm{J}_k^{\top}r_k .
+\label{eq:15-gn}
+\end{equation}
+解出 $\delta\bm{\xi}$ 后按 $\xi\leftarrow\xi\oplus\delta\bm{\xi}$ 更新（二维时 $\oplus$ 就是直接相加），重复几轮即可收敛。
+
+\begin{keybox}{扫描匹配的三个``为什么''}
+\textbf{为什么用双线性插值？}为了让得分函数连续可导；最近邻会让 GN 拿不到梯度。\\
+\textbf{为什么只迭代几轮？}匹配只是在给定位姿附近做局部精化，初值由里程计/IMU/上一次位姿给出；跑太多轮既慢又可能被局部极值带偏。\\
+\textbf{为什么还要分支定界？}GN 只能做局部精化，初值差得多时（比如刚开机或回环搜索）会掉进错误的局部极小；此时需要全局搜索，而全局搜索靠分支定界加速。
+\end{keybox}
+
+\section{分支定界：在离散位姿空间里找全局最优}\label{sec:15-bnb}
+
+\subsection{问题与离散化}
+
+回环检测或重定位时，我们不知道大致位姿，只有``可能在这一带''的先验。此时要解的是全局的式~\eqref{eq:15-argmax}。把位姿空间离散化：平移按子图分辨率 $r$ 取整数格，旋转按固定角步长 $\delta_\theta$ 取整。于是在一个窗口内，候选位姿数量是
+\begin{equation}
+N=N_x\cdot N_y\cdot N_\theta ,
+\end{equation}
+典型的回环搜索窗口 $N_x=N_y=100$、$N_\theta=180$（约 $2^{\circ}$ 一档），总数约 $1.8\times10^{6}$。每个候选都要对 $K\sim10^{3}$ 个点查一次子图，直接算就是 $10^{9}$ 次查表，实时不可能。
+
+分支定界（Branch and Bound）是解决``在离散空间里找最大值''的经典方法。它把搜索空间组织成一棵树：根节点代表整个搜索窗口，每个节点代表一个``位姿子集''，节点一分为四（平移二分 $\times$ 旋转二分）。对每个节点，我们不计算精确得分，而是计算一个\textbf{上界}——该子集里任何位姿的得分都不会超过这个上界。于是：若某节点的上界低于``目前已经找到的最好得分''，整棵子树直接剪掉，一个叶子都不用算；否则继续往下分。
+
+\begin{definition}[分支定界]
+分支定界（Branch and Bound）是一类求解离散最优化问题的方法：把候选解集合递归地划分成子集（分支），并给每个子集计算一个``其上所有解的目标值都不会超过''的上界（定界）。搜索时优先处理上界高的子集，一旦某子集的上界低于当前最优解，就剪掉该子集。若上界是紧的（接近真实最大值），可以在远少于穷举的节点数内找到最优解。
+\end{definition}
+
+\subsection{上界的推导}
+
+关键问题：怎么给一个位姿子集算上界，而且算得便宜？答案是用\textbf{预计算的多分辨率栅格}。
+
+设一个节点代表的位姿子集是：平移在以 $\xi_c$ 为中心的半宽 $c_h$ 个格子内，旋转在半宽 $\delta_h$ 内。对子集里的任意位姿 $\xi$ 与任意 scan 点 $\bm{h}_k$，有
+\begin{align}
+\big\|T_\xi\bm{h}_k-T_{\xi_c}\bm{h}_k\big\|
+&=\big\|\bm{R}(\theta)\bm{h}_k+\bm{t}-\bm{R}(\theta_c)\bm{h}_k-\bm{t}_c\big\|\notag\\
+&\le\underbrace{\big\|\bm{R}(\theta)-\bm{R}(\theta_c)\big\|\cdot\|\bm{h}_k\|}_{\text{旋转误差}}
++\underbrace{\|\bm{t}-\bm{t}_c\|}_{\text{平移误差}} .
+\label{eq:15-bound-pos}
+\end{align}
+二维旋转有个好性质：两旋转矩阵之差的作用可以界住角度差，
+\begin{equation}
+\big\|\bm{R}(\theta)-\bm{R}(\theta_c)\big\|_2
+=2\left|\sin\frac{\theta-\theta_c}{2}\right|\le|\theta-\theta_c| .
+\label{eq:15-rot-bound}
+\end{equation}
+（用 $\sin\alpha\le\alpha$ 即得。）由节点定义，$|\theta-\theta_c|\le\delta_h$，$\|\bm{t}-\bm{t}_c\|\le\sqrt{2}\,c_h r$（二维平移偏差最大值是对角线），代回式~\eqref{eq:15-bound-pos}：
+\begin{equation}
+\big\|T_\xi\bm{h}_k-T_{\xi_c}\bm{h}_k\big\|
+\le\delta_h\|\bm{h}_k\|+\sqrt{2}\,c_h r
+\;\triangleq\;\rho_h(\bm{h}_k).
+\label{eq:15-radius}
+\end{equation}
+也就是说：\textbf{子集内任意位姿下，第 $k$ 个点落到的位置，一定在以 $T_{\xi_c}\bm{h}_k$ 为圆心、$\rho_h(\bm{h}_k)$ 为半径的圆内}。
+
+于是对每个深度 $h$，预先算一张``膨胀栅格''：把子图里每个格子的值替换成它周围半径 $\rho_h$ 范围内的最大值，
+\begin{equation}
+M^{h}_{\mathrm{precomp}}(\bm{p})=\max_{\|\bm{q}-\bm{p}\|\le\rho_h}M_{\mathrm{smooth}}(\bm{q}).
+\label{eq:15-precomp}
+\end{equation}
+由式~\eqref{eq:15-radius}，子集内任意位姿下 $M_{\mathrm{smooth}}(T_\xi\bm{h}_k)\le M^{h}_{\mathrm{precomp}}(T_{\xi_c}\bm{h}_k)$。对所有点求和：
+\begin{equation}
+S(\xi)=\sum_k M_{\mathrm{smooth}}(T_\xi\bm{h}_k)
+\le\sum_k M^{h}_{\mathrm{precomp}}\big(T_{\xi_c}\bm{h}_k\big)
+\;\triangleq\;\overline{S}_h(\xi_c).
+\label{eq:15-upperbound}
+\end{equation}
+右边只依赖节点中心位姿 $\xi_c$ 与预计算栅格，查表即可算出——这就是\textbf{上界}。
+
+两个必须讲清的性质：
+\begin{enumerate}
+  \item \textbf{上界是``真上界''}：式~\eqref{eq:15-upperbound} 是严格推导出来的不等式，不是启发式，所以剪枝不会漏掉最优解。
+  \item \textbf{上界随深度单调收紧}：深度越大，$c_h$ 与 $\delta_h$ 越小，由式~\eqref{eq:15-radius} 得到的 $\rho_h$ 越小；$\rho_h$ 越小，式~\eqref{eq:15-precomp} 里取 $\max$ 的范围越小，$M^h_{\mathrm{precomp}}$ 逐点越小。所以\textbf{父节点的上界一定不小于子节点的上界}，这保证搜索树自顶向下``越来越紧''，剪枝才有意义。
+\end{enumerate}
+
+\subsection{搜索策略与伪代码}
+
+搜索用\textbf{优先队列}（每次取出上界最大的节点）最直观：由于父节点的上界不小于子孙，第一个被取出并展开到叶子的节点，其真实得分一定不低于队列里其他所有节点的上界，因此\textbf{第一个到达的叶子就是全局最优解}。这就是``最优优先''的分支定界。
+
+\begin{figure}[htbp]
+  \centering
+  \begin{tikzpicture}[font=\footnotesize]
+    \tikzset{sn/.style={circle, draw=structurecolor, thick, fill=structurecolor!10,
+                        minimum size=8mm, inner sep=1pt}}
+    \node[sn] (r) at (0,0) {9.1};
+    \node[sn] (a) at (-3.6,-1.5) {8.6};
+    \node[sn] (b) at (-1.2,-1.5) {8.9};
+    \node[sn] (c) at (1.2,-1.5) {7.8};
+    \node[sn] (d) at (3.6,-1.5) {8.4};
+    \draw (r) -- (a); \draw (r) -- (b); \draw (r) -- (c); \draw (r) -- (d);
+    \node[sn] (b1) at (-2.4,-3.0) {8.5};
+    \node[sn, fill=structurecolor!35] (b2) at (-1.2,-3.0) {8.8};
+    \node[sn] (b3) at (0.0,-3.0) {8.7};
+    \node[sn] (c1) at (1.2,-3.0) {7.7};
+    \draw (b) -- (b1); \draw (b) -- (b2); \draw (b) -- (b3);
+    \draw (c) -- (c1);
+    % pruned subtree of d
+    \draw[red!60!black, dashed] (d) -- (3.6,-3.0);
+    \node[sn, draw=red!60!black, fill=red!10] at (3.6,-3.0) {$\times$};
+    \node[label, align=center] at (-1.2,-3.9) {最优叶子：得分 $8.8$};
+    \node[label, align=center] at (3.6,-3.9) {上界 $7.8$ 低于当前最优\\$8.5$：整棵剪掉};
+  \end{tikzpicture}
+  \caption{分支定界的示意。圆圈内数字是该节点的上界。优先队列先展开上界 9.1 的根，再展开 8.9 的分支；当 8.8 的叶子被找到后，所有上界小于 8.8 的节点（如 7.8、8.4、8.5）整棵剪掉。上界必须``真''，否则会剪掉最优解。}\label{fig:15-bnb}
+\end{figure}
+
+\begin{pseudo}{分支定界搜索最优位姿}
+  \item 输入：先验位姿 $\xi_0$、搜索窗口、预计算的多层膨胀栅格
+  \item 根节点 $\leftarrow$ 整个窗口，用式~\eqref{eq:15-upperbound} 算上界
+  \item 优先队列 $Q\leftarrow\{\text{根节点}\}$；最优得分 $\mathrm{best}\leftarrow-\infty$
+  \item \textbf{while} $Q$ 非空 \textbf{do}
+  \item \quad 从 $Q$ 取出上界最大的节点 $n$
+  \item \quad \textbf{if} $n.\text{上界}<\mathrm{best}$ \textbf{then} 剪枝，\textbf{continue}
+  \item \quad \textbf{if} $n$ 是叶子 \textbf{then} $\mathrm{best}\leftarrow S(n)$，$\xi^{\star}\leftarrow n.\text{位姿}$，\textbf{continue}
+  \item \quad 把 $n$ 划分成子节点；对每个子节点算上界并放入 $Q$
+  \item \textbf{end while}
+  \item \textbf{return} $\xi^{\star}$
+\end{pseudo}
+
+\subsection{为什么能实时}
+
+遍历所有候选是 $O(N)$，其中 $N=N_xN_yN_\theta$ 可达 $10^{6}$；每个候选算得分又要 $O(K)$，总代价 $O(NK)$。分支定界不会遍历所有叶子：由于上界随深度收紧得很快，大部分分支在高层就被剪掉。实际运行中，一次回环搜索通常只访问 $10^{3}\sim10^{4}$ 个节点，相比 $10^{6}$ 个叶子少了两三个数量级——这就是 Cartographer 能``在后台实时做回环''的原因。当然，最坏情况下（得分面非常平坦、上界很松）它仍会退化为穷举，所以工程上还要限制搜索窗口大小与层数。
+
+\section{全局 SLAM：把子图连成一张图}\label{sec:15-global}
+
+Local SLAM 只保证``子图内部一致''，子图与子图之间会漂移。Global SLAM 要把它们缝起来：
+
+\begin{enumerate}
+  \item \textbf{约束构建（constraint building）}：当有新的 scan 或新子图完成时，在``历史子图''里找可能重叠的那些，用分支定界在粗分辨率上搜索候选相对位姿。若该位姿下的匹配得分超过阈值（参数 \lstinline{min_score}），就把它作为一条``子图—scan 约束''加入位姿图。
+  \item \textbf{回环检测}：本质上就是``在子图集合上做约束搜索''。Cartographer 不是拿两帧点云直接比，而是拿``当前 scan 对历史子图''匹配，这比 Scan Context 那样的描述子更准（直接优化得分），代价是搜索更重，所以要靠分支定界加速。
+  \item \textbf{位姿图优化}：节点是各子图的位姿，边是约束（含协方差），用 Ceres\cite{hess2016cartographer} 做稀疏最小二乘求解（第~\ref{ch:13-backend}~章）。优化后，所有子图位姿被修正，地图重新拼合。
+\end{enumerate}
+
+Cartographer 的位姿图规模很小：一张地图可能只有几十到几百个子图，每条边只连两个节点，海森矩阵极其稀疏，一次优化通常几十毫秒。这与前端每帧的扫描匹配（几毫秒）配合起来，整体可以实时运行。
+
+\section{IMU 与里程计的作用}\label{sec:15-imu}
+
+2D 情形下，IMU 的价值不像 3D LIO 那么大，但仍然有用：
+\begin{itemize}
+  \item \textbf{提供旋转初值}：陀螺仪积分给出 yaw 的短时变化，可以作为扫描匹配的旋转初值，把三维搜索（$x,y,\theta$）里 $\theta$ 的范围缩小。
+  \item \textbf{提供重力方向}：如果雷达不是水平安装，重力方向可以帮助把 scan 投影到水平面；纯 2D 系统里用得少，3D 版本则必须用。
+  \item \textbf{给位姿图加约束}：IMU 的航向角可以作为一条``绝对朝向''约束加进优化，抑制长走廊里的旋转漂移。
+\end{itemize}
+里程计（轮速）的作用更直接：它给出相邻帧之间的平移与旋转估计，作为扫描匹配的初值。没有里程计时，Cartographer 用``上一帧位姿''或匀速模型预测作初值；有里程计时初值更准，匹配更稳。三者都必须做\textbf{时间同步}（第~\ref{ch:03-sensors}~章）：scan、IMU、odom 的时间戳若差几十毫秒，在机器人快速运动时会直接变成位姿误差。
+
+\section{关键参数与调参}\label{sec:15-tuning}
+
+Cartographer 的配置文件（\lstinline{.lua}）参数很多，真正影响效果的是表~\ref{tab:15-params} 这几个。
+
+\begin{table}[htbp]
+  \centering
+  \caption{Cartographer 关键参数及其影响}\label{tab:15-params}
+  \footnotesize
+  \begin{tabular}{p{0.36\linewidth}p{0.12\linewidth}p{0.44\linewidth}}
+    \toprule
+    参数 & 默认值 & 调大 / 调小的后果 \\
+    \midrule
+    \lstinline{submaps.resolution} & 0.05 m & 调小：更精细但内存与计算增大；调大：省资源但细节丢失 \\
+    \lstinline{submaps.num_range_data} & 90 & 调大：子图更大、单图更稳、回环机会少；调小：子图碎、约束多、优化慢 \\
+    \lstinline{constraint_builder.min_score} & 0.55 & 调大：只接受高置信回环，漏检多；调小：回环多但误检风险高 \\
+    \lstinline{optimization_problem.huber_scale} & 1.0 & 调小：对错边更鲁棒；调大：更信任所有约束 \\
+    \lstinline{TRAJECTORY_BUILDER_2D.voxel_filter_size} & 0.025 m & 调大：降采样更狠、更快；调小：保留细节但更慢 \\
+    \lstinline{POSE_GRAPH.optimize_every_n_nodes} & 90 & 调小：优化频繁、更跟手但更耗 CPU；调大：省 CPU 但闭环延迟 \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+调参的顺序建议是：先保证\textbf{数据质量}（时间同步、外参、雷达去畸变），再调\textbf{分辨率与降采样}（决定计算量），最后调\textbf{回环相关参数}（\lstinline{min_score}、优化频率）。顺序反了会陷入``调一个坏一个''的循环。
+
+\section{优缺点与适用场景}\label{sec:15-pros}
+
+\textbf{优点：}回环可靠（子图 + 分支定界 + 位姿图，长距离建图能闭环）；实时性好（分支定界把全局搜索压到可接受的时间）；工程成熟（ROS/ROS 2 集成好，配置项清晰）；只依赖 2D 激光也能跑（可选 IMU/odom），成本低。
+
+\textbf{局限：}第一，2D 假设机器人在地面单层运动，多层场地、坡道、空中场景都不适用，这时要换 3D SLAM（第~\ref{ch:16-lio-evolution}~章与第~\ref{ch:17-advanced-lio}~章）；第二，长走廊、空旷场地存在几何退化（第~\ref{ch:12-frontend}~章），单靠激光会漂移，必须靠 IMU/odom 兜底；第三，参数较多，场景变化大时需要重新调参；第四，子图是``局部''的，超大场景（几万平方米）需要分块建图再拼接。
+
+对 RoboMaster 场景：赛场是单层、结构相对规整、有围挡与固定道具，2D Cartographer 是非常合适的选择；若场地有坡道或需要 3D 避障，则应采用第~\ref{ch:16-lio-evolution}~章起的 LIO 方案。
+
+\begin{summary}
+\begin{enumerate}
+  \item Cartographer 由 Local SLAM（前端：帧到子图匹配 + 插入）与 Global SLAM（后端：约束构建 + 位姿图优化）组成（图~\ref{fig:15-arch}），是第~\ref{ch:11-slam-framework}~章语境一的典型实现。
+  \item 子图是地图的基本单位，本质是一张概率栅格（log-odds），插入 \lstinline{num_range_data} 帧后完成；用子图位姿做全局优化，变量数从``帧数''降到``子图数''。
+  \item 扫描匹配的得分是 $S(\xi)=\sum_k M_{\mathrm{smooth}}(T_\xi\bm{h}_k)$（式~\eqref{eq:15-score}），双线性插值式~\eqref{eq:15-bilinear} 让得分连续可导；其梯度由式~\eqref{eq:15-dMdx}、式~\eqref{eq:15-dMdy} 给出，残差雅可比为式~\eqref{eq:15-jac}，用高斯-牛顿式~\eqref{eq:15-gn} 迭代求解。
+  \item 分支定界把位姿空间组织成树，用预计算膨胀栅格式~\eqref{eq:15-precomp} 给出上界式~\eqref{eq:15-upperbound}；上界严格成立、且随深度单调收紧，因此剪枝不会漏掉最优解，实际访问节点数比穷举少两三个数量级。
+  \item 全局 SLAM 用约束搜索（分支定界）找子图间回环，用 Ceres 做位姿图优化；IMU/odom 提供初值与旋转约束，时间同步是前提。
+  \item 参数调优顺序：数据质量 $\rightarrow$ 分辨率/降采样 $\rightarrow$ 回环与优化频率；2D 单层场景适用，多层与坡道需换 LIO。
+\end{enumerate}
+
+
+\end{summary}
+
+\begin{problemset}
+  \item 式~\eqref{eq:15-bilinear} 中，若点恰好落在格子中心（$u=v=0.5$），四个格子的权重各是多少？这个结果符合直觉吗？
+  \item 为什么扫描匹配的残差定义为 $1-M$ 而不是 $M$？两者对高斯-牛顿的迭代有什么影响？
+  \item 若把式~\eqref{eq:15-radius} 中的平移偏差从 $\sqrt{2}c_h r$ 改成 $2c_h r$，上界会变松还是变紧？变松之后剪枝效率如何变化？
+  \item 分支定界的上界如果取成``节点中心位姿的真实得分''，会有什么后果？为什么说``上界必须真''？
+  \item Cartographer 的位姿图节点是子图而不是每帧 scan，这样做省下了什么？又牺牲了什么？
+  \item 在长走廊里建图，Cartographer 的哪些环节最容易出问题？你会调整表~\ref{tab:15-params} 中的哪些参数、或者引入什么传感器？
+\end{problemset}
+
+\begin{reading}
+\begin{enumerate}
+  \item Hess 等，Cartographer 论文\cite{hess2016cartographer}：本章的原始文献，重点读第 III 节的 ``Local SLAM''、第 IV 节的 ``Branch-and-Bound'' 与第 V 节的 ``Global SLAM''。
+  \item Grisetti 等，Gmapping\cite{grisetti2007gmapping}：粒子滤波 2D SLAM 的代表，用来对照表~\ref{tab:15-compare}。
+  \item 第~\ref{ch:14-mapping}~章：子图的概率栅格更新与 log-odds，本章直接沿用。
+  \item Cartographer 官方文档与 \lstinline{cartographer_ros} 配置示例：调参时对照表~\ref{tab:15-params} 阅读。
+\end{enumerate}
+
+\end{reading}

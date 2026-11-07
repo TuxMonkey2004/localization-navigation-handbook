@@ -1,0 +1,396 @@
+\chapter{局部规划与控制}\label{ch:20-local-planning}
+
+\usetikzlibrary{arrows.meta,positioning,calc,fit,patterns,decorations.pathreplacing}
+
+\chapterintro{全局规划给出的是“大方向”，它只有几何、没有时间，也不考虑机器人此刻的速度、加速度和脚下 1 米内突然出现的障碍。局部规划（local planning）要在这条全局路径附近、在毫秒级的时间里，算出一条未来 1--3 秒真正能执行、不撞障碍、满足底盘约束的轨迹，并把它变成速度指令。本章按“采样—优化—预测控制—梯度优化”的演进线讲四种方法：DWA、TEB、MPC 与 EGO-Planner 式的 B 样条梯度法，再补上人工势场与底盘运动学约束，最后给出 Nav2 四个 controller 插件的选型对比。}
+
+\section{局部规划要解决什么}\label{sec:20-what}
+
+局部规划的输入是：全局路径 $\mathcal{P}$、局部代价地图、当前位姿与速度 $(\bm{x},\bm{u})$、机器人模型（尺寸、$v_{\max}$、$a_{\max}$、$\omega_{\max}$、最小转弯半径）。输出是：未来一段时间的控制序列，或直接是当前时刻的速度指令 $(v,\omega)$。它必须同时满足四件事：
+
+\begin{enumerate}
+  \item \textbf{跟踪}：轨迹要贴着全局路径走，不能偏离太远；
+  \item \textbf{避障}：与障碍保持安全距离，包括代价地图里新出现的动态障碍；
+  \item \textbf{可行}：满足速度、加速度、转角限制，不能算出底盘执行不了的动作；
+  \item \textbf{实时}：10--20 Hz 内算完，因为局部规划要在障碍出现后 100 ms 量级内做出反应。
+\end{enumerate}
+
+先用一个数字把“实时”的分量说清楚：控制周期 50 ms（20 Hz），留给局部规划的计算时间通常要小于 20 ms（剩下的留给通信、TF 查询与控制平滑）。这意味着任何单次迭代超过 20 ms 的方法都必须降频、降精度，或者只在低维空间里做。
+
+\section{DWA：把可行速度采样一遍}\label{sec:20-dwa}
+
+DWA（Dynamic Window Approach）\cite{fox1997dwa} 的思路非常朴素：\textbf{不去设计轨迹，而是枚举“下一时刻可能的速度”，把每个速度对应的短轨迹算出来打分，选最高分的那个执行。}它之所以叫“动态窗口”，是因为待枚举的速度范围受当前速度和加速度限制，是一个随时间“滑动”的窗口。
+
+\subsection{运动模型与动态窗口}
+
+差速底盘（unicycle）的运动学为
+\begin{equation}
+  \dot x=v\cos\theta,\qquad \dot y=v\sin\theta,\qquad \dot\theta=\omega,
+  \label{eq:20-unicycle}
+\end{equation}
+离散化后（步长 $\Delta t$）
+\begin{equation}
+  x_{k+1}=x_k+v\Delta t\cos\theta_k,\quad
+  y_{k+1}=y_k+v\Delta t\sin\theta_k,\quad
+  \theta_{k+1}=\theta_k+\omega\Delta t.
+  \label{eq:20-dwa-model}
+\end{equation}
+对某一个候选 $(v,\omega)$，从当前位姿递推 $N$ 步就得到一条候选轨迹；若轨迹上任意一点落在致命障碍格上，该候选直接淘汰。
+
+可枚举的速度集合是三个集合的交：
+\begin{itemize}
+  \item 硬约束 $V_s=\{(v,\omega)\mid v\in[v_{\min},v_{\max}],\ \omega\in[-\omega_{\max},\omega_{\max}]\}$；
+  \item 动态窗口 $V_d=\{(v,\omega)\mid v\in[v_c-a_v\Delta t,\ v_c+a_v\Delta t],\ \omega\in[\omega_c-a_\omega\Delta t,\ \omega_c+a_\omega\Delta t]\}$，其中 $v_c,\omega_c$ 是当前速度，$a_v,a_\omega$ 是最大线/角加速度；
+  \item 安全约束 $V_a=\{(v,\omega)\mid v\le\sqrt{2\,d_{\mathrm{stop}}(v,\omega)\,a_{\mathrm{brake}}}\}$，表示“以该速度走，还能在撞上之前刹住”。$d_{\mathrm{stop}}$ 是沿该轨迹到最近障碍的距离。
+\end{itemize}
+最终 $V_r=V_s\cap V_d\cap V_a$。举个数：$v_c=0.5\ \mathrm{m/s}$、$a_v=1.0\ \mathrm{m/s^2}$、$\Delta t=0.1\ \mathrm{s}$，则 $v$ 只能取 $[0.4,0.6]$；若 $v_{\max}=1.2$，真正限制搜索的是动态窗口而不是上限——这正是“动态”的意义：速度不能突变。
+
+\subsection{评价函数}
+
+对每个候选 $(v,\omega)$，用三个（或五个）归一化指标打分：
+\begin{align}
+  \mathrm{heading}(v,\omega) &= \pi-\abs{\theta_{\mathrm{goal}}-\theta(t_N)}, \label{eq:20-heading}\\
+  \mathrm{clearance}(v,\omega) &= \min_{k\in[0,N]} d_{\mathrm{obs}}\bigl(x_k,y_k\bigr), \label{eq:20-clear}\\
+  \mathrm{velocity}(v,\omega) &= \abs{v}, \label{eq:20-vel}
+\end{align}
+其中 $\theta_{\mathrm{goal}}=\mathrm{atan2}(y_g-y_0,\ x_g-x_0)$ 是当前点到目标的方位角，$\theta(t_N)$ 是候选轨迹终点的朝向，$d_{\mathrm{obs}}$ 是该点到最近障碍的距离（代价地图的距离变换直接给出）。三项量纲不同，必须先归一化。DWA 原文与 DWB 的常用做法是对所有候选求和后相除：
+\begin{equation}
+  \hat h=\frac{\mathrm{heading}}{\sum\mathrm{heading}},\quad
+  \hat c=\frac{\mathrm{clearance}}{\sum\mathrm{clearance}},\quad
+  \hat v=\frac{\mathrm{velocity}}{\sum\mathrm{velocity}},
+\end{equation}
+然后
+\begin{equation}
+  G(v,\omega)=\alpha\,\hat h+\beta\,\hat c+\gamma\,\hat v,\qquad \alpha+\beta+\gamma=1.
+  \label{eq:20-G}
+\end{equation}
+$\alpha$ 大则“更想朝向目标”，$\beta$ 大则“更想远离障碍”，$\gamma$ 大则“更想跑得快”。三者的物理含义分别是“方向一致性”“安全裕度”“任务效率”。
+
+\begin{table}[htbp]
+  \centering
+  \caption{一个 DWA 打分的数值例子（$T=1\ \mathrm{s}$，$\alpha=0.6$、$\beta=0.3$、$\gamma=0.1$）}
+  \label{tab:20-dwa}
+  \small
+  \begin{tabular}{lccccc}
+    \toprule
+    候选 $(v,\omega)$ & 终点 & $\hat h$ & $\hat c$ & $\hat v$ & $G$ \\
+    \midrule
+    $(0.5,\ 0)$ 直行 & $(0.50,0)$ & 0.852 & 0.89 & 0.50 & 0.828 \\
+    $(0.5,\ 0.5)$ 左转 & $(0.48,0.12)$ & 0.992 & 0.56 & 0.50 & 0.813 \\
+    $(0.5,-0.5)$ 右转 & $(0.48,-0.12)$ & 0.639 & 1.00 & 0.50 & 0.733 \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+表~\ref{tab:20-dwa} 里，左转的朝向得分最高（0.992），但离障碍更近导致安全得分低；右转最安全但方向偏得最多；直行两项都不极端，加权后胜出。这个例子说明两点：第一，\textbf{权重决定行为风格}，把 $\beta$ 调大就会变成“贴墙恐惧症”；第二，\textbf{分数接近时机器人会犹豫}（0.828 与 0.813 只差 0.015），实际 DWB 会对 $G$ 做时间上的低通平滑，避免相邻周期来回切换。
+
+\subsection{为什么能实时，局限在哪}
+
+\begin{figure}[htbp]
+  \centering
+  \begin{tikzpicture}[font=\footnotesize]
+    \draw[arrow] (0,0) -- (3.3,0) node[right] {$v$};
+    \draw[arrow] (0,-1.5) -- (0,1.7) node[above] {$\omega$};
+    \draw[structurecolor!45, dashed] (0.4,-1.3) rectangle (3.0,1.4);
+    \draw[structurecolor, thick] (1.0,-0.9) rectangle (2.4,0.85);
+    \foreach \x in {1.15,1.55,1.95,2.35}
+      \foreach \y in {-0.7,-0.35,0,0.35,0.7}
+        \fill[black!60] (\x,\y) circle (0.6pt);
+    \node[label, structurecolor!70] at (0.5,1.55) {$V_d$};
+    \node[label, structurecolor!70] at (2.85,1.55) {$V_s$};
+    \node[label] at (1.6,1.95) {速度空间};
+    \begin{scope}[xshift=5.4cm]
+      \draw[arrow] (0,0) -- (2.9,0) node[right] {$x$};
+      \draw[arrow] (0,0) -- (0,2.3) node[above] {$y$};
+      \fill[black!18] (2.15,1.35) circle (0.32);
+      \node[black!55, label] at (2.15,0.85) {障碍};
+      \fill[structurecolor!25] (-0.22,-0.18) rectangle (0.22,0.18);
+      \draw[arrow, black!65] (0,0) .. controls (0.7,0.02) and (1.4,0.05) .. (2.1,0.12);
+      \draw[arrow, green!45!black] (0,0) .. controls (0.45,0.5) and (0.85,1.3) .. (0.85,1.85);
+      \draw[arrow, red!60!black] (0,0) .. controls (0.9,-0.35) and (1.9,-0.1) .. (2.35,0.55);
+      \node[label] at (1.45,2.15) {候选轨迹};
+    \end{scope}
+  \end{tikzpicture}
+  \caption{DWA 的两层搜索。左：在速度空间 $(v,\omega)$ 中，粗框是动态窗口 $V_d$，虚框是硬约束 $V_s$，黑点是采样点；右：每个采样点积分出一条短轨迹，撞障碍的淘汰，其余按式~\eqref{eq:20-G} 打分。}
+  \label{fig:20-dwa}
+\end{figure}
+
+计算量很容易估：以 $v$ 方向 10 个、$\omega$ 方向 15 个采样计，共 150 条候选；每条积分 $N=30$ 步、每步 3 个三角函数与一次碰撞查询，总计约 $1.5\times10^4$ 次基本运算，在 20 Hz 的周期里绰绰有余。这就是 DWA 能在 2000 年代的嵌入式 CPU 上跑实时避障的原因。
+
+但 DWA 的缺点同样明显：它只在一步速度空间里做贪心，\textbf{没有全局视野}，容易陷在局部最优（U 形障碍前反复打转）；对“必须倒车才能脱困”的场景无能为力；$T$ 只有 1--2 s，对高速或大惯量平台不够；参数（$\alpha,\beta,\gamma$、分辨率、$T$）与场地强相关，换场地要重调。
+
+\section{TEB：把轨迹变成图优化}\label{sec:20-teb}
+
+TEB（Timed Elastic Band）\cite{rosmann2012teb} 换了个思路：不再枚举控制，而是把轨迹表示成一串带时间戳的位姿，\textbf{把“轨迹好不好”写成一个目标函数，用图优化求解}。
+
+轨迹变量是位姿序列 $\mathcal{Q}=\{\bm{s}_0,\bm{s}_1,\dots,\bm{s}_n\}$，其中 $\bm{s}_k=(x_k,y_k,\beta_k)$（$\beta_k$ 为朝向），相邻位姿之间还有时间间隔 $\Delta T_k>0$。目标函数由五类惩罚组成：
+\begin{equation}
+\begin{aligned}
+J(\mathcal{Q},\Delta T)=\;&
+w_h\sum_k \bigl[\max(0,r_h-d(\bm{s}_k,\mathcal{P}))\bigr]^2
++w_o\sum_k \bigl[\max(0,r_o-d(\bm{s}_k,\mathcal{O}))\bigr]^2\\
+&+J_{\mathrm{kin}}+J_{\mathrm{dyn}}+J_{\mathrm{time}},
+\end{aligned}
+\label{eq:20-teb}
+\end{equation}
+其中
+\begin{align}
+  J_{\mathrm{dyn}} &= \textstyle\sum_k \Bigl[\max(0,\abs{v_k}-v_{\max})^2+\max(0,\abs{a_k}-a_{\max})^2\Bigr], \label{eq:20-teb-dyn}\\
+  J_{\mathrm{kin}} &= \textstyle\sum_k \bigl[(y_{k+1}-y_k)\cos\beta_k-(x_{k+1}-x_k)\sin\beta_k\bigr]^2, \label{eq:20-teb-kin}\\
+  J_{\mathrm{time}} &= \Bigl(\textstyle\sum_k \Delta T_k\Bigr)^2. \label{eq:20-teb-time}
+\end{align}
+
+逐项解释：$d(\bm{s}_k,\mathcal{P})$ 是位姿到全局路径的距离，超过阈值 $r_h$ 才罚，保证“不偏离大方向”；$d(\bm{s}_k,\mathcal{O})$ 是到障碍的距离，小于安全裕度 $r_o$ 才罚，保证“不贴墙”；$J_{\mathrm{kin}}$ 惩罚“斜着走”（速度方向与朝向不一致），这是差速底盘的硬约束；$J_{\mathrm{dyn}}$ 用 $v_k=\Delta s_k/\Delta T_k$ 与 $a_k=(v_{k+1}-v_k)/\Delta T_k$ 约束速度、加速度；$J_{\mathrm{time}}$ 让总时间尽量短（否则机器人会磨蹭）。
+
+式~\eqref{eq:20-teb} 的每一项都只涉及 1--2 个位姿节点，天然是\textbf{稀疏图}：位姿是节点，惩罚项是超边（hyper-edge），时间间隔也是节点。用 g2o\cite{kummerle2011g2o} 建图后，做稀疏 Levenberg--Marquardt 迭代，通常 2--5 次迭代收敛；把上一周期的解作为初值（warm start），10--20 Hz 完全能跑。位姿数 $n$ 通常取 10--30，对应 1--3 s 的轨迹。
+
+\begin{figure}[htbp]
+  \centering
+  \begin{tikzpicture}[font=\footnotesize, scale=1.0]
+    \coordinate (p0) at (0,0.3);
+    \coordinate (p1) at (1.1,0.7);
+    \coordinate (p2) at (2.2,1.3);
+    \coordinate (p3) at (3.1,2.1);
+    \coordinate (p4) at (3.9,3.0);
+    \draw[structurecolor, thick] (p0) -- (p1) -- (p2) -- (p3) -- (p4);
+    \foreach \p in {p0,p1,p2,p3,p4}
+      \fill[structurecolor!25, draw=structurecolor, thick] (\p) circle (0.09);
+    \fill[black!18] (4.2,1.2) circle (0.45);
+    \node[black!60, label] at (4.2,0.6) {障碍};
+    \draw[red!60!black, thick, dashed] (p2) -- (3.75,1.22);
+    \draw[red!60!black, thick, dashed] (p3) -- (3.85,1.49);
+    \node[red!60!black, label] at (3.15,0.95) {$d(\bm{s}_k,\mathcal{O})$};
+    \node[label, fill=white, inner sep=1pt] at (0.55,0.5) {$\Delta T_1$};
+    \node[label, fill=white, inner sep=1pt] at (1.65,1.0) {$\Delta T_2$};
+    \node[label, fill=white, inner sep=1pt] at (2.65,1.7) {$\Delta T_3$};
+    \node[label, fill=white, inner sep=1pt] at (3.5,2.55) {$\Delta T_4$};
+    \node[below, label] at (p0) {$\bm{s}_0$};
+    \node[below, label] at (p1) {$\bm{s}_1$};
+    \node[below, label] at (p2) {$\bm{s}_2$};
+    \node[below, label] at (p3) {$\bm{s}_3$};
+    \node[right, label] at (p4) {$\bm{s}_4$};
+  \end{tikzpicture}
+  \caption{TEB 的图结构：圆形是位姿节点 $\bm{s}_k$（优化变量），相邻位姿之间的连边带时间间隔 $\Delta T_k$，红色虚线是到障碍的“距离惩罚”超边。优化时全体位姿一起移动、时间间隔一起缩放，所以 TEB 能同时改变“路径形状”和“速度分配”。}
+  \label{fig:20-teb}
+\end{figure}
+
+TEB 的好处是轨迹平滑、能处理车式底盘（非完整约束写进 $J_{\mathrm{kin}}$）、能把“时间”也当作优化变量，因此停车、让行、窄道通过都比较自然。代价是：目标函数非凸，初值不好会收敛到局部极小；每周期都要建图求解，CPU 占用比 DWB 高一个量级；参数（$w_h,w_o$、$r_h,r_o$）比 DWA 更难调。
+
+\section{MPC：滚动时域的最优控制}\label{sec:20-mpc}
+
+MPC（Model Predictive Control）\cite{rawlings2017mpc} 是控制理论的标准答案：用模型预测未来 $N$ 步，在每条预测轨迹上优化控制序列，只执行第一步，下一周期再重新预测——这就是\textbf{滚动时域}（receding horizon）。
+
+设离散状态空间模型
+\begin{equation}
+  \bm{x}_{k+1}=\bm{A}\bm{x}_k+\bm{B}\bm{u}_k,
+  \label{eq:20-mpc-model}
+\end{equation}
+其中 $\bm{x}=[x,y,\theta,v,\omega]^{\top}$，$\bm{u}=[a,\alpha]^{\top}$（线加速度、角加速度），$\bm{A},\bm{B}$ 由式~\eqref{eq:20-unicycle} 在当前工作点线性化得到。每个控制周期求解
+\begin{equation}
+  \begin{aligned}
+    \min_{\bm{x}_{1:N},\bm{u}_{0:N-1}}\quad
+    &\sum_{k=0}^{N-1}\bigl(\bm{x}_k-\bm{x}_k^{\mathrm{ref}}\bigr)^{\top}\bm{Q}\bigl(\bm{x}_k-\bm{x}_k^{\mathrm{ref}}\bigr)
+     +\bm{u}_k^{\top}\bm{R}\bm{u}_k
+     +\bigl(\bm{x}_N-\bm{x}_N^{\mathrm{ref}}\bigr)^{\top}\bm{Q}_f\bigl(\bm{x}_N-\bm{x}_N^{\mathrm{ref}}\bigr)\\
+    \text{s.t.}\quad
+    &\bm{x}_{k+1}=\bm{A}\bm{x}_k+\bm{B}\bm{u}_k,\quad \bm{x}_0=\hat{\bm{x}},\\
+    &\bm{u}_{\min}\le\bm{u}_k\le\bm{u}_{\max},\quad \bm{x}_k\in\mathcal{X}_{\mathrm{free}}.
+  \end{aligned}
+  \label{eq:20-mpc}
+\end{equation}
+$\bm{Q}\succeq0$、$\bm{R}\succ0$ 是权重矩阵：$\bm{Q}$ 大则“更想贴合参考轨迹”，$\bm{R}$ 大则“更不想用大加速度”。约束里的 $\mathcal{X}_{\mathrm{free}}$ 是“不撞障碍”，工程上把每个附近障碍近似成半平面 $\bm{a}_j^{\top}\bm{x}\le b_j$ 加进去，于是整个问题变成\textbf{二次规划}（QP），可用 OSQP 之类的稀疏求解器在毫秒级解出。
+
+规模感受一下：$N=20$、状态 5 维、控制 2 维，决策变量 $20\times5+20\times2=140$ 个，约束约几百条，20 Hz 下现代 CPU 完全够用。MPC 与 DWA 的关系可以这样理解：\textbf{DWA 是在离散控制集上做一步贪心，MPC 是在连续控制空间里做 $N$ 步带约束的优化}；DWA 不需要模型（只用运动学积分），MPC 需要模型和求解器，但能显式处理加速度、障碍、终端代价，且天然支持预测动态障碍（把障碍位置写成时间的函数即可）。
+
+\begin{figure}[htbp]
+  \centering
+  \begin{tikzpicture}[font=\footnotesize, scale=1.05]
+    \draw[arrow] (0,0) -- (7.6,0) node[right] {时间};
+    \draw[arrow] (0,0) -- (0,3.2) node[above] {状态};
+    \draw[structurecolor!60, thick]
+      (0.2,0.6) .. controls (1.3,2.5) and (2.4,2.6) .. (3.2,2.35)
+      .. controls (4.2,2.05) and (5.2,1.1) .. (6.2,0.8)
+      .. controls (6.8,0.6) and (7.2,0.55) .. (7.5,0.55);
+    \node[structurecolor!70, label] at (1.3,0.85) {参考轨迹};
+    \draw[structurecolor, thick, dashed]
+      (2.6,2.15) .. controls (3.3,2.3) and (4.0,2.1) .. (4.7,1.75);
+    \foreach \x/\y in {2.85/2.28,3.3/2.3,3.75/2.22,4.2/2.05,4.65/1.82}
+      \draw[structurecolor, thick] (\x-0.12,\y-0.12) rectangle (\x+0.12,\y+0.12);
+    \fill[black!70] (2.6,2.15) circle (2pt);
+    \node[label, below left] at (2.35,1.95) {当前状态 $\hat{\bm{x}}$};
+    \node[structurecolor, label] at (3.7,2.75) {预测时域 $N$ 步};
+    \draw[arrow, red!60!black, thick] (6.4,1.6) -- (7.1,1.6);
+    \node[red!60!black, label, above] at (6.75,1.72) {下一周期整体右移};
+  \end{tikzpicture}
+  \caption{MPC 的滚动时域：每个控制周期都以当前状态为起点，预测未来 $N$ 步并优化；只执行第一步控制，下一周期把时域整体向前平移、用新的测量重新优化。}
+  \label{fig:20-mpc}
+\end{figure}
+
+\section{梯度类方法：B 样条轨迹优化}\label{sec:20-gradient}
+
+DWA 采样、TEB 图优化、MPC 求解 QP，都是在“低维控制/位姿”上做文章。无人机、四足等高速平台更常用\textbf{连续时间轨迹优化}：用 B 样条参数化整条轨迹，直接对控制点求梯度\cite{zhou2019fastplanner,zhou2021egoplanner}。
+
+$p$ 次 B 样条曲线为
+\begin{equation}
+  \bm{p}(t)=\sum_{i=0}^{n}B_{i,p}(t)\,\bm{Q}_i,
+  \label{eq:20-bspline}
+\end{equation}
+其中 $\bm{Q}_i\in\mathbb{R}^3$ 是控制点，$B_{i,p}(t)$ 是基函数。它有两个对规划极有用的性质：\textbf{局部支撑}（改一个控制点只影响相邻 $p+1$ 段）与\textbf{凸包性}（每一段曲线都在相邻 $p+1$ 个控制点的凸包内）。
+
+目标函数通常写成三项之和：
+\begin{equation}
+  J=\lambda_s J_{\mathrm{smooth}}+\lambda_c J_{\mathrm{collision}}+\lambda_d J_{\mathrm{dynamic}}.
+  \label{eq:20-J}
+\end{equation}
+平滑项用二阶差分（近似加速度/曲率）：
+\begin{equation}
+  J_{\mathrm{smooth}}=\sum_{i=1}^{n-1}\norm{\bm{Q}_{i+1}-2\bm{Q}_i+\bm{Q}_{i-1}}^2.
+  \label{eq:20-smooth}
+\end{equation}
+碰撞项需要一个“到障碍的距离场”。经典做法是把地图做成 \textbf{ESDF}（欧氏符号距离场）\cite{oleynikova2017voxblox}：每个体素存“到最近障碍的距离” $d(\bm{p})$，其梯度 $\nabla d(\bm{p})$ 指向远离障碍的方向。碰撞代价取二次惩罚
+\begin{equation}
+  J_{\mathrm{collision}}=\sum_{i}\bigl[\max\bigl(0,\ d_0-d(\bm{Q}_i)\bigr)\bigr]^2,
+  \label{eq:20-coll}
+\end{equation}
+$d_0$ 是安全距离。对控制点求偏导，用链式法则：
+\begin{equation}
+  \frac{\partial J_{\mathrm{collision}}}{\partial \bm{Q}_i}
+  =-2\bigl(d_0-d(\bm{Q}_i)\bigr)\,\nabla d(\bm{Q}_i),
+  \qquad d(\bm{Q}_i)<d_0.
+  \label{eq:20-coll-grad}
+\end{equation}
+举个数值：$d_0=0.5\ \mathrm{m}$、某控制点处 $d=0.2\ \mathrm{m}$，则惩罚为 $(0.3)^2=0.09$，梯度大小为 $2\times0.3=0.6$，方向沿 $\nabla d$（远离障碍），优化后该控制点被推出去。
+
+\begin{pseudo}{ESDF 梯度下降优化一段 B 样条轨迹}
+  \item 用前端搜索（A*/Hybrid A*）给出一条初始轨迹，转成 B 样条控制点 $\bm{Q}_i$
+  \item 重复直到收敛或达到迭代上限：
+  \item \quad 对每个控制点，从 ESDF 查 $d(\bm{Q}_i)$ 与 $\nabla d(\bm{Q}_i)$，按式~\eqref{eq:20-coll-grad} 累加碰撞梯度
+  \item \quad 按式~\eqref{eq:20-smooth} 累加平滑梯度，两项加权求和得 $\partial J/\partial\bm{Q}_i$
+  \item \quad 沿负梯度更新 $\bm{Q}_i$，并检查凸包性质（控制点都不在障碍内则整段安全）
+  \item 输出轨迹，交给控制器跟踪
+\end{pseudo}
+
+EGO-Planner\cite{zhou2021egoplanner} 的关键改进是\textbf{不显式建 ESDF}：它用“碰撞对 $\{\bm{p},\bm{v}\}$”（轨迹上的点与对应的障碍表面点）直接构造惩罚，并利用 B 样条凸包性质保证优化后的轨迹不穿障碍。这省掉了建 ESDF 的内存与计算，代价是碰撞对的维护逻辑更复杂。对 RoboMaster 这类 2D 主要、偶尔上坡的场地，完整的 ESDF 通常负担得起，可以先从 Fast-Planner 思路入手。
+
+\section{人工势场：最直观也最容易卡住}\label{sec:20-apf}
+
+人工势场把目标设成引力源、障碍设成斥力源。引力势与引力（梯度取负）为
+\begin{equation}
+  U_{\mathrm{att}}(\bm{q})=\tfrac12 k_a\norm{\bm{q}-\bm{q}_g}^2,
+  \qquad
+  \bm{F}_{\mathrm{att}}=-\nabla U_{\mathrm{att}}=k_a(\bm{q}_g-\bm{q}).
+  \label{eq:20-att}
+\end{equation}
+斥力势（$\rho$ 为到障碍距离，$\rho_0$ 为影响半径）为
+\begin{equation}
+  U_{\mathrm{rep}}(\bm{q})=
+  \begin{cases}
+    \tfrac12 k_r\left(\dfrac{1}{\rho}-\dfrac{1}{\rho_0}\right)^2, & \rho<\rho_0,\\[6pt]
+    0, & \rho\ge\rho_0,
+  \end{cases}
+  \qquad
+  \bm{F}_{\mathrm{rep}}=k_r\left(\frac{1}{\rho}-\frac{1}{\rho_0}\right)\frac{1}{\rho^2}\,\nabla\rho.
+  \label{eq:20-rep}
+\end{equation}
+数值例子：$k_a=2$，目标 $(5,0)$，当前位置 $(2,0)$，则 $\bm{F}_{\mathrm{att}}=(6,0)$；$k_r=0.5$、$\rho_0=1$、$\rho=0.5$，则 $U_{\mathrm{rep}}=0.25$，$\abs{\bm{F}_{\mathrm{rep}}}=0.5\times(2-1)\times4=2$，方向远离障碍。
+
+势场法的问题是\textbf{局部极小值}：当引力与斥力恰好抵消且不在目标点时，机器人停住。凹形障碍、长墙尽头、目标位于墙后都会出现。改进思路有三类：加随机扰动/模拟退火跳出；用调和函数（满足拉普拉斯方程，理论上无局部极小，但计算贵）；最实用的是\textbf{用全局路径做引导}——沿全局路径取“虚拟目标”，让势场只负责局部避障，这就回到了“全局规划 + 局部规划”的分工。
+
+\section{底盘约束如何进入局部规划}\label{sec:20-kinematics}
+
+局部规划算出的 $(v,\omega)$ 必须能被执行器实现。三种常见底盘：
+
+\textbf{差速}（两轮独立驱动）：设轮距 $b$、左右轮速 $v_l,v_r$，则
+\begin{equation}
+  v=\frac{v_r+v_l}{2},\qquad \omega=\frac{v_r-v_l}{b}.
+  \label{eq:20-diff}
+\end{equation}
+例如 $v_r=1.0\ \mathrm{m/s}$、$v_l=0.6\ \mathrm{m/s}$、$b=0.4\ \mathrm{m}$，得 $v=0.8\ \mathrm{m/s}$、$\omega=1.0\ \mathrm{rad/s}$，转弯半径 $R=v/\omega=0.8\ \mathrm{m}$。约束是 $v_l,v_r\in[-v_{\max},v_{\max}]$，等价于 $v$ 与 $\omega$ 的联合约束（不是矩形）。
+
+\textbf{麦轮}（全向）：四轮速度由底盘速度解算，例如前左轮
+\begin{equation}
+  v_{fl}=v_x-v_y-(l_x+l_y)\omega,
+\end{equation}
+其余三轮按符号变化。麦轮可以横移（$v_y\neq0$），所以局部规划的状态空间可以加一个横向速度，路径不必先转向再前进。
+
+\textbf{阿克曼}（车式）：前轮转角 $\delta$、轴距 $L$，有
+\begin{equation}
+  \omega=\frac{v\tan\delta}{L},\qquad R=\frac{L}{\tan\delta}\ge R_{\min}=\frac{L}{\tan\delta_{\max}}.
+  \label{eq:20-ackermann}
+\end{equation}
+$L=0.6\ \mathrm{m}$、$\delta_{\max}=25^\circ$ 时 $R_{\min}=0.6/0.466=1.29\ \mathrm{m}$。这条约束必须写进规划器：2D 差速用的 DWA 会算出“原地旋转”，阿克曼执行不了，所以要么用 Hybrid A* 做全局规划，要么在局部规划里用 TEB 的 $J_{\mathrm{kin}}$ 或 MPC 的模型约束。
+
+\section{Nav2 的 controller 插件怎么选}\label{sec:20-plugins}
+
+\begin{table}[htbp]
+  \centering
+  \caption{Nav2 常见 controller 插件对比}
+  \label{tab:20-controllers}
+  \small
+  \begin{tabular}{p{2.7cm}p{2.5cm}p{3.1cm}p{3.4cm}}
+    \toprule
+    插件 & 类型 & 优点 & 适用/局限 \\
+    \midrule
+    DWB & 速度采样（DWA 的 Nav2 实现） & 稳、易调、CPU 低 & 差速底盘、中低速；窄道与局部最优弱 \\
+    TEB & 图优化 & 轨迹平滑、支持阿克曼、可倒车 & CPU 高、初值敏感、参数多 \\
+    MPPI & 采样 + 预测控制 & 处理动态障碍、平滑、GPU 友好 & 需要调采样数与温度参数 \\
+    RPP & 纯跟踪几何法 & 极快、路径跟踪准 & 避障弱，靠代价地图限速 \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+新手最常犯的错误是“上来就换 TEB”。正确的顺序是：先用 DWB 把 TF、代价地图、全局规划调通，确认能稳定跟踪；出现“窄道过不去、需要倒车、轨迹抖动”再考虑 TEB 或 MPPI。表~\ref{tab:20-controllers} 里没有“最好”，只有“匹配”。
+
+\begin{lstlisting}[language=Python]
+# Minimal DWB-style scoring (illustrative, not production code)
+def score(candidates, goal, costmap, w=(0.6, 0.3, 0.1)):
+    best, best_g = None, -1.0
+    for v, w_ in candidates:
+        traj = rollout(v, w_, T=1.0, dt=0.05)   # integrate unicycle
+        if collides(traj, costmap):
+            continue
+        h = heading_score(traj[-1], goal)       # pi - |dtheta|
+        c = clearance_score(traj, costmap)      # min obstacle distance
+        s = speed_score(v)                      # |v| / v_max
+        g = w[0] * h + w[1] * c + w[2] * s
+        if g > best_g:
+            best, best_g = (v, w_), g
+    return best
+\end{lstlisting}
+
+\begin{summary}
+
+\begin{enumerate}
+  \item 局部规划在 1--3 s 的滚动窗口内，同时满足跟踪、避障、运动学可行与 20 Hz 实时四项要求。
+  \item DWA 在动态窗口 $V_r=V_s\cap V_d\cap V_a$ 内采样 $(v,\omega)$，积分短轨迹，按式~\eqref{eq:20-G} 加权打分；快但贪心、易陷局部最优。
+  \item TEB 把轨迹写成位姿 + 时间间隔的图，用式~\eqref{eq:20-teb} 的六类惩罚做 g2o 优化；平滑、支持非完整约束，但非凸、CPU 高。
+  \item MPC 用模型预测 $N$ 步、解带约束的 QP、只执行第一步；比 DWA 多模型与约束，比 TEB 更适合显式预测动态障碍。
+  \item 梯度法用 B 样条参数化轨迹，平滑项用二阶差分，碰撞项用 ESDF 的二次惩罚与梯度（式~\eqref{eq:20-coll-grad}），EGO-Planner 用碰撞对避免建 ESDF。
+  \item 人工势场直观但有局部极小；底盘约束（差速式~\eqref{eq:20-diff}、阿克曼式~\eqref{eq:20-ackermann}）必须进入局部规划，否则算出的动作执行不了。
+  \item Nav2 选型：DWB 打底，TEB/MPPI 解决窄道与动态障碍，RPP 用于快速纯跟踪。
+\end{enumerate}
+
+
+\end{summary}
+
+\begin{problemset}
+
+  \item 用式~\eqref{eq:20-dwa-model} 手算：初始位姿 $(0,0,0)$，$v=0.6\ \mathrm{m/s}$、$\omega=0.4\ \mathrm{rad/s}$、$\Delta t=0.1\ \mathrm{s}$，求 5 步后的位姿。
+  \item 在表~\ref{tab:20-dwa} 的数据下，若把 $\beta$ 从 0.3 调到 0.8、$\alpha$ 降到 0.1（保持和为 1），重新排序三个候选，并解释机器人行为会怎样变化。
+  \item TEB 的 $J_{\mathrm{kin}}$ 为什么能表达“不能横移”？如果机器人是麦轮，这一项应该怎么改？
+  \item MPC 的 $\bm{Q}$ 与 $\bm{R}$ 分别调大，对轨迹的跟踪精度与舒适性有什么影响？
+  \item 给定 $L=0.5\ \mathrm{m}$、$\delta_{\max}=30^\circ$，求阿克曼底盘的最小转弯半径；若要求 $R_{\min}\le0.8\ \mathrm{m}$，$\delta_{\max}$ 至少要多大？
+  \item 有人说“DWA 就是 MPC 的特例”，你同意吗？请从目标函数、约束、求解方式三方面比较。
+\end{problemset}
+
+\begin{reading}
+
+\begin{itemize}
+  \item \cite{fox1997dwa}：DWA 原始论文，评价函数与动态窗口的定义都在这里，篇幅不长，适合精读。
+  \item \cite{rosmann2012teb}：TEB 论文，重点看它如何把“时间间隔”也作为优化变量，以及 g2o 图的构建。
+  \item \cite{rawlings2017mpc}：MPC 的标准教材，读第 1--2 章即可建立“滚动时域 + QP”的直觉。
+  \item \cite{zhou2019fastplanner,zhou2021egoplanner}：B 样条轨迹优化的工程实现，重点看碰撞代价的梯度与“无 ESDF”版本的区别。
+\end{itemize}
+
+
+\end{reading}

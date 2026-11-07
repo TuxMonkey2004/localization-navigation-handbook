@@ -1,0 +1,285 @@
+﻿\chapter{多传感器融合定位}\label{ch:09-fusion}
+
+\chapterintro{前面五章分别讲了轮式、IMU、激光、视觉四种里程计，每一种都有自己的死穴：轮式怕打滑、IMU 漂移快、激光怕退化、视觉怕光照。真实系统从来不会只押注一个传感器，而是把它们的信息按各自的可信度加权组合——这就是\textbf{多传感器融合}。本章先讲清融合的层次与松紧耦合的区别，再把卡尔曼融合、序贯更新与批量更新的等价性推完，接着定义信息矩阵与马氏距离并用卡方检验做外点剔除，最后讲时间同步这个「看起来是工程细节、实际上决定成败」的问题。学完本章，你应当能设计一个多传感器融合的架构，并解释为什么 FAST-LIO 和 VINS 要那么写。}
+
+\section{融合的层次与松紧耦合}\label{sec:09-levels}
+
+\subsection{三个融合层次}
+
+按信息被处理的深度，融合分三个层次：
+
+\begin{itemize}
+  \item \textbf{数据级融合}（data-level fusion）：直接融合原始测量。例如把激光点云与相机像素做深度对齐，或把 IMU 与轮速放进同一个滤波器。信息损失最小，但对时间同步与标定要求最高。
+  \item \textbf{特征级融合}（feature-level fusion）：各传感器先提取特征（点云特征、图像特征、轮速积分位姿），再融合特征。多数 LIO/VIO 系统属于这一层。
+  \item \textbf{决策级融合}（decision-level fusion）：各传感器独立算出位姿，再对结果做加权平均或投票。实现最简单，但丢失了传感器间的相关性信息。
+\end{itemize}
+
+\subsection{松耦合与紧耦合}
+
+\begin{definition}[松耦合与紧耦合]
+\textbf{松耦合}（loosely coupled）：每个传感器子系统先独立估计出一个位姿/速度，再把估计结果作为「观测」送进融合滤波器。\textbf{紧耦合}（tightly coupled）：不使用子系统的中间位姿结果，而是把原始测量（原始点云残差、原始像素残差、IMU 预积分）直接放进同一个滤波器或优化器，联合估计状态。
+\end{definition}
+
+\begin{figure}[htbp]
+  \centering
+  \begin{tikzpicture}[node distance=5mm and 9mm]
+    \node[block] (l1) {LiDAR 里程计};
+    \node[block, below=of l1] (v1) {视觉里程计};
+    \node[block, below=of v1] (i1) {IMU 积分};
+    \node[block, right=26mm of v1] (f1) {融合滤波器};
+    \node[block, right=of f1] (o1) {位姿};
+    \draw[-stealth, thick] (l1) -| node[label, above, pos=0.25] {位姿 + 协方差} (f1.north);
+    \draw[-stealth, thick] (v1) -- (f1);
+    \draw[-stealth, thick] (i1) -| (f1.south);
+    \draw[-stealth, thick] (f1) -- (o1);
+    \node[font=\footnotesize, structurecolor] at (2.6,-2.6) {(a) 松耦合};
+    \begin{scope}[xshift=6.4cm]
+      \node[block] (l2) {LiDAR 点云};
+      \node[block, below=of l2] (v2) {图像};
+      \node[block, below=of v2] (i2) {IMU};
+      \node[block, right=26mm of v2] (f2) {联合优化\\（原始残差）};
+      \node[block, right=of f2] (o2) {位姿};
+      \draw[-stealth, thick] (l2) -| (f2.north);
+      \draw[-stealth, thick] (v2) -- (f2);
+      \draw[-stealth, thick] (i2) -| (f2.south);
+      \draw[-stealth, thick] (f2) -- (o2);
+      \node[font=\footnotesize, structurecolor] at (2.6,-2.6) {(b) 紧耦合};
+    \end{scope}
+  \end{tikzpicture}
+  \caption{松耦合与紧耦合。松耦合先把各传感器压成「位姿 + 协方差」再融合，实现简单但会丢失相关性；紧耦合把原始测量直接送入联合估计，信息保留最完整，代价是系统复杂度与标定要求更高。}
+  \label{fig:09-coupling}
+\end{figure}
+
+为什么紧耦合通常更好？松耦合把子系统的估计当作独立观测，但子系统的误差其实与原数据相关（例如激光里程计位姿误差与 IMU 预积分误差共享同一段运动），当成独立会低估不确定性、导致融合权重失真；更重要的是，松耦合在子系统失效时（如激光退化）无法利用其他传感器的原始信息补救。紧耦合则可以在同一个优化里用 IMU 先验补上激光缺失的方向，这正是 FAST-LIO 在长廊里仍能工作的原因（第~\ref{ch:16-lio-evolution}~章）。
+
+\section{卡尔曼融合的统一形式}\label{sec:09-kf}
+
+\subsection{状态增广与观测堆叠}
+
+多传感器融合最直接的实现是\textbf{状态增广}：把所有需要估计的量放进同一个状态向量 $\bm{x}$，每个传感器的测量都写成 $\bm{z}_i=\bm{H}_i\bm{x}+\bm{v}_i$。这样问题就退化成「一个状态、多组观测」的卡尔曼滤波。假设先验 $\bm{x}\sim\mathcal{N}(\hat{\bm{x}}_0,\bm{P}_0)$，两组独立观测 $\bm{z}_1=\bm{H}_1\bm{x}+\bm{v}_1$、$\bm{z}_2=\bm{H}_2\bm{x}+\bm{v}_2$，噪声 $\bm{v}_i\sim\mathcal{N}(\bm{0},\bm{R}_i)$。批量融合的结果是
+\begin{equation}
+  \hat{\bm{x}} = \left(\bm{P}_0^{-1}+\bm{H}_1^{\top}\bm{R}_1^{-1}\bm{H}_1+\bm{H}_2^{\top}\bm{R}_2^{-1}\bm{H}_2\right)^{-1}
+  \left(\bm{P}_0^{-1}\hat{\bm{x}}_0+\bm{H}_1^{\top}\bm{R}_1^{-1}\bm{z}_1+\bm{H}_2^{\top}\bm{R}_2^{-1}\bm{z}_2\right).
+  \label{eq:09-batch}
+\end{equation}
+
+\subsection{序贯更新与批量更新的等价性}
+
+实现上更常见的是序贯更新：先更新 $\bm{z}_1$，把结果作为先验再更新 $\bm{z}_2$。下面证明两者等价。
+
+\textbf{第一步：更新 $\bm{z}_1$。}令 $\bm{\Lambda}_0=\bm{P}_0^{-1}$、$\bm{b}_0=\bm{P}_0^{-1}\hat{\bm{x}}_0$。卡尔曼更新的信息形式为
+\begin{equation}
+  \bm{\Lambda}_1 = \bm{\Lambda}_0+\bm{H}_1^{\top}\bm{R}_1^{-1}\bm{H}_1,
+  \qquad
+  \bm{b}_1 = \bm{b}_0+\bm{H}_1^{\top}\bm{R}_1^{-1}\bm{z}_1,
+  \qquad
+  \hat{\bm{x}}_1=\bm{\Lambda}_1^{-1}\bm{b}_1.
+  \label{eq:09-seq1}
+\end{equation}
+\textbf{第二步：以 $\hat{\bm{x}}_1$ 为先验更新 $\bm{z}_2$。}
+\begin{equation}
+  \bm{\Lambda}_2 = \bm{\Lambda}_1+\bm{H}_2^{\top}\bm{R}_2^{-1}\bm{H}_2,
+  \qquad
+  \bm{b}_2 = \bm{b}_1+\bm{H}_2^{\top}\bm{R}_2^{-1}\bm{z}_2,
+  \qquad
+  \hat{\bm{x}}_2=\bm{\Lambda}_2^{-1}\bm{b}_2.
+\end{equation}
+把式~\eqref{eq:09-seq1} 代入：
+\begin{equation}
+  \bm{\Lambda}_2 = \bm{P}_0^{-1}+\bm{H}_1^{\top}\bm{R}_1^{-1}\bm{H}_1+\bm{H}_2^{\top}\bm{R}_2^{-1}\bm{H}_2,
+\end{equation}
+\begin{equation}
+  \bm{b}_2 = \bm{P}_0^{-1}\hat{\bm{x}}_0+\bm{H}_1^{\top}\bm{R}_1^{-1}\bm{z}_1+\bm{H}_2^{\top}\bm{R}_2^{-1}\bm{z}_2.
+\end{equation}
+这与式~\eqref{eq:09-batch} 完全相同。结论：\textbf{信息形式下，多观测融合就是信息矩阵与信息向量的相加}：
+\begin{equation}
+  \bm{\Lambda} = \bm{P}_0^{-1}+\sum_i\bm{H}_i^{\top}\bm{R}_i^{-1}\bm{H}_i,
+  \qquad
+  \bm{b} = \bm{P}_0^{-1}\hat{\bm{x}}_0+\sum_i\bm{H}_i^{\top}\bm{R}_i^{-1}\bm{z}_i.
+  \label{eq:09-information-sum}
+\end{equation}
+这个结论带来两个实用推论：第一，观测的\textbf{顺序不影响结果}（序贯更新可以任意排列）；第二，每个观测对信息矩阵的贡献是 $\bm{H}_i^{\top}\bm{R}_i^{-1}\bm{H}_i$，与状态维度无关——这就是为什么紧耦合里可以把上千个点云残差直接累加，而不必把它们变成「一个位姿观测」。
+
+\begin{keybox}{松耦合/紧耦合的取舍}
+\begin{enumerate}
+  \item 松耦合适合「传感器模块已经很成熟、接口稳定」的场合，调试简单、故障隔离好；
+  \item 紧耦合适合「单传感器会失效、需要互相补位」的场合，精度更高但对标定、时间同步、状态维数要求更高；
+  \item 工程折中：关键子系统紧耦合（如 IMU + 激光），外围模块松耦合（如全局定位）。
+\end{enumerate}
+\end{keybox}
+
+\section{信息矩阵、马氏距离与卡方检验}\label{sec:09-mahalanobis}
+
+\subsection{信息矩阵}
+
+\begin{definition}[信息矩阵]
+协方差矩阵 $\bm{P}$ 的逆 $\bm{\Lambda}=\bm{P}^{-1}$ 叫\textbf{信息矩阵}（information matrix）。$\bm{P}$ 描述不确定性的大小，$\bm{\Lambda}$ 描述「信息量」的大小：方差越小、信息越多、$\Lambda$ 越大。在线性高斯系统中，融合后的信息矩阵等于各观测信息矩阵之和（式~\eqref{eq:09-information-sum}）。
+\end{definition}
+
+\subsection{马氏距离及其卡方分布}
+
+考虑一个观测残差 $\bm{r}=\bm{z}-\bm{H}\hat{\bm{x}}$。不同残差分量量纲不同，不能直接平方相加，需要按各自的不确定性归一化。设噪声与状态误差独立，真实状态为 $\bm{x}$，先验误差 $\bm{e}=\hat{\bm{x}}-\bm{x}\sim\mathcal{N}(\bm{0},\bm{P})$，则
+\begin{equation}
+  \bm{r} = \bm{z}-\bm{H}\hat{\bm{x}}
+  = \left(\bm{H}\bm{x}+\bm{v}\right)-\bm{H}\left(\bm{x}+\bm{e}\right)
+  = \bm{v}-\bm{H}\bm{e}.
+  \label{eq:09-residual}
+\end{equation}
+它的协方差为（用了 $\bm{v}$ 与 $\bm{e}$ 独立、均为零均值）
+\begin{equation}
+  \E\left[\bm{r}\bm{r}^{\top}\right]
+  = \E\left[\bm{v}\bm{v}^{\top}\right]+\bm{H}\E\left[\bm{e}\bm{e}^{\top}\right]\bm{H}^{\top}
+  = \bm{R}+\bm{H}\bm{P}\bm{H}^{\top} = \bm{S}.
+  \label{eq:09-S}
+\end{equation}
+\textbf{马氏距离}（Mahalanobis distance）定义为用 $\bm{S}$ 归一化后的平方：
+\begin{equation}
+  d^{2} = \bm{r}^{\top}\bm{S}^{-1}\bm{r}
+  = \bm{r}^{\top}\left(\bm{H}\bm{P}\bm{H}^{\top}+\bm{R}\right)^{-1}\bm{r}.
+  \label{eq:09-mahalanobis}
+\end{equation}
+
+\textbf{为什么它服从卡方分布？}对 $\bm{S}$ 做特征分解 $\bm{S}=\bm{U}\bm{\Lambda}_S\bm{U}^{\top}$（$\bm{U}$ 正交、$\bm{\Lambda}_S$ 对角正定），定义
+\begin{equation}
+  \bm{y} = \bm{\Lambda}_S^{-1/2}\bm{U}^{\top}\bm{r}.
+\end{equation}
+由于 $\bm{r}$ 是零均值高斯，$\bm{y}$ 也是零均值高斯；其协方差为
+\begin{equation}
+  \E\left[\bm{y}\bm{y}^{\top}\right]
+  = \bm{\Lambda}_S^{-1/2}\bm{U}^{\top}\bm{S}\,\bm{U}\bm{\Lambda}_S^{-1/2}
+  = \bm{\Lambda}_S^{-1/2}\bm{\Lambda}_S\bm{\Lambda}_S^{-1/2}=\bm{I}.
+\end{equation}
+即 $\bm{y}$ 的各分量是独立标准正态变量。于是
+\begin{equation}
+  d^{2} = \bm{r}^{\top}\bm{S}^{-1}\bm{r}
+  = \bm{r}^{\top}\bm{U}\bm{\Lambda}_S^{-1}\bm{U}^{\top}\bm{r}
+  = \bm{y}^{\top}\bm{y} = \sum_{i=1}^{m}y_i^{2}\ \sim\ \chi^{2}(m),
+  \label{eq:09-chi2}
+\end{equation}
+其中 $m$ 是残差维数。卡方分布的定义见第~\ref{ch:02-math}~章。直观上：$d^{2}$ 是「$m$ 个独立标准正态变量的平方和」，它超过某个阈值的概率可以查表。
+
+\textbf{用于外点剔除。}若观测是内点，$d^{2}$ 应落在卡方分布的高概率区间；若超出 $1-\alpha$ 分位数，就认为该观测异常并拒绝。对 $m=3$、$\alpha=0.05$，阈值 $\chi^{2}_{3,0.95}=7.815$；$\alpha=0.01$ 时阈值 $11.345$。工程上要注意：外点剔除必须基于「先验 + 观测」的$\bm{S}$，而不是只基于观测噪声 $\bm{R}$，否则会把「先验本来就不确定」的情况误判为外点。
+
+\begin{pseudo}{序贯融合与卡方检验}
+  \item 初始化先验 $\hat{\bm{x}}_0,\ \bm{P}_0$
+  \item 对每个传感器观测 $\bm{z}_i=\bm{H}_i\bm{x}+\bm{v}_i$：
+  \item \quad 计算残差 $\bm{r}_i\leftarrow\bm{z}_i-\bm{H}_i\hat{\bm{x}}$
+  \item \quad 计算新息协方差 $\bm{S}_i\leftarrow\bm{H}_i\bm{P}\bm{H}_i^{\top}+\bm{R}_i$
+  \item \quad 计算 $d_i^{2}\leftarrow\bm{r}_i^{\top}\bm{S}_i^{-1}\bm{r}_i$，若 $d_i^{2}$ 超过卡方阈值则拒绝该观测
+  \item \quad $\bm{K}_i\leftarrow\bm{P}\bm{H}_i^{\top}\bm{S}_i^{-1}$
+  \item \quad $\hat{\bm{x}}\leftarrow\hat{\bm{x}}+\bm{K}_i\bm{r}_i$，$\bm{P}\leftarrow(\bm{I}-\bm{K}_i\bm{H}_i)\bm{P}$
+  \item 输出融合位姿与协方差
+\end{pseudo}
+
+\section{因子图视角：融合就是最大后验}\label{sec:09-factorgraph}
+
+卡尔曼滤波是「逐时刻递推」的融合，而因子图（factor graph）是「全局一起解」的融合。把所有测量写成残差 $\bm{r}_i(\bm{x})$，假设残差零均值、协方差 $\bm{\Sigma}_i$，则最大后验估计（MAP）为
+\begin{equation}
+  \hat{\bm{x}} = \argmin_{\bm{x}}\sum_i\norm{\bm{r}_i(\bm{x})}_{\bm{\Sigma}_i}^{2}
+  = \argmin_{\bm{x}}\sum_i\bm{r}_i(\bm{x})^{\top}\bm{\Sigma}_i^{-1}\bm{r}_i(\bm{x}),
+  \label{eq:09-map}
+\end{equation}
+其中 $\norm{\bm{r}}^{2}_{\bm{\Sigma}}=\bm{r}^{\top}\bm{\Sigma}^{-1}\bm{r}$ 是马氏距离平方。对线性高斯情形，每个残差的雅可比为 $\bm{H}_i$，令梯度为零：
+\begin{equation}
+  \sum_i\bm{H}_i^{\top}\bm{\Sigma}_i^{-1}\left(\bm{r}_i^{0}+\bm{H}_i\delta\bm{x}\right)=\bm{0}
+  \ \Longrightarrow\
+  \left(\sum_i\bm{H}_i^{\top}\bm{\Sigma}_i^{-1}\bm{H}_i\right)\delta\bm{x}
+  = -\sum_i\bm{H}_i^{\top}\bm{\Sigma}_i^{-1}\bm{r}_i^{0}.
+  \label{eq:09-gn}
+\end{equation}
+左边正是式~\eqref{eq:09-information-sum} 的信息矩阵累加。也就是说：\textbf{滤波与优化在「信息形式」下是同一个东西}——滤波是优化在马尔可夫假设下的一种增量、递推解法。因子图的详细推导与求解见第~\ref{ch:13-backend}~章，可参考 \cite{dellaert2017factorgraphs}。
+
+\section{时间同步与延时补偿}\label{sec:09-time}
+
+前面所有公式都隐含一个假设：参与融合的测量是「同一时刻」的。现实中这是最容易出错的地方。
+
+\textbf{为什么 10\,ms 会致命？}设机器人以 $2\,\mathrm{m/s}$ 运动，时间戳错 $10\,\mathrm{ms}$，则位姿的对应位置偏差约
+\begin{equation}
+  \delta p \approx v\,\delta t = 2\times0.01=0.02\,\mathrm{m}=2\,\mathrm{cm}.
+\end{equation}
+对激光里程计来说，$2\,\mathrm{cm}$ 的偏差在配准时会变成系统性残差，滤波器会把它当作「真实运动」去修正，于是状态被持续拖偏；如果时间错的是旋转量（角速度 $1\,\mathrm{rad/s}$ 错 $10\,\mathrm{ms}$ 即 $0.57\degree$），姿态也会被带偏。更隐蔽的是，时间戳错误往往表现为「缓慢漂移 + 偶发跳变」，很难归因。
+
+\textbf{补偿方法。}设测量时刻为 $t$，需要把它对齐到统一时刻 $t_0$。若已有两个时刻的位姿 $T_a(T_a\text{ at }t_a)$、$T_b(T_b\text{ at }t_b)$，用 $\mathrm{SE}(3)$ 插值：
+\begin{equation}
+  T(t) = T_a\exp\left(\alpha\,\log\left(T_a^{-1}T_b\right)\right),
+  \qquad
+  \alpha=\frac{t-t_a}{t_b-t_a},
+  \label{eq:09-interp}
+\end{equation}
+其中 $\log(\cdot)$ 是 $\exp(\cdot)$ 的逆映射（把 $SE(3)$ 元素变回六维 twist）。$\alpha=0$ 时得到 $T_a$，$\alpha=1$ 时得到 $T_b$，中间按指数映射平滑过渡。若只有速度，也可以做一阶补偿：$T(t)\approx T_a\exp((t-t_a)\bm{\xi}^{\wedge})$。
+
+工程上还有两件事必须做：一是\textbf{统一时钟}——相机、IMU、激光的驱动都把时间戳打到同一时钟源（ROS 2 用 \texttt{node->now()} 或硬件触发）；二是\textbf{检查频率与延迟}——用 \texttt{ros2 topic hz} 与 \texttt{ros2 topic delay} 确认没有丢帧与过大延迟。ROS 2 的 \texttt{message\_filters} 提供 \texttt{ApproximateTime} 策略，可以在时间戳不完全一致时按最近邻配对，但它只是「配对」，并不能消除真正的延时误差。
+
+\begin{figure}[htbp]
+  \centering
+  \begin{tikzpicture}[scale=1.0]
+    \draw[-stealth, thick] (0,0) -- (10.5,0) node[right, font=\footnotesize] {时间};
+    \foreach \x/\lab in {1/相机, 3/IMU, 5/激光, 7/相机, 9/IMU} {
+      \draw[thick] (\x,0.1) -- (\x,-0.35);
+      \node[font=\footnotesize, rotate=45, anchor=north east] at (\x,-0.35) {\lab};
+    }
+    \draw[thick, structurecolor] (3,0.25) -- (7,0.25);
+    \draw[-stealth, structurecolor] (3,0.25) -- (3,0.55);
+    \draw[-stealth, structurecolor] (7,0.25) -- (7,0.55);
+    \node[font=\footnotesize, structurecolor, above] at (5,0.55) {IMU 预积分区间};
+    \draw[<->, red!60!black] (5,1.35) -- (6.6,1.35) node[midway, above, font=\footnotesize] {$\delta t$ 延时};
+    \draw[dashed, red!60!black] (5,1.3) -- (5.8,-0.3);
+    \draw[dashed, red!60!black] (6.6,1.3) -- (6.6,-0.3);
+  \end{tikzpicture}
+  \caption{时间同步示意。不同传感器的时间戳必须对齐到同一时钟；若激光帧的位姿被错误地关联到 $\delta t$ 之前的状态，残差里就会混入 $v\,\delta t$ 的系统偏差。}
+  \label{fig:09-time}
+\end{figure}
+
+\section{典型融合架构}\label{sec:09-arch}
+
+\textbf{FAST-LIO（激光 + IMU 紧耦合）}\cite{xu2022fastlio2}：用迭代扩展卡尔曼滤波（IEKF）把激光点到面残差直接作为观测更新，状态含位置、速度、姿态、零偏与重力；IMU 负责预测，激光负责更新；点云通过增量式 KD 树直接配准到地图，不需要提取特征。它的核心优势是把「激光退化方向靠 IMU 先验补」写进了同一个滤波器。详见第~\ref{ch:17-advanced-lio}~章。
+
+\textbf{VINS-Mono（视觉 + IMU 紧耦合）}\cite{qin2018vinsmono}：视觉重投影残差与 IMU 预积分残差放进滑动窗口联合优化，窗口滑出时边缘化；视觉前端用光流跟踪，后端用 Ceres 求解。详见第~\ref{ch:16-lio-evolution}~章与第~\ref{ch:13-backend}~章。
+
+\textbf{Z-Localization（前后端分离）}\cite{zloc2026}：前端做高频的里程计与局部跟踪，后端做低频的全局匹配与位姿图优化；前后端通过位姿与协方差解耦，兼顾实时性与全局一致性。详见第~\ref{ch:23-zlocalization}~章。
+
+\begin{keybox}{融合系统的排错顺序}
+\begin{enumerate}
+  \item 先查时间戳：每个话题的 header.stamp 是否单调、是否来自同一时钟；
+  \item 再查外参：传感器之间的 $T_{SB}$ 是否标定、符号是否正确；
+  \item 再查协方差：$\bm{R}$、$\bm{Q}$ 的量级是否与真实噪声匹配（过大/过小都会让融合偏科）；
+  \item 最后才调参数：在数据一致的前提下，融合参数才是有意义的。
+\end{enumerate}
+\end{keybox}
+
+\begin{summary}
+
+\begin{enumerate}
+  \item 融合分数据级、特征级、决策级；按接口分松耦合与紧耦合，紧耦合保留原始测量、精度更高，代价是复杂度与标定要求。
+  \item 状态增广后多传感器融合就是「一个状态、多组观测」；信息形式下融合 = 信息矩阵与信息向量相加：$\bm{\Lambda}=\bm{P}_0^{-1}+\sum\bm{H}_i^{\top}\bm{R}_i^{-1}\bm{H}_i$。
+  \item 序贯更新与批量更新在信息形式下完全等价，观测顺序不影响结果。
+  \item 信息矩阵 $\bm{\Lambda}=\bm{P}^{-1}$；马氏距离 $d^{2}=\bm{r}^{\top}(\bm{H}\bm{P}\bm{H}^{\top}+\bm{R})^{-1}\bm{r}$，在零均值高斯假设下服从 $\chi^{2}(m)$。
+  \item 卡方检验用于外点剔除：$d^{2}>\chi^{2}_{m,1-\alpha}$ 时拒绝观测；$\bm{S}$ 必须包含先验不确定性。
+  \item 因子图把融合写成 MAP：$\min\sum\norm{\bm{r}_i}^{2}_{\bm{\Sigma}_i}$，线性化后的正规方程与信息滤波一致。
+  \item 时间同步是融合成败的关键：$2\,\mathrm{m/s}$ 下 $10\,\mathrm{ms}$ 错位就是 $2\,\mathrm{cm}$；用 $\mathrm{SE}(3)$ 插值补偿，并用统一时钟源避免错误。
+  \item 典型架构：FAST-LIO（激光-IMU 紧耦合）、VINS-Mono（视觉-IMU 紧耦合）、Z-Localization（前后端分离）。
+\end{enumerate}
+
+
+\end{summary}
+
+\begin{problemset}
+
+  \item 用一维情形验证式~\eqref{eq:09-batch}：两个观测 $z_1=x+v_1$、$z_2=x+v_2$，方差分别为 $r_1,r_2$，先验方差 $p_0$，分别用批量与序贯公式求后验方差，验证相同。
+  \item 证明式~\eqref{eq:09-information-sum}：从卡尔曼更新的信息形式出发，写出 $\bm{P}^{-1}$ 的更新式，并说明为什么观测顺序无关。
+  \item 推导式~\eqref{eq:09-residual} 与式~\eqref{eq:09-S}，说明为什么 $\bm{r}$ 的协方差不是 $\bm{R}$。
+  \item 对 $m=2$、$\alpha=0.05$ 求卡方阈值（查表或记忆），并解释为什么外点剔除阈值不能直接用 $\bm{R}$ 归一化。
+  \item 某系统相机在 $t=1.000\,\mathrm{s}$、IMU 在 $t=1.008\,\mathrm{s}$ 各有一组数据，机器人速度 $1.5\,\mathrm{m/s}$、角速度 $0.8\,\mathrm{rad/s}$，估算不对齐造成的位移与角度偏差。
+  \item 解释为什么「FAST-LIO 在长廊里仍能用」而「纯激光里程计会退化」，用本章的紧耦合概念与第~\ref{ch:07-lidar-odom}~章的退化分析回答。
+\end{problemset}
+
+\begin{reading}
+
+\begin{itemize}
+  \item Thrun 等《Probabilistic Robotics》第 2--3 章：高斯滤波与信息形式的经典推导。
+  \item Dellaert 的因子图教程（\href{https://gtsam.org/}{gtsam.org}）：从 MAP 到因子图的完整视角。
+  \item FAST-LIO2 论文与代码（\href{https://github.com/hku-mars/FAST_LIO}{GitHub}）：紧耦合 IEKF 的工程实现。
+\end{itemize}
+
+
+\end{reading}

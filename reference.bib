@@ -1,0 +1,520 @@
+% ============================================================
+%  reference.bib —— 全书参考文献（由 Lead 维护，撰稿人请勿修改）
+%
+%  可用 key 一览（正文只能 \cite 这些 key）：
+%  LOAM/LIO：zhang2014loam, shan2018lego, shan2020liosam, xu2021fastlio,
+%            xu2022fastlio2, he2023pointlio, yuan2022voxelmap,
+%            yuan2022fastlivo, yuan2024fastlivo2, lin2022r3live,
+%            shan2021lvisam, chen2023dlio, vizzo2023kissicp
+%  2D SLAM： hess2016cartographer, grisetti2007gmapping, fox2003amcl,
+%            biber2003ndt, kummerle2011g2o
+%  基础理论：besl1992icp, dellaert2017factorgraphs, sola2017eskf,
+%            forster2017preintegration, forster2015preintegration,
+%            kalman1960, mahony2008, madgwick2011, thrun2005probabilistic,
+%            barfoot2017state, kim2018scancontext
+%  视觉：   qin2018vinsmono, campos2021orbslam3, engel2018dso,
+%            mourikis2007msckf
+%  导航：   macenski2020nav2, macenski2022ros2, fox1997dwa,
+%            rosmann2012teb, dolgov2010hybridastar, hart1968astar,
+%            harabor2011jps, karaman2011rrtstar, zhou2021egoplanner,
+%            zhou2019fastplanner, yang2022farplanner, cao2022tare,
+%            rawlings2017mpc, oleynikova2017voxblox
+%  地图：   hornung2013octomap, curless1996tsdf
+%  开源项目：zloc2026, gprobe2026, equi2023
+% ============================================================
+
+@inproceedings{zhang2014loam,
+  author    = {Zhang, Ji and Singh, Sanjiv},
+  title     = {{LOAM}: Lidar Odometry and Mapping in Real-time},
+  booktitle = {Robotics: Science and Systems (RSS)},
+  year      = {2014},
+  doi       = {10.15607/RSS.2014.X.007}
+}
+
+@inproceedings{shan2018lego,
+  author    = {Shan, Tixiao and Englot, Brendan},
+  title     = {{LeGO-LOAM}: Lightweight and Ground-Optimized Lidar Odometry and Mapping on Variable Terrain},
+  booktitle = {IEEE/RSJ International Conference on Intelligent Robots and Systems (IROS)},
+  year      = {2018},
+  pages     = {4758--4765},
+  doi       = {10.1109/IROS.2018.8594299}
+}
+
+@inproceedings{shan2020liosam,
+  author    = {Shan, Tixiao and Englot, Brendan and Meyers, Dave and Wang, Wei and Ratti, Carlo and Rus, Daniela},
+  title     = {{LIO-SAM}: Tightly-coupled Lidar Inertial Odometry via Smoothing and Mapping},
+  booktitle = {IEEE/RSJ International Conference on Intelligent Robots and Systems (IROS)},
+  year      = {2020},
+  pages     = {5135--5142},
+  doi       = {10.1109/IROS45743.2020.9341176}
+}
+
+@article{xu2021fastlio,
+  author  = {Xu, Wei and Zhang, Fu},
+  title   = {{FAST-LIO}: A Fast, Robust {LiDAR}-Inertial Odometry Package by Tightly-Coupled Iterated {Kalman} Filter},
+  journal = {IEEE Robotics and Automation Letters},
+  year    = {2021},
+  volume  = {6},
+  number  = {2},
+  pages   = {3317--3324},
+  doi     = {10.1109/LRA.2021.3064227}
+}
+
+@article{xu2022fastlio2,
+  author  = {Xu, Wei and Cai, Yixi and He, Dongjiao and Lin, Jiarong and Zhang, Fu},
+  title   = {{FAST-LIO2}: Fast Direct {LiDAR}-Inertial Odometry},
+  journal = {IEEE Transactions on Robotics},
+  year    = {2022},
+  volume  = {38},
+  number  = {4},
+  pages   = {2053--2071},
+  doi     = {10.1109/TRO.2021.3128032}
+}
+
+@article{he2023pointlio,
+  author  = {He, Dongjiao and Xu, Wei and Chen, Nan and Kong, Fanze and Yuan, Chongjian and Zhang, Fu},
+  title   = {{Point-LIO}: Robust High-Bandwidth {LiDAR}-Inertial Odometry},
+  journal = {Advanced Intelligent Systems},
+  year    = {2023},
+  volume  = {5},
+  number  = {6},
+  pages   = {2200459},
+  doi     = {10.1002/aisy.202200459}
+}
+
+@article{yuan2022voxelmap,
+  author  = {Yuan, Chongjian and Xu, Wei and Liu, Xiyuan and Hong, Xiaoping and Zhang, Fu},
+  title   = {Efficient and Probabilistic Adaptive Voxel Mapping for Accurate Online {LiDAR} Odometry},
+  journal = {IEEE Robotics and Automation Letters},
+  year    = {2022},
+  volume  = {7},
+  number  = {3},
+  pages   = {8518--8525},
+  doi     = {10.1109/LRA.2022.3187268}
+}
+
+@inproceedings{yuan2022fastlivo,
+  author    = {Yuan, Chongjian and Liu, Xiyuan and Hong, Xiaoping and Zhang, Fu},
+  title     = {{FAST-LIVO}: Fast and Sparse {LiDAR}-Inertial-Visual Odometry},
+  booktitle = {IEEE/RSJ International Conference on Intelligent Robots and Systems (IROS)},
+  year      = {2022},
+  pages     = {1633--1639},
+  doi       = {10.1109/IROS47612.2022.9982049}
+}
+
+@article{yuan2024fastlivo2,
+  author  = {Yuan, Chongjian and Xu, Wei and Liu, Xiyuan and Hong, Xiaoping and Zhang, Fu},
+  title   = {{FAST-LIVO2}: Fast, Direct {LiDAR}-Inertial-Visual Odometry},
+  journal = {IEEE Transactions on Robotics},
+  year    = {2024},
+  volume  = {40},
+  pages   = {1--18},
+  doi     = {10.1109/TRO.2024.3422052}
+}
+
+@inproceedings{lin2022r3live,
+  author    = {Lin, Jiarong and Zhang, Fu},
+  title     = {{R3LIVE}: A Robust, Real-time, {RGB}-colored, {LiDAR}-Inertial-Visual Tightly-coupled State Estimation and Mapping Package},
+  booktitle = {IEEE International Conference on Robotics and Automation (ICRA)},
+  year      = {2022},
+  pages     = {10672--10678},
+  doi       = {10.1109/ICRA46639.2022.9811607}
+}
+
+@inproceedings{shan2021lvisam,
+  author    = {Shan, Tixiao and Englot, Brendan and Ratti, Carlo and Rus, Daniela},
+  title     = {{LVI-SAM}: Tightly-coupled Lidar-Visual-Inertial Odometry via Smoothing and Mapping},
+  booktitle = {IEEE International Conference on Robotics and Automation (ICRA)},
+  year      = {2021},
+  pages     = {5693--5699},
+  doi       = {10.1109/ICRA48506.2021.9561996}
+}
+
+@inproceedings{chen2023dlio,
+  author    = {Chen, Kenny and Nemiroff, Ryan and Lopez, Blake},
+  title     = {Direct {LiDAR}-Inertial Odometry: Lightweight {LIO} with Continuous-Time Motion Correction},
+  booktitle = {IEEE International Conference on Robotics and Automation (ICRA)},
+  year      = {2023},
+  pages     = {3983--3989},
+  doi       = {10.1109/ICRA48891.2023.10160508}
+}
+
+@article{vizzo2023kissicp,
+  author  = {Vizzo, Ignacio and Guadagnino, Tiziano and Mersch, Benedikt and Wiesmann, Louis and Behley, Jens and Stachniss, Cyrill},
+  title   = {{KISS-ICP}: In Defense of Point-to-Point {ICP} -- Simple, Accurate, and Robust Registration If Done the Right Way},
+  journal = {IEEE Robotics and Automation Letters},
+  year    = {2023},
+  volume  = {8},
+  number  = {2},
+  pages   = {1029--1036},
+  doi     = {10.1109/LRA.2023.3236571}
+}
+
+@inproceedings{hess2016cartographer,
+  author    = {Hess, Wolfgang and Kohler, Damon and Rapp, Holger and Andor, Daniel},
+  title     = {Real-Time Loop Closure in {2D} {LIDAR} {SLAM}},
+  booktitle = {IEEE International Conference on Robotics and Automation (ICRA)},
+  year      = {2016},
+  pages     = {1271--1278},
+  doi       = {10.1109/ICRA.2016.7487258}
+}
+
+@article{grisetti2007gmapping,
+  author  = {Grisetti, Giorgio and Stachniss, Cyrill and Burgard, Wolfram},
+  title   = {Improved Techniques for Grid Mapping with {Rao-Blackwellized} Particle Filters},
+  journal = {IEEE Transactions on Robotics},
+  year    = {2007},
+  volume  = {23},
+  number  = {1},
+  pages   = {34--46},
+  doi     = {10.1109/TRO.2006.889486}
+}
+
+@article{fox2003amcl,
+  author  = {Fox, Dieter},
+  title   = {Adapting the Sample Size in Particle Filters Through {KLD}-Sampling},
+  journal = {International Journal of Robotics Research},
+  year    = {2003},
+  volume  = {22},
+  number  = {12},
+  pages   = {985--1003},
+  doi     = {10.1177/0278364903022012001}
+}
+
+@inproceedings{biber2003ndt,
+  author    = {Biber, Peter and Strasser, Wolfgang},
+  title     = {The Normal Distributions Transform: A New Approach to Laser Scan Matching},
+  booktitle = {IEEE/RSJ International Conference on Intelligent Robots and Systems (IROS)},
+  year      = {2003},
+  pages     = {2743--2748},
+  doi       = {10.1109/IROS.2003.1249285}
+}
+
+@inproceedings{besl1992icp,
+  author    = {Besl, Paul J. and McKay, Neil D.},
+  title     = {A Method for Registration of {3-D} Shapes},
+  booktitle = {IEEE Transactions on Pattern Analysis and Machine Intelligence},
+  year      = {1992},
+  volume    = {14},
+  number    = {2},
+  pages     = {239--256},
+  doi       = {10.1109/34.121791}
+}
+
+@book{dellaert2017factorgraphs,
+  author    = {Dellaert, Frank and Kaess, Michael},
+  title     = {Factor Graphs for Robot Perception},
+  publisher = {Foundations and Trends in Robotics},
+  year      = {2017},
+  doi       = {10.1561/2300000043}
+}
+
+@misc{sola2017eskf,
+  author       = {Sol{\`a}, Joan},
+  title        = {Quaternion Kinematics for the Error-State {Kalman} Filter},
+  year         = {2017},
+  eprint       = {1711.02508},
+  archivePrefix= {arXiv},
+  primaryClass = {cs.CV}
+}
+
+@article{forster2017preintegration,
+  author  = {Forster, Christian and Carlone, Luca and Dellaert, Frank and Scaramuzza, Davide},
+  title   = {On-Manifold Preintegration for Real-Time Visual-Inertial Odometry},
+  journal = {IEEE Transactions on Robotics},
+  year    = {2017},
+  volume  = {33},
+  number  = {1},
+  pages   = {1--21},
+  doi     = {10.1109/TRO.2016.2597321}
+}
+
+@inproceedings{forster2015preintegration,
+  author    = {Forster, Christian and Carlone, Luca and Dellaert, Frank and Scaramuzza, Davide},
+  title     = {{IMU} Preintegration on Manifold for Efficient Visual-Inertial Maximum-a-Posteriori Estimation},
+  booktitle = {Robotics: Science and Systems (RSS)},
+  year      = {2015},
+  doi       = {10.15607/RSS.2015.XI.006}
+}
+
+@article{kalman1960,
+  author  = {Kalman, Rudolf E.},
+  title   = {A New Approach to Linear Filtering and Prediction Problems},
+  journal = {Journal of Basic Engineering},
+  year    = {1960},
+  volume  = {82},
+  number  = {1},
+  pages   = {35--45},
+  doi     = {10.1115/1.3662552}
+}
+
+@article{mahony2008,
+  author  = {Mahony, Robert and Hamel, Tarek and Pflimlin, Jean-Michel},
+  title   = {Nonlinear Complementary Filters on the Special Orthogonal Group},
+  journal = {IEEE Transactions on Automatic Control},
+  year    = {2008},
+  volume  = {53},
+  number  = {5},
+  pages   = {1203--1218},
+  doi     = {10.1109/TAC.2008.923738}
+}
+
+@inproceedings{madgwick2011,
+  author    = {Madgwick, Sebastian O. H. and Harrison, Andrew J. L. and Vaidyanathan, Ravi},
+  title     = {Estimation of {IMU} and {MARG} Orientation Using a Gradient Descent Algorithm},
+  booktitle = {IEEE International Conference on Rehabilitation Robotics (ICORR)},
+  year      = {2011},
+  pages     = {1--7},
+  doi       = {10.1109/ICORR.2011.5975346}
+}
+
+@book{thrun2005probabilistic,
+  author    = {Thrun, Sebastian and Burgard, Wolfram and Fox, Dieter},
+  title     = {Probabilistic Robotics},
+  publisher = {MIT Press},
+  year      = {2005}
+}
+
+@book{barfoot2017state,
+  author    = {Barfoot, Timothy D.},
+  title     = {State Estimation for Robotics},
+  publisher = {Cambridge University Press},
+  year      = {2017}
+}
+
+@inproceedings{kim2018scancontext,
+  author    = {Kim, Giseop and Kim, Ayoung},
+  title     = {{Scan Context}: Egocentric Spatial Descriptor for Place Recognition within {3D} Point Cloud Map},
+  booktitle = {IEEE/RSJ International Conference on Intelligent Robots and Systems (IROS)},
+  year      = {2018},
+  pages     = {4802--4809},
+  doi       = {10.1109/IROS.2018.8593953}
+}
+
+@article{qin2018vinsmono,
+  author  = {Qin, Tong and Li, Peiliang and Shen, Shaojie},
+  title   = {{VINS-Mono}: A Robust and Versatile Monocular Visual-Inertial State Estimator},
+  journal = {IEEE Transactions on Robotics},
+  year    = {2018},
+  volume  = {34},
+  number  = {4},
+  pages   = {1143--1155},
+  doi     = {10.1109/TRO.2018.2853729}
+}
+
+@article{campos2021orbslam3,
+  author  = {Campos, Carlos and Elvira, Richard and Rodr{\'i}guez, Juan J. G{\'o}mez and Montiel, Jos{\'e} M. M. and Tard{\'o}s, Juan D.},
+  title   = {{ORB-SLAM3}: An Accurate Open-Source Library for Visual, Visual-Inertial and Multi-Map {SLAM}},
+  journal = {IEEE Transactions on Robotics},
+  year    = {2021},
+  volume  = {37},
+  number  = {6},
+  pages   = {1874--1890},
+  doi     = {10.1109/TRO.2021.3075644}
+}
+
+@article{engel2018dso,
+  author  = {Engel, Jakob and Koltun, Vladlen and Cremers, Daniel},
+  title   = {Direct Sparse Odometry},
+  journal = {IEEE Transactions on Pattern Analysis and Machine Intelligence},
+  year    = {2018},
+  volume  = {40},
+  number  = {3},
+  pages   = {611--625},
+  doi     = {10.1109/TPAMI.2017.2658577}
+}
+
+@inproceedings{mourikis2007msckf,
+  author    = {Mourikis, Anastasios I. and Roumeliotis, Stergios I.},
+  title     = {A Multi-State Constraint {Kalman} Filter for Vision-aided Inertial Navigation},
+  booktitle = {IEEE International Conference on Robotics and Automation (ICRA)},
+  year      = {2007},
+  pages     = {3565--3572},
+  doi       = {10.1109/ROBOT.2007.363958}
+}
+
+@inproceedings{macenski2020nav2,
+  author    = {Macenski, Steve and Mart{\'i}n, Francisco and White, Ruffin and Gin{\'e}s Clavero, Jonatan},
+  title     = {The {Marathon 2}: A Navigation System},
+  booktitle = {IEEE/RSJ International Conference on Intelligent Robots and Systems (IROS)},
+  year      = {2020},
+  pages     = {2718--2725},
+  doi       = {10.1109/IROS45743.2020.9340862}
+}
+
+@article{macenski2022ros2,
+  author  = {Macenski, Steven and Foote, Tully and Gerkey, Brian and Lalancette, Chris and Woodall, William},
+  title   = {Robot Operating System 2: Design, Architecture, and Uses in the Wild},
+  journal = {Science Robotics},
+  year    = {2022},
+  volume  = {7},
+  number  = {66},
+  pages   = {eabm6074},
+  doi     = {10.1126/scirobotics.abm6074}
+}
+
+@article{fox1997dwa,
+  author  = {Fox, Dieter and Burgard, Wolfram and Thrun, Sebastian},
+  title   = {The Dynamic Window Approach to Collision Avoidance},
+  journal = {IEEE Robotics and Automation Magazine},
+  year    = {1997},
+  volume  = {4},
+  number  = {1},
+  pages   = {23--33},
+  doi     = {10.1109/100.580977}
+}
+
+@inproceedings{rosmann2012teb,
+  author    = {R{\"o}smann, Christoph and Feiten, Wendelin and W{\"o}sch, Thomas and Hoffmann, Frank and Bertram, Torsten},
+  title     = {Trajectory Modification Considering Dynamic Constraints of Autonomous Robots},
+  booktitle = {German Conference on Robotics (ROBOTIK)},
+  year      = {2012},
+  pages     = {74--79}
+}
+
+@inproceedings{dolgov2010hybridastar,
+  author    = {Dolgov, Dmitri and Thrun, Sebastian and Montemerlo, Michael and Diebel, James},
+  title     = {Practical Search Techniques in Path Planning for Autonomous Driving},
+  booktitle = {AAAI Workshop on Intelligent Vehicle Systems},
+  year      = {2010}
+}
+
+@article{hart1968astar,
+  author  = {Hart, Peter E. and Nilsson, Nils J. and Raphael, Bertram},
+  title   = {A Formal Basis for the Heuristic Determination of Minimum Cost Paths},
+  journal = {IEEE Transactions on Systems Science and Cybernetics},
+  year    = {1968},
+  volume  = {4},
+  number  = {2},
+  pages   = {100--107},
+  doi     = {10.1109/TSSC.1968.300136}
+}
+
+@inproceedings{harabor2011jps,
+  author    = {Harabor, Daniel and Grastien, Alban},
+  title     = {Online Graph Pruning for Pathfinding on Grid Maps},
+  booktitle = {AAAI Conference on Artificial Intelligence},
+  year      = {2011},
+  pages     = {1114--1119}
+}
+
+@article{karaman2011rrtstar,
+  author  = {Karaman, Sertac and Frazzoli, Emilio},
+  title   = {Sampling-based Algorithms for Optimal Motion Planning},
+  journal = {International Journal of Robotics Research},
+  year    = {2011},
+  volume  = {30},
+  number  = {7},
+  pages   = {846--894},
+  doi     = {10.1177/0278364911406761}
+}
+
+@article{zhou2021egoplanner,
+  author  = {Zhou, Xin and Wang, Zhepei and Ye, Hongkai and Xu, Chao and Gao, Fei},
+  title   = {{EGO-Planner}: An {ESDF}-Free Gradient-Based Local Planner for Quadrotors},
+  journal = {IEEE Robotics and Automation Letters},
+  year    = {2021},
+  volume  = {6},
+  number  = {2},
+  pages   = {478--485},
+  doi     = {10.1109/LRA.2020.3043694}
+}
+
+@article{zhou2019fastplanner,
+  author  = {Zhou, Boyu and Gao, Fei and Wang, Luqi and Liu, Chuhao and Shen, Shaojie},
+  title   = {Robust and Efficient Quadrotor Trajectory Generation for Fast Autonomous Flight},
+  journal = {IEEE Robotics and Automation Letters},
+  year    = {2019},
+  volume  = {4},
+  number  = {4},
+  pages   = {3529--3536},
+  doi     = {10.1109/LRA.2019.2927938}
+}
+
+@article{yang2022farplanner,
+  author  = {Yang, Fan and Cao, Chao and Zhu, Hongbiao and Oh, Jean and Zhang, Ji},
+  title   = {{FAR Planner}: Fast, Attemptable Route Planner for Navigation in Known and Unknown Environments},
+  journal = {IEEE/RSJ International Conference on Intelligent Robots and Systems (IROS)},
+  year    = {2022},
+  pages   = {5293--5299},
+  doi     = {10.1109/IROS47612.2022.9981164}
+}
+
+@inproceedings{cao2022tare,
+  author    = {Cao, Chao and Zhu, Hongbiao and Yang, Fan and Xia, Yukun and Choset, Howie and Zhang, Ji},
+  title     = {Autonomous Exploration Development Environment and the Planning Algorithms},
+  booktitle = {IEEE International Conference on Robotics and Automation (ICRA)},
+  year      = {2022},
+  pages     = {4805--4811},
+  doi       = {10.1109/ICRA46639.2022.9812330}
+}
+
+@book{rawlings2017mpc,
+  author    = {Rawlings, James B. and Mayne, David Q. and Diehl, Moritz M.},
+  title     = {Model Predictive Control: Theory, Computation, and Design},
+  publisher = {Nob Hill Publishing},
+  edition   = {2nd},
+  year      = {2017}
+}
+
+@inproceedings{oleynikova2017voxblox,
+  author    = {Oleynikova, Helen and Taylor, Zachary and Fehr, Marius and Siegwart, Roland and Nieto, Juan},
+  title     = {{Voxblox}: Incremental {3D} {ESDFs} for Onboard Planning},
+  booktitle = {IEEE/RSJ International Conference on Intelligent Robots and Systems (IROS)},
+  year      = {2017},
+  pages     = {6024--6030},
+  doi       = {10.1109/IROS.2017.8206504}
+}
+
+@article{hornung2013octomap,
+  author  = {Hornung, Armin and Wurm, Kai M. and Bennewitz, Maren and Stachniss, Cyrill and Burgard, Wolfram},
+  title   = {{OctoMap}: An Efficient Probabilistic {3D} Mapping Framework Based on Octrees},
+  journal = {Autonomous Robots},
+  year    = {2013},
+  volume  = {34},
+  number  = {3},
+  pages   = {189--206},
+  doi     = {10.1007/s10514-012-9321-0}
+}
+
+@inproceedings{curless1996tsdf,
+  author    = {Curless, Brian and Levoy, Marc},
+  title     = {A Volumetric Method for Building Complex Models from Range Images},
+  booktitle = {ACM SIGGRAPH},
+  year      = {1996},
+  pages     = {303--312},
+  doi       = {10.1145/237170.237269}
+}
+
+@inproceedings{kummerle2011g2o,
+  author    = {K{\"u}mmerle, Rainer and Grisetti, Giorgio and Strasdat, Hauke and Konolige, Kurt and Burgard, Wolfram},
+  title     = {{g2o}: A General Framework for Graph Optimization},
+  booktitle = {IEEE International Conference on Robotics and Automation (ICRA)},
+  year      = {2011},
+  pages     = {3607--3613},
+  doi       = {10.1109/ICRA.2011.5979949}
+}
+
+@misc{zloc2026,
+  author       = {mozihe},
+  title        = {{Z-Localization}: 2026 {东北大学 T-DT} {RoboMaster} 哨兵定位开源},
+  year         = {2026},
+  howpublished = {GitHub repository},
+  url          = {https://github.com/mozihe/z-localization}
+}
+
+@misc{gprobe2026,
+  title        = {{G-PROBE}: Cross-{FOV} Place Recognition and Certainty-Coupled Localization for {3D} Point Clouds},
+  year         = {2026},
+  eprint       = {2607.06782},
+  archivePrefix= {arXiv},
+  primaryClass = {cs.RO}
+}
+
+@misc{equi2023,
+  title        = {Equivariant Symmetries for Inertial Navigation Systems},
+  year         = {2023},
+  eprint       = {2309.03765},
+  archivePrefix= {arXiv},
+  primaryClass = {cs.RO}
+}

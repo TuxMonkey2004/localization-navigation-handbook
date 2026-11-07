@@ -1,0 +1,315 @@
+﻿\chapter{视觉里程计与 VIO}\label{ch:08-visual-odom}
+
+\chapterintro{相机每秒送来几十张图像，每张图里有成千上万个「特征」，本质上是把三维世界压扁成二维。视觉里程计（VO）要做的，就是从这一串二维投影里反推出相机的三维运动。本章按「相机怎么成像 → 特征怎么匹配 → 运动怎么求解」的顺序展开：先把针孔模型与畸变讲透，再推对极几何与三角化，接着用重投影误差把位姿优化写出来，然后介绍直接法与 VIO 的三条主流路线（MSCKF、VINS-Mono、ORB-SLAM3），最后说清单目尺度不可观这一根本局限。学完本章，你应当能看懂 ORB-SLAM 与 VINS 前端在算什么。}
+
+\section{相机模型与畸变}\label{sec:08-camera}
+
+\subsection{针孔模型}
+
+最简单的成像模型是\textbf{针孔模型}（pinhole model）：光线从物体出发，穿过光心，落在成像平面上。设相机系 $C$ 的原点在光心，$z$ 轴朝前（光轴方向），$x$ 轴向右、$y$ 轴向下（与图像坐标一致）。空间点 ${}^{C}\bm{X}=[X,Y,Z]^{\top}$ 投影到成像平面上的坐标为 $(X/Z,Y/Z)$（用相似三角形：成像平面距光心 $f$，则像高与物高的比等于像距与物距的比）。
+
+像素坐标还要经过缩放与平移。设焦距以像素为单位为 $f_x,f_y$（$f_x=f/s_x$，$s_x$ 是单个像素的物理宽度），主点（光轴与成像平面的交点）像素坐标为 $(c_x,c_y)$，则
+\begin{equation}
+  u = f_x\frac{X}{Z}+c_x,
+  \qquad
+  v = f_y\frac{Y}{Z}+c_y.
+  \label{eq:08-projection}
+\end{equation}
+写成齐次坐标：
+\begin{equation}
+  Z\begin{bmatrix}u\\v\\1\end{bmatrix}
+  = \underbrace{\begin{bmatrix}
+    f_x & 0 & c_x\\
+    0 & f_y & c_y\\
+    0 & 0 & 1
+  \end{bmatrix}}_{\bm{K}}
+  \begin{bmatrix}X\\Y\\Z\end{bmatrix}.
+  \label{eq:08-K}
+\end{equation}
+矩阵 $\bm{K}$ 叫\textbf{内参矩阵}（intrinsic matrix），它只与相机本身有关；$f_x,f_y,c_x,c_y$ 叫\textbf{内参}。记号 $\pi(\cdot)$ 表示把三维点投影到像素平面，$\pi^{-1}$ 表示「给定深度」时的反投影。
+
+\begin{example}[一组典型的 USB 相机内参]
+分辨率 $640\times480$，$f_x=f_y=500$，$c_x=320$、$c_y=240$。空间点 $[1,0.5,5]^{\top}\,\mathrm{m}$ 的投影像素为
+\begin{equation}
+  u=500\times\frac{1}{5}+320=420,
+  \qquad
+  v=500\times\frac{0.5}{5}+240=290,
+\end{equation}
+即位于图像右半边、中心偏下。若该点深度从 $5\,\mathrm{m}$ 变到 $10\,\mathrm{m}$，像素 $u$ 会从 420 移到 $500/10+320=370$：深度翻倍，像素向主点靠近一半。
+\end{example}
+
+\subsection{径向与切向畸变}
+
+真实镜头不是理想针孔，直线在图像里会变成曲线。工程上采用如下畸变模型：先把像素坐标转成归一化坐标 $x=(u-c_x)/f_x$、$y=(v-c_y)/f_y$，令 $r^{2}=x^{2}+y^{2}$，
+\begin{align}
+  x_{\text{dist}} &= x\left(1+k_1r^{2}+k_2r^{4}+k_3r^{6}\right)
+  + 2p_1xy+p_2\left(r^{2}+2x^{2}\right), \label{eq:08-dist-x}\\
+  y_{\text{dist}} &= y\left(1+k_1r^{2}+k_2r^{4}+k_3r^{6}\right)
+  + p_1\left(r^{2}+2y^{2}\right)+2p_2xy, \label{eq:08-dist-y}
+\end{align}
+其中 $k_1,k_2,k_3$ 是\textbf{径向畸变}系数（$k_1<0$ 表现为桶形畸变），$p_1,p_2$ 是\textbf{切向畸变}系数（由镜头与成像面不平行引起）。最后再乘回内参得到畸变后的像素坐标。
+
+\textbf{去畸变。}标定得到的是「畸变后像素 → 归一化坐标」的映射，而后续几何计算需要「无畸变像素」。由于式~\eqref{eq:08-dist-x} 不可解析求逆，工程上用迭代法：以畸变点 $x_d$ 为初值，反复执行
+\begin{equation}
+  x \leftarrow \frac{x_d-2p_1xy-p_2\left(r^{2}+2x^{2}\right)}{1+k_1r^{2}+k_2r^{4}+k_3r^{6}},
+  \label{eq:08-undistort}
+\end{equation}
+（$y$ 同理）直到 $x$ 的变化小于阈值。多数库（OpenCV \texttt{undistort}）的做法是预先算好整幅图像的映射表，运行时查表，速度更快。
+
+\begin{keybox}{相机模型的三个易错点}
+\begin{enumerate}
+  \item 图像 $v$ 轴向下：$c_y$ 与 $y$ 方向不要搞反，否则三角化出的三维点会上下颠倒。
+  \item 内参来自标定：$f_x$ 与 $f_y$ 可以不相等（非方形像素），不要强行假设相等。
+  \item 畸变系数作用于\textbf{归一化坐标}：先除内参再去畸变，顺序不能反。
+\end{enumerate}
+\end{keybox}
+
+\section{特征点法视觉里程计}\label{sec:08-feature}
+
+VO 的两大流派是特征点法与直接法。本节先讲特征点法：先在图像里找「好认的点」，再在两张图之间匹配它们，最后用匹配点求运动。
+
+\begin{definition}[特征点与描述子匹配]
+\textbf{特征点}（feature point / keypoint）是图像中可重复检测、对光照和小视角变化稳定的位置，如角点。\textbf{描述子}（descriptor）是描述该点邻域外观的向量，用于判断两个特征点是否是同一物理点。\textbf{描述子匹配}（descriptor matching）指按描述子距离为两帧特征点建立对应关系，常用欧氏距离（SIFT）或汉明距离（ORB 的二进制描述子）。
+\end{definition}
+
+\textbf{检测与描述。}FAST 特征检测角点：以像素 $p$ 为中心、半径 3 的圆上取 16 个像素，若其中连续一段（如 9 个）都明显亮于或暗于 $p$，则 $p$ 是角点。ORB 在 FAST 基础上加了方向（用灰度质心法算主方向）与旋转不变的 BRIEF 二进制描述子（256 bit），匹配时用汉明距离（两串二进制不同位的个数），可以用位运算快速计算。匹配后常做\textbf{比值检验}（ratio test）：对每个特征点，若最近与次近描述子距离之比小于 0.7 才接受匹配，这能剔除大量误匹配。
+
+\textbf{运动求解的两条路。}匹配点若都是二维像素，用对极几何求相对位姿（2D-2D）；若其中一帧有深度（RGB-D 或三角化过），用 PnP 求位姿（3D-2D）；若两帧都有三维点，用 ICP（第~\ref{ch:07-lidar-odom}~章）。下面依次推导。
+
+\subsection{对极几何：2D-2D 的约束}
+
+设同一空间点在两帧相机系下的坐标为 $\bm{X}_1,\bm{X}_2$，两帧间的位姿变换为 $\bm{X}_2=\bm{R}\bm{X}_1+\bm{t}$，归一化像点为 $\bm{x}_1=\bm{X}_1/Z_1$、$\bm{x}_2=\bm{X}_2/Z_2$（即 $Z[\bm{x}^{\top},1]^{\top}=\bm{X}$）。关键观察：$\bm{x}_2$、$\bm{R}\bm{x}_1$、$\bm{t}$ 三个向量共面，因为 $\bm{X}_2=Z_1\bm{R}\bm{x}_1+\bm{t}$，而 $\bm{x}_2$ 与 $\bm{X}_2$ 平行。三个共面向量的混合积为零：
+\begin{equation}
+  \bm{x}_2^{\top}\left(\bm{t}\times\bm{R}\bm{x}_1\right)=0
+  \quad\Longleftrightarrow\quad
+  \bm{x}_2^{\top}\bm{t}^{\wedge}\bm{R}\,\bm{x}_1=0,
+  \label{eq:08-epipolar}
+\end{equation}
+其中 $\bm{t}^{\wedge}$ 是反对称矩阵，满足 $\bm{t}^{\wedge}\bm{x}=\bm{t}\times\bm{x}$。式~\eqref{eq:08-epipolar} 就是\textbf{对极约束}（epipolar constraint），它说明「一对匹配点」就提供了关于 $\bm{R},\bm{t}$ 的一个标量方程。定义
+\begin{equation}
+  \bm{E}=\bm{t}^{\wedge}\bm{R},\qquad
+  \bm{F}=\bm{K}_2^{-\top}\bm{E}\,\bm{K}_1^{-1},
+  \label{eq:08-E-F}
+\end{equation}
+其中 $\bm{E}$ 叫\textbf{本质矩阵}（essential matrix），$\bm{F}$ 叫\textbf{基础矩阵}（fundamental matrix，作用在像素坐标上）。$\bm{E}$ 有 5 个自由度（$\bm{R}$ 三个、$\bm{t}$ 方向两个，尺度不可观），$\bm{F}$ 有 7 个自由度；作为 $3\times3$ 矩阵它们有 9 个元素，去掉整体尺度剩 8 个，再减去秩 2 约束正好是 7 个。
+
+\textbf{八点法。}把 $\bm{F}=[f_1,\dots,f_9]^{\top}$ 拉直，每对匹配点给一个线性方程
+\begin{equation}
+  \left[u_2u_1,\ u_2v_1,\ u_2,\ v_2u_1,\ v_2v_1,\ v_2,\ u_1,\ v_1,\ 1\right]\bm{f}=0.
+\end{equation}
+$N\ge8$ 对点堆成 $\bm{A}\bm{f}=\bm{0}$，取 $\bm{A}$ 的最小奇异值对应的右奇异向量作为 $\bm{f}$。由于噪声，这样得到的 $\bm{F}$ 通常是满秩的，需要\textbf{强制秩 2}：对 $\bm{F}$ 做 SVD $\bm{F}=\bm{U}\diag(\sigma_1,\sigma_2,\sigma_3)\bm{V}^{\top}$，把最小的 $\sigma_3$ 置零，得 $\hat{\bm{F}}=\bm{U}\diag(\sigma_1,\sigma_2,0)\bm{V}^{\top}$。再从 $\hat{\bm{E}}=\bm{K}_2^{\top}\hat{\bm{F}}\bm{K}_1$ 分解出 $\bm{R},\bm{t}$（SVD 分解有 4 组解，用「点必须在相机前方」筛选）。工程上通常先用 RANSAC 剔除误匹配，再解 $\bm{E}$。
+
+\subsection{三角化}
+
+已知 $\bm{R},\bm{t}$ 与匹配点 $\bm{x}_1,\bm{x}_2$，要恢复该点的三维坐标。由 $\bm{X}_2=\bm{R}\bm{X}_1+\bm{t}$ 与 $\bm{X}_i=Z_i[\bm{x}_i^{\top},1]^{\top}$：
+\begin{equation}
+  Z_2\begin{bmatrix}\bm{x}_2\\1\end{bmatrix}
+  = Z_1\bm{R}\begin{bmatrix}\bm{x}_1\\1\end{bmatrix}+\bm{t}.
+  \label{eq:08-triangulate}
+\end{equation}
+两边左乘 $\bm{x}_2^{\wedge}$ 消掉左边的未知量 $Z_2$：
+\begin{equation}
+  \bm{0} = Z_1\,\bm{x}_2^{\wedge}\bm{R}\begin{bmatrix}\bm{x}_1\\1\end{bmatrix}
+  +\bm{x}_2^{\wedge}\bm{t}
+  \ \Longrightarrow\
+  Z_1\,\bm{x}_2^{\wedge}\bm{R}\bar{\bm{x}}_1 = -\bm{x}_2^{\wedge}\bm{t},
+  \label{eq:08-tri-ls}
+\end{equation}
+其中 $\bar{\bm{x}}_i=[\bm{x}_i^{\top},1]^{\top}$。这是关于 $Z_1$ 的超定线性方程（三个方程，秩 2）。用最小二乘解：两边左乘 $(\bm{x}_2^{\wedge}\bm{R}\bar{\bm{x}}_1)^{\top}$，得
+\begin{equation}
+  Z_1 = -\frac{\left(\bm{x}_2^{\wedge}\bm{R}\bar{\bm{x}}_1\right)^{\top}\left(\bm{x}_2^{\wedge}\bm{t}\right)}
+  {\norm{\bm{x}_2^{\wedge}\bm{R}\bar{\bm{x}}_1}^{2}}.
+  \label{eq:08-Z1}
+\end{equation}
+代回得 $\bm{X}_1=Z_1\bar{\bm{x}}_1$，再用 $\bm{X}_2=\bm{R}\bm{X}_1+\bm{t}$ 得到另一帧坐标。注意三角化的精度与视差有关：两帧间基线太短（视差小）时，深度对像素噪声极其敏感，这是单目 VO 在慢速直线运动时深度估计很差的根本原因。
+
+\subsection{PnP 与重投影误差}
+
+当一帧有深度信息时，问题变成 3D-2D：已知三维点 $\bm{X}_j$ 与像素观测 $\bm{u}_{ij}$，求相机位姿 $T_i$。最直接的做法是最小化\textbf{重投影误差}（reprojection error）：
+\begin{equation}
+  \bm{e}_{ij} = \bm{u}_{ij}-\pi\left(\bm{R}_i\bm{X}_j+\bm{t}_i\right),
+  \qquad
+  \min_{T_i}\sum_j\norm{\bm{e}_{ij}}^{2}.
+  \label{eq:08-reproj}
+\end{equation}
+它是 $\bm{R}$ 的非线性函数，用 Gauss-Newton 迭代。先给出投影对三维点的雅可比。由式~\eqref{eq:08-projection}，
+\begin{equation}
+  \frac{\partial\pi}{\partial\bm{p}}
+  = \begin{bmatrix}
+    \dfrac{f_x}{Z} & 0 & -\dfrac{f_xX}{Z^{2}}\\[2mm]
+    0 & \dfrac{f_y}{Z} & -\dfrac{f_yY}{Z^{2}}
+  \end{bmatrix}\in\mathbb{R}^{2\times3},
+  \qquad \bm{p}=\begin{bmatrix}X\\Y\\Z\end{bmatrix}.
+  \label{eq:08-dpi-dp}
+\end{equation}
+再给出三维点对位姿增量 $\delta\bm{\xi}=[\delta\bm{\theta};\delta\bm{t}]$ 的雅可比。$\bm{p}=\bm{R}\bm{X}+\bm{t}$，对 $\delta\bm{\theta}$ 用 $\bm{R}\leftarrow\exp(\delta\bm{\theta}^{\wedge})\bm{R}\approx(\bm{I}+\delta\bm{\theta}^{\wedge})\bm{R}$：
+\begin{equation}
+  \frac{\partial\bm{p}}{\partial\delta\bm{\theta}}=-\bm{p}^{\wedge}\in\mathbb{R}^{3\times3},
+  \qquad
+  \frac{\partial\bm{p}}{\partial\delta\bm{t}}=\bm{I}\in\mathbb{R}^{3\times3}.
+\end{equation}
+链式法则得 $2\times6$ 的雅可比
+\begin{equation}
+  \bm{J}_{ij}=\frac{\partial\bm{e}_{ij}}{\partial\delta\bm{\xi}}
+  = -\frac{\partial\pi}{\partial\bm{p}}\Big|_{\bm{p}=\bm{R}_i\bm{X}_j+\bm{t}_i}
+  \left[-\bm{p}^{\wedge}\ \ \bm{I}\right]\in\mathbb{R}^{2\times6}.
+  \label{eq:08-reproj-jac}
+\end{equation}
+正规方程为 $\left(\sum_j\bm{J}_{ij}^{\top}\bm{J}_{ij}\right)\delta\bm{\xi}=-\sum_j\bm{J}_{ij}^{\top}\bm{e}_{ij}$，与第~\ref{ch:07-lidar-odom}~章的点到面完全同构。若相机内参也未知，可以同时对 $\bm{K}$ 求导做自标定，工程上一般先离线标定好。
+
+\textbf{PnP 的初值与外点。}重投影误差是局部方法，初值差会发散。常用的初始化方法有 DLT（直接线性变换）与 EPnP：DLT 把投影方程写成
+\begin{equation}
+  u\,\bm{p}_3^{\top}\bm{X}= \bm{p}_1^{\top}\bm{X},
+  \qquad
+  v\,\bm{p}_3^{\top}\bm{X}= \bm{p}_2^{\top}\bm{X},
+\end{equation}
+其中 $\bm{P}=\bm{K}[\bm{R}\ \bm{t}]\in\mathbb{R}^{3\times4}$ 有 12 个未知数，$N\ge6$ 个点即可线性求解（SVD 取零空间）；EPnP 则把三维点表示成 4 个虚拟控制点的加权和，把未知量降到 12 维以内，更快更稳。外点用 RANSAC：随机取最小点集求 PnP，统计内点数，迭代取内点最多的模型，最后用全部内点做一次重投影误差优化。
+
+\subsection{光束法平差}
+
+把多帧、多个点的重投影误差放在一起联合优化，就叫\textbf{光束法平差}（bundle adjustment, BA）：
+\begin{equation}
+  \min_{\{T_i\},\{\bm{X}_j\}}\sum_{(i,j)\in\mathcal{O}}\norm{\bm{u}_{ij}-\pi\left(\bm{R}_i\bm{X}_j+\bm{t}_i\right)}^{2},
+  \label{eq:08-BA}
+\end{equation}
+其中 $\mathcal{O}$ 是所有观测。BA 的变量包含位姿与三维点，规模很大，但雅可比矩阵高度稀疏（每个观测只涉及一个位姿与一个点），可以用舒尔补（Schur complement）把点变量消掉，只解位姿（推导见第~\ref{ch:13-backend}~章）。视觉 SLAM 的后端本质上就是「带鲁棒核与边缘化的增量 BA」。
+
+\begin{pseudo}{特征点法 VO 的单帧流程}
+  \item 输入：当前帧图像 $I_k$、上一帧状态
+  \item 提取 FAST 角点，计算 ORB 描述子
+  \item 与上一帧描述子做匹配，比值检验剔除误匹配
+  \item RANSAC 估计本质矩阵 $\bm{E}$（或基础矩阵 $\bm{F}$），得到初始 $\bm{R},\bm{t}$
+  \item 三角化匹配点得到三维坐标；若上一帧已有三维点则改做 PnP
+  \item 以重投影误差做 Gauss-Newton 局部优化，剔除大残差点
+  \item 输出位姿 $T_{k}$，把新三角化的点加入地图
+\end{pseudo}
+
+\begin{figure}[htbp]
+  \centering
+  \begin{tikzpicture}[scale=1.0]
+    \draw[thick, fill=structurecolor!8] (1.0,0.2) rectangle (1.2,2.4);
+    \node[font=\footnotesize, rotate=90] at (1.1,1.95) {成像平面};
+    \fill[black] (0,0) circle (1.8pt) node[below left, font=\footnotesize] {光心 $O$};
+    \fill[black] (3.6,2.6) circle (1.8pt) node[right, font=\footnotesize] {$\bm{X}$};
+    \draw[thick] (0,0) -- (3.6,2.6);
+    \fill[red!60!black] (1.1,0.794) circle (1.6pt) node[right, font=\footnotesize] {$\bm{x}$};
+    \draw[dashed, black!40] (0,0) -- (0,2.2) node[above, font=\footnotesize] {$f$};
+    \draw[-stealth, thick] (0,0) -- (0.9,0) node[right, font=\footnotesize] {$x$};
+    \draw[-stealth, thick] (0,0) -- (0,0.9) node[above, font=\footnotesize] {$y$};
+    \draw[-stealth, thick] (0,0) -- (-0.7,-0.7) node[below left, font=\footnotesize] {$z$};
+  \end{tikzpicture}
+  \caption{针孔成像模型。三维点 $\bm{X}$ 与光心连线交成像平面于像点 $\bm{x}$，像素坐标由 $u=f_xX/Z+c_x$ 给出；焦距 $f$、深度 $Z$ 与像高构成相似三角形。}
+  \label{fig:08-pinhole}
+\end{figure}
+
+\section{直接法与光流}\label{sec:08-direct}
+
+特征点法要先检测、匹配，再丢弃大量信息（一幅图只用几百个点）。直接法（direct method）反过来：直接假设「同一个空间点在两帧中的像素灰度不变」，最小化\textbf{光度误差}（photometric error）：
+\begin{equation}
+  e_{i} = I_1\left(\bm{u}_i\right)-I_2\left(\pi\left(\bm{R}\,\pi^{-1}\left(\bm{u}_i,d_i\right)+\bm{t}\right)\right),
+  \label{eq:08-photometric}
+\end{equation}
+其中 $d_i$ 是像素 $\bm{u}_i$ 对应的深度。目标是最小化 $\sum_i e_i^{2}$，用 Gauss-Newton 对位姿（以及可能的深度）迭代，雅可比通过图像梯度链式得到：
+\begin{equation}
+  \frac{\partial e_i}{\partial\delta\bm{\xi}}
+  = -\nabla I_2^{\top}\frac{\partial\pi}{\partial\bm{p}}\left[-\bm{p}^{\wedge}\ \ \bm{I}\right].
+\end{equation}
+直接法不需要特征，弱纹理区域只要有小梯度就能用，还能利用全部像素；代价是光度误差对光照变化、相机自动曝光、卷帘快门非常敏感，且需要较好的深度初值。DSO \cite{engel2018dso} 是直接法的代表作，它联合优化光度参数与几何参数，在无纹理、高动态范围场景表现突出。
+
+\textbf{光流}可以看作直接法的「前身」：为每个像素在下一帧里找到灰度最相似的位置（LK 光流），再把这些像素位移当作特征匹配的替代品。光流匹配的位移通常很小，所以适合视频这种帧间运动小的场景。
+
+\section{VIO：视觉与惯性的融合}\label{sec:08-vio}
+
+\begin{definition}[VIO]
+\textbf{视觉惯性里程计}（visual-inertial odometry, VIO）指把相机与 IMU 的数据联合起来估计位姿与速度：相机提供长期无漂移的几何约束（但频率低、有尺度模糊），IMU 提供高频运动与尺度信息（但漂移快）。二者互补，是现代无人机、机器人的主流定位方案。
+\end{definition}
+
+\textbf{尺度问题：单目为什么不能定尺度。}由式~\eqref{eq:08-K}，投影只依赖 $X/Z$ 的比值。若把相机系下所有三维点与平移同时放大 $s$ 倍：$\bm{X}\to s\bm{X}$、$\bm{t}\to s\bm{t}$，则
+\begin{equation}
+  \frac{s\bm{X}}{sZ}=\frac{\bm{X}}{Z},
+\end{equation}
+像素投影完全不变。因此单目视觉只能恢复「相差一个未知尺度」的轨迹，速度、位置、地图尺度都不可观。IMU 的加速度计提供绝对加速度（真实物理量），能在运动激励足够时把尺度观测出来，这是 VIO 相对纯单目 VO 的核心优势。
+
+\textbf{MSCKF。}MSCKF（multi-state constraint Kalman filter）\cite{mourikis2007msckf} 用 EKF 维护一个滑动窗口内的多个相机位姿，特征点不进入状态。当某个特征点离开视野时，它的多次观测给窗口内的位姿提供了一组约束；为了不把特征点坐标加进状态，用\textbf{零空间投影}把这些约束投影到「与特征点无关」的子空间，得到一个只含位姿的残差，再做 EKF 更新。好处是状态维度小、计算量可控；代价是信息有损（投影后约束变弱）。
+
+\textbf{VINS-Mono。}VINS-Mono \cite{qin2018vinsmono} 走优化路线：IMU 预积分（第~\ref{ch:06-imu}~章）连接相邻关键帧，视觉观测提供重投影残差，二者放进同一个滑动窗口做 BA；窗口滑出时用边缘化（marginalization）把旧状态的信息转成先验，保留约束、丢弃变量。它是「视觉惯性紧耦合 + 滑动窗口优化」的经典实现。
+
+\textbf{ORB-SLAM3。}ORB-SLAM3 \cite{campos2021orbslam3} 把特征点、多地图（ATLAS）、视觉惯性紧耦合整合在一起，支持单目/双目/RGB-D 与 IMU 的组合，是工程完整度最高的视觉 SLAM 系统之一。它的前端用 ORB 特征与对极几何/PnP，后端用局部 BA + 回环 + 位姿图。
+
+\begin{figure}[htbp]
+  \centering
+  \begin{tikzpicture}[node distance=6mm and 11mm]
+    \node[block] (cam) {相机\\30\,Hz};
+    \node[block, right=of cam] (vis) {视觉前端\\特征 + 匹配};
+    \node[block, below=of cam] (imu) {IMU\\200\,Hz};
+    \node[block, right=of imu] (pre) {预积分\\$\Delta\bm{R},\Delta\bm{v},\Delta\bm{p}$};
+    \node[block, right=of vis, yshift=-15mm] (win) {滑动窗口\\联合优化};
+    \node[block, right=of win] (out) {位姿、速度\\零偏、地图};
+    \draw[-stealth, thick] (cam) -- (vis);
+    \draw[-stealth, thick] (imu) -- (pre);
+    \draw[-stealth, thick] (vis) -- node[label, above] {重投影残差} (win);
+    \draw[-stealth, thick] (pre) -- node[label, below] {IMU 残差} (win);
+    \draw[-stealth, thick] (win) -- (out);
+    \draw[-stealth, thick, dashed] (out.south) |- (pre.south);
+  \end{tikzpicture}
+  \caption{VIO 的信息流。视觉前端给出重投影残差，IMU 预积分给出帧间运动约束，二者在滑动窗口里联合优化；优化结果反过来用于下一轮预积分与边缘化。}
+  \label{fig:08-vio}
+\end{figure}
+
+\section{视觉里程计的局限}\label{sec:08-limits}
+
+\begin{itemize}
+  \item \textbf{尺度}：单目尺度不可观（上面已证明）；双目/IMU 可以补上，但需要基线或运动激励。
+  \item \textbf{光照}：强光、逆光、暗处、曝光变化会让特征/光度误差失效；直接法比特征点法更敏感。
+  \item \textbf{纹理}：白墙、地板、大面积单色物体上没有可用的角点或梯度，VO 会退化（与激光的长廊问题本质相同）。
+  \item \textbf{动态物体}：行人、其他机器人会引入错误的特征匹配，需要 RANSAC、语义分割或运动一致性检验。
+  \item \textbf{滚动快门}：高速旋转时 CMOS 逐行曝光会引入几何畸变，需要专门建模。
+  \item \textbf{尺度漂移}：即使有 IMU，长时间慢速运动时尺度仍可能缓慢漂移，需要绝对观测（GPS、地图）来闭合。
+\end{itemize}
+
+这也是为什么真实的定位系统几乎都是「视觉 + IMU + 轮速 + 激光」多传感器融合：没有任何单一传感器能在所有场景下可靠工作（第~\ref{ch:09-fusion}~章）。
+
+\begin{keybox}{选择 VO 方案的三条原则}
+\begin{enumerate}
+  \item 有纹理、要精度：特征点法 + 回环（ORB-SLAM3 一类）；
+  \item 弱纹理、要速度：直接法（DSO 一类）或光流；
+  \item 要尺度、要鲁棒：一定要上 IMU（VIO），纯单目 VO 不适合作为长期定位的唯一来源。
+\end{enumerate}
+\end{keybox}
+
+\begin{summary}
+
+\begin{enumerate}
+  \item 针孔模型：$Z[u,v,1]^{\top}=\bm{K}[X,Y,Z]^{\top}$，内参含 $f_x,f_y,c_x,c_y$；畸变由 $k_1,k_2,k_3,p_1,p_2$ 描述，作用在归一化坐标上。
+  \item 特征点法：FAST 检测、ORB 描述子、汉明距离匹配与比值检验，是 VO 前端的基础。
+  \item 对极约束 $\bm{x}_2^{\top}\bm{t}^{\wedge}\bm{R}\bm{x}_1=0$ 来自三个向量共面；八点法 + 秩 2 约束求 $\bm{F}$，再分解出 $\bm{R},\bm{t}$。
+  \item 三角化把匹配点变成三维点，深度精度强烈依赖视差；视差小则深度不可靠。
+  \item PnP 最小化重投影误差，雅可比由 $\partial\pi/\partial\bm{p}$ 与 $[-\bm{p}^{\wedge},\bm{I}]$ 链式相乘得到；初值可用 DLT/EPnP，外点用 RANSAC。
+  \item BA 是联合优化多帧位姿与三维点，雅可比稀疏，可用舒尔补消元。
+  \item 直接法最小化光度误差，适应弱纹理但怕光照变化；DSO 是代表。
+  \item 单目尺度不可观（投影对整体缩放不变）；VIO 用 IMU 补尺度与高频运动，MSCKF、VINS-Mono、ORB-SLAM3 是三条代表性路线。
+\end{enumerate}
+
+
+\end{summary}
+
+\begin{problemset}
+
+  \item 用 $f_x=f_y=500$、$c_x=c_y=320$ 的内参，求空间点 $[2,-1,4]^{\top}$ 的像素坐标；再求 $[4,-2,8]^{\top}$ 的像素坐标，验证两者相同（说明尺度不可观）。
+  \item 从 $\bm{X}_2=\bm{R}\bm{X}_1+\bm{t}$ 与 $\bm{x}_i=\bm{X}_i/Z_i$ 出发，完整推导对极约束~\eqref{eq:08-epipolar}，并说明每一步用了什么性质。
+  \item 写出八点法的线性方程组，说明为什么最少需要 8 对点，以及为什么解出的 $\bm{F}$ 需要强制秩 2。
+  \item 用式~\eqref{eq:08-dpi-dp} 与 $[-\bm{p}^{\wedge},\bm{I}]$ 推导 $\bm{J}_{ij}$，并写出 $\bm{J}_{ij}$ 的形状与每一块的含义。
+  \item 若两帧间基线为 $0.05\,\mathrm{m}$、目标深度 $5\,\mathrm{m}$，像素噪声 $0.5$ 像素、$f=500$，估算三角化深度的相对误差量级。
+  \item 比较特征点法与直接法的优缺点，并说明为什么 VIO 能解决单目的尺度问题。
+\end{problemset}
+
+\begin{reading}
+
+\begin{itemize}
+  \item DSO 论文（\href{https://ieeexplore.ieee.org/document/8220081}{IEEE TPAMI 2018}）：直接法的光度误差与模型参数联合优化。
+  \item VINS-Mono 论文与开源代码（\href{https://github.com/HKUST-Aerial-Robotics/VINS-Mono}{GitHub}）：预积分 + 滑动窗口 + 边缘化的完整实现。
+  \item ORB-SLAM3 论文与代码（\href{https://github.com/UZ-SLAMLab/ORB_SLAM3}{GitHub}）：多地图与视觉惯性紧耦合的工程范本。
+\end{itemize}
+
+
+\end{reading}

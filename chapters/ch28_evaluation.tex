@@ -1,0 +1,279 @@
+\chapter{数据集、评测与复现}\label{ch:28-evaluation}
+\usetikzlibrary{arrows.meta}
+
+\chapterintro{"我的算法比 FAST-LIO 好"——这句话在组会上说出来之前，必须先回答三个问题：在哪个数据集上、用什么指标、对齐方式是什么。否则它只是一个无法验证的感觉。本章解决的就是"怎么把感觉变成数字"：先列出定位领域最常用的公开数据集与各自适合评什么，再给出 ATE/RPE 的严格定义与 Umeyama 对齐闭式解（这是所有评测工具背后真正在算的东西），然后用 \lstinline{evo} 把命令和输出对上号，最后讲自采数据的规范与可复现实验的设计。评测能力决定了你能否在一堆参数里做出正确判断，也决定了你的实验别人能不能复现。}
+
+\section{公开数据集}\label{sec:28-datasets}
+
+选数据集的原则是：\textbf{它必须能暴露你想改进的那种失效模式}。在 KITTI 上刷高分的算法，遇到 RM 场地的动态障碍与对称结构可能一塌糊涂；反之只在自家场地上调参，也无法证明方法本身有效。表~\ref{tab:28-datasets} 是常用的几套。
+
+\begin{table}[htbp]
+  \centering
+  \caption{常用公开数据集对比}\label{tab:28-datasets}
+  \footnotesize
+  \begin{tabular}{p{2.3cm}p{4.2cm}p{3.4cm}p{4.0cm}}
+    \toprule
+    数据集 & 传感器 & 场景 & 适合评什么 \\
+    \midrule
+    KITTI Odometry & 双目、HDL-64、GPS/IMU & 城郊道路、高速 & 激光/视觉里程计的 ATE，室外长距离 \\
+    EuRoC MAV & 双目、ADIS16448、Vicon/Leica & 室内房间与厂房 & VIO 的 ATE/RPE，标定与时间同步 \\
+    TUM VI & 双目鱼眼、IMU & 室内外混合 & 视觉惯性，含相机标定基准 \\
+    NTU VIRAL & Ouster、双目、IMU、UWB & 校园、室内外 & 多传感器融合、UWB 辅助定位 \\
+    Newer College & Ouster、相机、IMU & 校园、含季节变化 & 长期定位、鲁棒性 \\
+    M2DGR & 鱼眼/双目/事件相机、激光、IMU、GNSS & 校园地面机器人 & 多模态融合、地面平台 \\
+    RM 自采 & Livox、IMU、轮式 & 比赛场地 & 你的真实失效模式 \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+几点使用建议：
+
+\begin{enumerate}
+  \item \textbf{先用小数据集跑通闭环}。EuRoC 的 MH\_01 只有 3 分钟，适合快速验证编译与配置；不要在 KITTI 上调试程序。
+  \item \textbf{真值要看清来源}。Vicon/动捕是 mm 级但只覆盖小场地；RTK 是 cm 级但室内失效；KITTI 的 GPS/IMU 融合真值本身也有误差。\textbf{评测精度的下限是真值精度}。
+  \item \textbf{注意传感器差异}。Livox 非重复扫描的点云分布与 Velodyne 机械旋转完全不同，在一套数据上调好的 \lstinline{filter_size_surf} 换到另一套上必须重调。
+  \item \textbf{自采数据不可替代}。公开数据集用于"证明方法有效"，自采数据用于"证明在 RM 场上能用"，两者都要有。
+\end{enumerate}
+
+\section{评价指标：ATE、RPE 与漂移率}\label{sec:28-metrics}
+
+\subsection{ATE：绝对轨迹误差}
+
+\textbf{ATE}（Absolute Trajectory Error）衡量估计轨迹与真值轨迹的整体偏差。设有 $N$ 个对应时刻，估计位姿 $\hat{T}_i$、真值位姿 $T_i$，最简单的定义是逐点位置误差
+\begin{equation}
+\bm{e}_i=\mathrm{trans}\bigl(\hat{T}_i\bigr)-\mathrm{trans}\bigl(T_i\bigr),
+\qquad
+\mathrm{ATE}_{\mathrm{RMSE}}=\sqrt{\frac{1}{N}\sum_{i=1}^{N}\norm{\bm{e}_i}^{2}},
+\label{eq:28-ate}
+\end{equation}
+其中 $\mathrm{trans}(\cdot)$ 取位姿的平移部分。但这样直接比是\textbf{不公平的}：两个轨迹可能只差一个初始位姿（起点朝向不同）或一个全局尺度（单目 SLAM），这不代表算法差。所以必须先做\textbf{对齐}，把估计轨迹用一个刚体变换（有时还允许缩放）配到真值上，再算误差。这就是常说的 "ATE with SE(3) alignment"。
+
+\subsection{Umeyama 对齐的闭式解}
+
+对齐问题：给定两组三维点 $\{\bm{x}_i\}$（估计）与 $\{\bm{y}_i\}$（真值），$i=1,\dots,N$，求尺度 $s$、旋转 $\bm{R}$、平移 $\bm{t}$，使
+\begin{equation}
+J(s,\bm{R},\bm{t})=\frac{1}{N}\sum_{i=1}^{N}\norm{\bm{y}_i-\bigl(s\bm{R}\bm{x}_i+\bm{t}\bigr)}^{2}
+\label{eq:28-umeyama}
+\end{equation}
+最小。下面推导闭式解（Umeyama 1991）。
+
+\textbf{第一步：消去平移。} 对 $\bm{t}$ 求偏导并令其为零：
+\begin{equation}
+\frac{\partial J}{\partial\bm{t}}=-\frac{2}{N}\sum_{i=1}^{N}\bigl(\bm{y}_i-s\bm{R}\bm{x}_i-\bm{t}\bigr)=\bm{0}
+\;\Longrightarrow\;
+\bm{t}=\bm{\mu}_y-s\bm{R}\bm{\mu}_x,
+\label{eq:28-t}
+\end{equation}
+其中 $\bm{\mu}_x=\frac{1}{N}\sum_i\bm{x}_i$、$\bm{\mu}_y=\frac{1}{N}\sum_i\bm{y}_i$。记中心化坐标 $\bm{x}'_i=\bm{x}_i-\bm{\mu}_x$、$\bm{y}'_i=\bm{y}_i-\bm{\mu}_y$，代回 $J$ 得
+\begin{equation}
+J=\frac{1}{N}\sum_{i=1}^{N}\norm{\bm{y}'_i-s\bm{R}\bm{x}'_i}^{2}
+=\frac{1}{N}\sum_{i=1}^{N}\norm{\bm{y}'_i}^{2}-\frac{2s}{N}\sum_{i=1}^{N}{\bm{y}'_i}^{\top}\bm{R}\bm{x}'_i+\frac{s^{2}}{N}\sum_{i=1}^{N}\norm{\bm{x}'_i}^{2},
+\label{eq:28-expand}
+\end{equation}
+中间一步用了 $\norm{\bm{a}-\bm{b}}^2=\norm{\bm{a}}^2-2\bm{a}^{\top}\bm{b}+\norm{\bm{b}}^2$。记 $\sigma_x^{2}=\frac{1}{N}\sum_i\norm{\bm{x}'_i}^{2}$、$\sigma_y^{2}=\frac{1}{N}\sum_i\norm{\bm{y}'_i}^{2}$，并定义 $3\times3$ 的\textbf{互协方差矩阵}
+\begin{equation}
+\bm{\Sigma}=\frac{1}{N}\sum_{i=1}^{N}\bm{x}'_i{\bm{y}'_i}^{\top}.
+\label{eq:28-sigma}
+\end{equation}
+利用迹的性质 $\tr(\bm{R}\bm{\Sigma})=\frac{1}{N}\sum_i{\bm{y}'_i}^{\top}\bm{R}\bm{x}'_i$（把 $\bm{\Sigma}$ 展开后交换求和与求迹即可验证），式~\eqref{eq:28-expand} 变成
+\begin{equation}
+J=\sigma_y^{2}-2s\,\tr(\bm{R}\bm{\Sigma})+s^{2}\sigma_x^{2}.
+\label{eq:28-J}
+\end{equation}
+
+\textbf{第二步：先定旋转。} 式~\eqref{eq:28-J} 中只有中间一项与 $\bm{R}$ 有关，所以固定 $s$ 时最小化 $J$ 等价于最大化 $\tr(\bm{R}\bm{\Sigma})$。对 $\bm{\Sigma}$ 做奇异值分解 $\bm{\Sigma}=\bm{U}\bm{D}\bm{V}^{\top}$，$\bm{D}=\diag(d_1,d_2,d_3)$，$d_1\ge d_2\ge d_3\ge0$。代入：
+\begin{equation}
+\tr(\bm{R}\bm{\Sigma})=\tr\bigl(\bm{R}\bm{U}\bm{D}\bm{V}^{\top}\bigr)=\tr\bigl(\bm{V}^{\top}\bm{R}\bm{U}\bm{D}\bigr)=\sum_{k=1}^{3}d_k\bigl(\bm{V}^{\top}\bm{R}\bm{U}\bigr)_{kk}.
+\end{equation}
+由于 $\bm{V}^{\top}\bm{R}\bm{U}$ 是正交矩阵，其对角元不超过 1，故上界是 $\sum_k d_k$，取等当且仅当 $\bm{V}^{\top}\bm{R}\bm{U}=\bm{I}$，即 $\bm{R}=\bm{V}\bm{U}^{\top}$。但正交矩阵还可能是反射（$\det=-1$），而旋转要求 $\det=1$，于是引入修正矩阵
+\begin{equation}
+\bm{S}=\diag\bigl(1,\,1,\,\det(\bm{V}\bm{U}^{\top})\bigr),\qquad
+\bm{R}=\bm{V}\bm{S}\bm{U}^{\top}.
+\label{eq:28-R}
+\end{equation}
+这样 $\det(\bm{R})=1$ 且仍取到最大 $\tr(\bm{R}\bm{\Sigma})=\sum_k d_k s_k$（$s_k$ 为 $\bm{S}$ 的对角元）。
+
+\textbf{第三步：再定尺度。} 把 $\bm{R}$ 代回式~\eqref{eq:28-J}，对 $s$ 求导：
+\begin{equation}
+\frac{\partial J}{\partial s}=-2\tr(\bm{R}\bm{\Sigma})+2s\sigma_x^{2}=0
+\;\Longrightarrow\;
+s=\frac{\tr(\bm{R}\bm{\Sigma})}{\sigma_x^{2}}=\frac{\sum_{k=1}^{3}s_kd_k}{\sigma_x^{2}}.
+\label{eq:28-s}
+\end{equation}
+\textbf{第四步：}平移由式~\eqref{eq:28-t} 给出：$\bm{t}=\bm{\mu}_y-s\bm{R}\bm{\mu}_x$。
+
+\begin{keybox}{评测时的三个约定}
+\begin{enumerate}
+  \item \textbf{是否估计尺度}：单目 SLAM 必须估计 $s$（否则轨迹差一个倍数）；激光/激光惯性系统通常固定 $s=1$，只在刚体变换下对齐。
+  \item \textbf{对齐范围}：是"整条轨迹对齐一次"（全局对齐）还是"逐段对齐"，结果差很多。\lstinline{evo} 默认全局对齐。
+  \item \textbf{时间对齐}：估计与真值的时间戳必须先按时间关联（\lstinline{evo} 会自动关联，但存在偏移时要用 \lstinline{--t_max_diff} 或先手动补偿）。
+\end{enumerate}
+\end{keybox}
+
+\subsection{RPE：相对位姿误差}
+
+\textbf{RPE}（Relative Pose Error）衡量"固定间隔内的相对运动"的误差，定义在成对的位姿上。取间隔 $\Delta$（按帧数、时间 1\,s 或距离 1\,m），第 $i$ 对的误差为
+\begin{equation}
+\bm{E}_i=\bigl(T_i^{-1}T_{i+\Delta}\bigr)^{-1}\bigl(\hat{T}_i^{-1}\hat{T}_{i+\Delta}\bigr),
+\label{eq:28-rpe}
+\end{equation}
+即"真值的相对运动"与"估计的相对运动"之差的变换。分解成平移与旋转两部分：
+\begin{equation}
+\mathrm{RPE}_{\mathrm{trans},i}=\norm{\mathrm{trans}(\bm{E}_i)},\qquad
+\mathrm{RPE}_{\mathrm{rot},i}=\arccos\!\left(\frac{\tr\bigl(\mathrm{rot}(\bm{E}_i)\bigr)-1}{2}\right),
+\end{equation}
+再对 $i$ 取 RMSE。$\arccos$ 那一项是旋转矩阵的\textbf{迹公式}：绕单位轴转 $\theta$ 的旋转矩阵迹为 $1+2\cos\theta$，反解即得旋转角。
+
+\textbf{为什么里程计看 RPE、SLAM 看 ATE？}因为两者关心的东西不同：里程计的核心是"每走一步的增量准不准"，增量误差会累积成漂移，RPE 正好测增量；SLAM 有回环与后端优化，单步可能不准但整体轨迹闭合得很好，此时 RPE 会很难看而 ATE 很好。所以报指标时通常两个都给：ATE 说整体精度，RPE 说局部一致性。
+
+\begin{figure}[htbp]
+  \centering
+  \begin{tikzpicture}[x=1.05cm,y=1.05cm,font=\footnotesize]
+    % ground truth (solid) and estimate (dashed), offset by a constant
+    \draw[thick, black!70] plot[smooth] coordinates
+      {(0,0) (1.2,0.6) (2.4,1.0) (3.6,0.8) (4.8,1.3) (6.0,1.9) (7.2,2.2)};
+    \draw[thick, structurecolor, dashed] plot[smooth] coordinates
+      {(0,0.55) (1.2,1.15) (2.4,1.55) (3.6,1.35) (4.8,1.85) (6.0,2.45) (7.2,2.75)};
+    % ATE: point-wise error between corresponding poses
+    \foreach \x/\ya/\yb in
+      {0/0/0.55, 1.2/0.6/1.15, 2.4/1.0/1.55, 3.6/0.8/1.35,
+       4.8/1.3/1.85, 6.0/1.9/2.45, 7.2/2.2/2.75}
+      \draw[red!60!black, thick] (\x,\ya) -- (\x,\yb);
+    % RPE: relative motion between pose i and pose i+Delta
+    \draw[very thick, orange!80!black] (1.2,0.6) -- (3.6,0.8);
+    \draw[very thick, orange!80!black, dashed] (1.2,1.15) -- (3.6,1.35);
+    \foreach \x/\y in {1.2/0.6, 3.6/0.8, 1.2/1.15, 3.6/1.35}
+      \fill (\x,\y) circle (1.6pt);
+    % legend
+    \node[anchor=west, black!70] at (7.25,2.2) {真值};
+    \node[anchor=west, structurecolor] at (7.25,2.75) {估计};
+    \node[anchor=north west, font=\footnotesize] at (0.05,-0.12)
+      {红：ATE（逐点位置误差）};
+    \node[anchor=north west, font=\footnotesize] at (0.05,-0.65)
+      {橙：RPE（$\Delta$ 内相对运动的误差）};
+  \end{tikzpicture}
+  \caption{ATE 与 RPE 的区别。ATE 比较同一时刻的绝对位置（红色短线段），RPE 比较固定间隔 $\Delta$ 内的相对运动（橙色线段：真值一条、估计一条，二者之差才是误差）。}\label{fig:28-ate}
+\end{figure}
+
+\subsection{漂移率与工程指标}
+
+\textbf{漂移率}把 ATE 归一化，便于跨数据集比较：
+\begin{equation}
+\text{drift}=\frac{\mathrm{ATE}_{\mathrm{RMSE}}}{\text{轨迹长度}}\times100\%.
+\label{eq:28-drift}
+\end{equation}
+$1$\,km 轨迹 ATE 1\,m 是 $0.1\%$，属于很好的水平；室内 50\,m 轨迹 0.5\,m 就是 $1\%$，需要检查。
+
+除精度外，工程上还必须报三类指标：
+
+\begin{itemize}
+  \item \textbf{实时性}：单帧平均耗时、$95$ 分位耗时、是否达到雷达频率。只报平均耗时会掩盖偶发的卡顿。
+  \item \textbf{资源}：CPU 单核占用、内存峰值（RSS）、地图内存增长速度。
+  \item \textbf{鲁棒性}：连续运行 $N$ 次/小时的失败次数、丢失跟踪后的恢复时间。
+\end{itemize}
+
+\section{evo：命令与输出解读}\label{sec:28-evo}
+
+\lstinline{evo} 是评测的事实标准工具，支持 TUM/KITTI/bag 等多种格式。四条最常用的命令：
+
+\begin{lstlisting}[language=bash,caption={evo 常用命令},label={lst:28-evo}]
+# 1) inspect two trajectories: align, then plot side by side
+evo_traj tum gt.tum --ref est.tum --align --plot
+
+# 2) absolute trajectory error (RMSE), with alignment
+evo_ape tum gt.tum est.tum -va --align --plot
+# add --correct_scale when evaluating monocular SLAM
+
+# 3) relative pose error over 1 m of travel
+evo_rpe kitti gt.txt est.txt --delta 1 --delta_unit m -va
+
+# 4) compare many runs: each result is a zip saved by evo_ape/evo_rpe
+evo_res results/*.zip -p --use_fig --save_table table.csv
+\end{lstlisting}
+
+输出中最该看的是 \lstinline{RMSE}、\lstinline{median}、\lstinline{std} 三个数：RMSE 对大误差敏感（平方后再平均），median 反映典型水平，std 反映抖动。若 median 好而 RMSE 差，说明轨迹中\textbf{偶有跳变}；若两者都差，说明是系统性偏移。\lstinline{--align} 做的是第~\ref{sec:28-metrics} 节的 Umeyama 对齐（不含尺度），\lstinline{--correct_scale} 才估计尺度。
+
+\begin{note}
+\textbf{报数字时的三个必须}：必须写对齐方式（有无尺度）、必须写数据段（哪几段序列）、必须写运行次数（取中位数还是最好的一次）。只写"ATE 0.12"是不可复现的。
+\end{note}
+
+\section{自采数据规范}\label{sec:28-selfdata}
+
+RM 场地的数据是公开数据集替代不了的，但自采数据最容易烂在文件夹里。规范如下：
+
+\begin{enumerate}
+  \item \textbf{时间同步先于录制}。录之前用第~\ref{ch:26-calibration} 章的方法确认两路时间戳一致，并记录同步方式（硬件触发/PTP/NTP）。
+  \item \textbf{标定文件与数据同存}。每次采数据时把当次的相机内参、外参、IMU 噪声参数、激光雷达型号配置与 bag 放在同一目录，文件名带版本号。
+  \item \textbf{真值获取}：动捕精度最高但场地受限；全站仪适合静态标定点；室外用 RTK；也可以先用"高精度先验地图 + ICP"得到准真值，但要注明是"准真值"。
+  \item \textbf{命名与元数据}：建议 \lstinline{日期_场地_平台_传感器_序号}，并写一个 README 记录：谁录的、什么配置、场地描述、已知问题（比如"这段有人走过"）。
+  \item \textbf{不要只录成功片段}。失败的数据最有价值——炸的那 10 秒决定了你能不能复现并修好问题。
+\end{enumerate}
+
+\section{可复现实验}\label{sec:28-repro}
+
+一个实验能被别人（或三个月后的你自己）复现，必须固定四件事：
+
+\begin{enumerate}
+  \item \textbf{代码状态}：记录 git commit hash；有未提交改动时用 \lstinline{git stash} 或打 tag。
+  \item \textbf{配置快照}：把当次使用的 YAML 与 launch 文件复制到结果目录（不要只记"改了 \lstinline{filter_size_surf}"）。
+  \item \textbf{随机性}：ICP/采样类算法、随机种子、线程调度都可能带来波动。固定随机种子，并\textbf{至少跑 3 次取中位数}；差异小于波动幅度的改进不能算改进。
+  \item \textbf{环境}：CPU 型号、是否开 Release、是否绑核、ROS 版本、bag 回放速度（是否 \lstinline{--rate 1.0}）。
+\end{enumerate}
+
+做改进对比时用消融表（表~\ref{tab:28-ablation}），每一行只允许一个变量不同，并用中位数与波动范围一起报。
+
+\begin{table}[htbp]
+  \centering
+  \caption{消融实验表模板（每个配置跑 3 次，报中位数$\pm$半极差）}\label{tab:28-ablation}
+  \small
+  \begin{tabular}{llccc}
+    \toprule
+    配置 & 改动 & ATE (m) & RPE (m) & 平均耗时 (ms) \\
+    \midrule
+    A & 基线 & $0.42\pm0.03$ & $0.021$ & 18 \\
+    B & A + iKD-Tree 体素 0.5\,m & $0.40\pm0.02$ & $0.020$ & 14 \\
+    C & B + 时间偏移补偿 & $0.29\pm0.01$ & $0.014$ & 14 \\
+    D & C + \lstinline{max_iteration} 6 & $0.27\pm0.02$ & $0.013$ & 21 \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+\begin{note}
+\textbf{不要用"最好一次"的结果参与比较}。算法的真实表现是分布，不是单点。如果两个配置的差异落进了多次运行的波动范围，就老老实实说"无显著差异"，这比编一个漂亮的数字更专业，也更省时间。
+\end{note}
+
+\begin{summary}
+
+\begin{enumerate}
+  \item 数据集要选能暴露目标失效模式的：公开数据集证明方法有效，自采数据证明在 RM 场上能用，两者都要。
+  \item ATE 是逐点绝对误差的 RMSE，通常先做 Umeyama 对齐再算；单目系统要估计尺度，激光系统固定 $s=1$。
+  \item Umeyama 闭式解四步：中心化求 $\bm{\Sigma}=\frac1N\sum\bm{x}'{\bm{y}'}^{\top}$ $\to$ SVD 取 $\bm{R}=\bm{V}\bm{S}\bm{U}^{\top}$（$\bm{S}$ 修正反射）$\to$ $s=\tr(\bm{R}\bm{\Sigma})/\sigma_x^{2}$ $\to$ $\bm{t}=\bm{\mu}_y-s\bm{R}\bm{\mu}_x$。
+  \item RPE 测固定间隔 $\Delta$ 内的相对运动误差，是里程计的核心指标；ATE 与 RPE 一起报才完整。
+  \item 漂移率 $=\mathrm{ATE}/\text{轨迹长度}$，便于跨场景比较；工程上还要报耗时分布、内存与失败率。
+  \item \lstinline{evo} 四条命令覆盖检查、ATE、RPE、多结果对比；报数字必须带对齐方式、数据段与运行次数。
+  \item 可复现四要素：代码 commit、配置快照、随机性控制（3 次取中位数）、环境记录。
+\end{enumerate}
+
+
+\end{summary}
+
+\begin{problemset}
+
+  \item 估计轨迹与真值只差一个初始朝向，不做对齐的 ATE 会很大。请说明这种"不公平"在什么情况下不能通过刚体对齐消除（提示：想想单目尺度）。
+  \item 从式~\eqref{eq:28-expand} 出发，补全 $\tr(\bm{R}\bm{\Sigma})$ 与逐点求和等价的推导步骤（允许用"展开后交换求和与求迹"）。
+  \item 为什么 $\bm{S}$ 的第三个对角元要取 $\det(\bm{V}\bm{U}^{\top})$？如果直接取 $\bm{R}=\bm{V}\bm{U}^{\top}$ 会发生什么？
+  \item 某算法 ATE 的 median 是 0.05\,m 而 RMSE 是 0.6\,m。请解释这两个数为什么会差这么多，并说明你会去查什么。
+  \item 你要比较两个参数配置的优劣，两者 ATE 相差 3\%，而 5 次运行的波动范围是 $\pm5\%$。应该怎么下结论？
+\end{problemset}
+
+\begin{reading}
+
+\begin{itemize}
+  \item Umeyama 的原始论文 \href{https://ieeexplore.ieee.org/document/88573}{Least-Squares Estimation of Transformation Parameters Between Two Point Patterns}（PAMI 1991）：本章对齐闭式解的全部推导来源。
+  \item \lstinline{evo} 官方文档 \href{https://michaelgrupp.github.io/evo/}{michaelgrupp.github.io/evo}：所有命令行参数与输出含义，配合本章第~\ref{sec:28-evo} 节的四条命令即可上手。
+  \item KITTI Odometry 与 EuRoC 官方页面：真实数据、真值格式与评测脚本的权威说明，建议在跑通自己的系统后读它们的评测协议。
+  \item 第~\ref{ch:27-tuning} 章的调参记录表：评测结果最终要落到那张表上才能形成闭环。
+\end{itemize}
+
+
+\end{reading}

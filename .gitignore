@@ -1,0 +1,33 @@
+# LaTeX 编译产物
+build/
+*.aux
+*.bcf
+*.bbl
+*.blg
+*.fdb_latexmk
+*.fls
+*.log
+*.out
+*.run.xml
+*.toc
+*.synctex.gz
+*.xdv
+*.nav
+*.snm
+*.vrb
+
+# Python
+__pycache__/
+*.py[cod]
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# 临时文件
+*.tmp
+*.bak
+~$*

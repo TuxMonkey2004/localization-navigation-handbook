@@ -1,0 +1,385 @@
+\chapter{Z-Localization 深度解析}\label{ch:23-zlocalization}
+
+\chapterintro{这一章解剖一套真实的、开源的、为比赛而生的定位系统：东北大学 T-DT 战队 2026 赛季开源的 Z-Localization。它不是又一篇论文的复现，而是一次工程取舍的完整展示——为什么把 LIO 和先验地图定位拆成前后端？为什么状态机要设四个状态？为什么地图里要存“点矩”而不是点？我们按“架构 → 前端 → 后端 → 使用流程 → 可借鉴之处”的顺序拆解，并把它与 FAST-LIO2、Point-LIO 放在一起对比。读完你应该能判断：什么场景该用它，什么场景该自己改。}
+
+\section{背景与定位}\label{sec:23-background}
+
+Z-Localization 是东北大学（Northeastern University）T-DT 实验室在 2026 赛季 RoboMaster 超级对抗赛中使用的哨兵定位方案，赛后以 GPL-2.0 协议开源\cite{zloc2026}。它的官方描述是“一套面向移动机器人的 ROS 2 激光惯性定位栈，支持里程计、点云建图、先验地图定位、回环与重定位，也可接入 UWB 提供位置辅助”。
+
+它解决的核心问题，是比赛场景下的三个现实约束：
+\begin{enumerate}
+  \item \textbf{场地是动态的}：有对手、有弹丸、有观众，地图里不能有动态残影；
+  \item \textbf{先验地图不一定可用}：适应性训练阶段可能来不及建图，需要“无图也能跑”；
+  \item \textbf{定位必须可恢复}：云台转动、撞击、遮挡都可能导致里程计飞掉，系统要能自己找回来。
+\end{enumerate}
+
+这些约束决定了它的架构与 FAST-LIO2 那种“一个紧耦合滤波器打天下”的方案不同——它把系统拆成了\textbf{前端 ZLIO} 与\textbf{后端定位}两部分。这个拆分本身就是本章最值得学习的设计。
+
+\section{总体架构：前后端分离}\label{sec:23-arch}
+
+\subsection{为什么拆}
+
+作者在设计说明中给了一个很实在的理由：直接把先验地图塞进 LIO，LIO 是紧耦合的，一旦发散很难判断——“有时候位置飞了，或者速度、加速度已经比较离谱了，才能发现里程计爆炸了”。
+
+拆开之后，职责变得清晰：
+\begin{itemize}
+  \item \textbf{前端（ZLIO）}：只负责在 \textbf{odom 系}里估计运动。它维护自己的局部地图，输出高频里程计、去畸变点云、以及每一帧的位姿。
+  \item \textbf{后端}：只负责维护 $\text{map}\to\text{odom}$ 的变换。它从前方送来关键帧，把关键帧的全局位姿放进因子图优化，用先验地图配准、回环、UWB 提供全局约束。
+\end{itemize}
+
+这样做有三个好处：
+\begin{enumerate}
+  \item \textbf{可观测性分析}：先验图配准的海森矩阵可以单独做可观测性分析，判断点云匹配是否退化、定位是否可信；
+  \item \textbf{减少高频大图访问}：前端不必在每次高频更新时访问巨大的先验地图，理论上更省算力；
+  \item \textbf{可恢复}：前端可以独立重启并重建 odom 系，全局位姿的恢复交给后端单独处理，不会“一崩全崩”。
+\end{enumerate}
+
+\begin{figure}[htbp]
+  \centering
+  \begin{tikzpicture}[node distance=0.9cm]
+    \node[block, minimum width=22mm] (lidar) {LiDAR};
+    \node[block, right=0.7cm of lidar, minimum width=22mm] (imu) {IMU};
+    \node[block2, right=1.2cm of imu, minimum width=30mm, minimum height=16mm] (front) {前端 ZLIO\\局部里程计 + 局部地图};
+    \node[block2, right=1.6cm of front, minimum width=30mm, minimum height=16mm] (back) {后端\\因子图 + $\text{map}\to\text{odom}$};
+    \node[block, below=1.0cm of back, minimum width=26mm] (prior) {先验地图/描述子};
+    \node[block, below=1.0cm of front, minimum width=26mm] (uwb) {UWB};
+    \node[block2, below=1.2cm of lidar, minimum width=30mm] (out) {输出：位姿、速度、协方差、状态};
+    \draw[arrow] (lidar) -- (front);
+    \draw[arrow] (imu) -- (front);
+    \draw[arrow] (front) -- node[above, label]{关键帧 + 点云} (back);
+    \draw[arrow] (prior) -- (back);
+    \draw[arrow] (uwb) -- (back);
+    \draw[arrow] (back) -- node[right, label]{TF 校正} (out);
+    \draw[arrow] (front) -- (out);
+  \end{tikzpicture}
+  \caption{Z-Localization 的前后端架构。前端在 odom 系估计局部运动，后端维护 map 与 odom 之间的变换并输出全局位姿。}
+  \label{fig:23-arch}
+\end{figure}
+
+\subsection{与 SLAM 前后端的区别}
+
+注意这里的“前后端”与第 11 章 SLAM 的前后端不完全一样：
+\begin{itemize}
+  \item SLAM 的前端 = 里程计 + 数据关联；后端 = 回环 + 全局优化。二者共同维护\textbf{一张地图}。
+  \item Z-Localization 的前端 = LIO；后端 = 全局定位（图 23 章\ref{fig:23-arch}）。前端维护\textbf{局部地图}，后端维护\textbf{全局一致性}，二者通过关键帧观测连接。
+\end{itemize}
+这是“定位系统语境下的前端/后端”——正是第 1 章表 1 中的第二种划分。
+
+\section{前端 ZLIO}\label{sec:23-frontend}
+
+前端要解决四件事：误差状态怎么建、怎么启动、怎么去畸变、地图怎么存。
+
+\subsection{误差状态建模}
+
+常见滤波式 LIO 沿用 ESKF 的“直积流形”建模：旋转用乘法更新，位置、速度、零偏用加法更新。ZLIO 采用 \textbf{$\mathrm{SE}_2(3)\ltimes\mathfrak{se}(3)$ 半直积结构}，把导航状态与 IMU 零偏一起纳入误差变换，目的是让姿态和速度部分的无噪声误差得到精确的线性形式，减少线性化误差。
+
+其误差方程（引自项目设计说明）为
+\begin{align}
+\dot{\bm{\rho}}_p &\simeq \bm{\rho}_v-\hat{\bm{p}}\times\bm{\beta}_g+\hat{\bm{p}}\times(\hat{\bm{R}}\bm{n}_\omega),\\
+\dot{\bm{\theta}} &\simeq -\bm{\beta}_g+\hat{\bm{R}}\bm{n}_\omega,\\
+\dot{\bm{\rho}}_v &\simeq \bm{g}\times\bm{\theta}-\bm{\beta}_a+\hat{\bm{v}}\times(\hat{\bm{R}}\bm{n}_\omega)+\hat{\bm{R}}\bm{n}_a,\\
+\dot{\bm{\beta}}_g &\simeq \bigl(\hat{\bm{R}}(\bm{\omega}_m-\hat{\bm{b}}_g)\bigr)\times\bm{\beta}_g-\hat{\bm{R}}\bm{n}_{bg},\\
+\dot{\bm{\beta}}_a &\simeq \bigl(\hat{\bm{R}}(\bm{a}_m-\hat{\bm{b}}_a)+\bm{g}+\hat{\bm{v}}\times\hat{\bm{R}}(\bm{\omega}_m-\hat{\bm{b}}_g)\bigr)\times\bm{\beta}_g \nonumber\\
+&\quad +\bigl(\hat{\bm{R}}(\bm{\omega}_m-\hat{\bm{b}}_g)\bigr)\times\bm{\beta}_a-\hat{\bm{v}}\times(\hat{\bm{R}}\bm{n}_{bg})-\hat{\bm{R}}\bm{n}_{ba}.
+\label{eq:23-err}
+\end{align}
+这里 $\bm{\rho}_p,\bm{\rho}_v,\bm{\theta}$ 分别对应位置、速度、姿态的误差分量，$\bm{\beta}_g,\bm{\beta}_a$ 对应零偏误差。这个模型的推导细节可参考文献\cite{equi2023}。对读者而言，重要的是理解它的动机：\textbf{标准 ESKF 在姿态误差较大时线性化误差明显，而把状态放在更“等变”的群结构上，可以让误差方程在更大范围内保持线性}。
+
+\subsection{不要求静止的初始化}
+
+传统 IMU 初始化要求机器人静止几秒，用加速度均值估计重力方向。但比赛里“定位飞掉重启时，云台可能还在跟随自瞄转动，几乎不能保证静止”。ZLIO 的初始化流程是：
+\begin{enumerate}
+  \item 先用一小段 IMU 数据给出重力方向初值；
+  \item 通过 IMU 传播和点云粗配准得到初步轨迹；
+  \item 积累一段数据后，把\textbf{多帧点云的共面约束}与\textbf{IMU 预积分}放在同一个窗口里联合优化，一起估计位姿、速度、IMU 零偏和重力方向；
+  \item 每轮优化后，用更新后的轨迹重新去畸变，再继续优化（类似迭代最近点 + 优化的交替）；
+  \item 收敛后，把坐标系对齐到重力方向，用窗口末帧状态建立滤波初值与初始地图，进入正常里程计更新。
+\end{enumerate}
+
+这套流程的价值在于：\textbf{把“初始化”从“静止假设”中解放出来}。对任何需要在运动中启动的机器人，这都是可以直接借鉴的思路。
+
+\subsection{去畸变}
+
+ZLIO 的去畸变采用 DLIO\cite{chen2023dlio} 的思路：用 IMU 构造\textbf{分段连续轨迹}，按每个点的采样时刻做运动补偿。具体做法是：
+\begin{enumerate}
+  \item 把加速度转到 odom 系并加入重力，得到实际运动加速度；
+  \item 根据相邻 IMU 数据估计角加速度和加速度变化率；
+  \item 构造这段时间内的姿态与位置轨迹：\textbf{位置随时间按三次多项式变化，姿态由区间内变化的角速度积分得到}；
+  \item 每个点按自己的时间戳找到对应轨迹段，结合外参转换到 odom 系，再统一到本帧结束时刻的 IMU 系。
+\end{enumerate}
+
+相比“假设帧内匀速”的简单做法，这能描述扫描期间角速度和加速度的变化，显著减少云台转动、机器人加减速时的点云畸变。计算上，同一 IMU 区间内的点可以复用轨迹参数，开销可控。
+
+\subsection{地图结构：用统计量代替点}
+
+ZLIO 的地图沿用 VoxelMap\cite{yuan2022voxelmap} 的结构：哈希表索引体素，每个体素内部用八叉树组织平面；若体素内点能用一个平面描述就保存平面，否则继续细分，直到满足平面条件或达到最大深度。平整区域用大体素，几何复杂处用小体素。
+
+它真正改动的地方是\textbf{历史点的保存方式}：平面建立后，不再保存原始支持点，而是保存\textbf{点数、一阶矩、二阶矩}。以体素中心 $\bm{o}$ 为局部原点，记 $\bm{x}_i=\bm{p}_i-\bm{o}$，保存
+\begin{equation}
+N=\sum_i 1,\qquad \bm{s}=\sum_i \bm{x}_i,\qquad \bm{Q}=\sum_i \bm{x}_i\bm{x}_i^{\top}.
+\label{eq:23-moments}
+\end{equation}
+新点加入时，只需累加 $1$、$\bm{x}$、$\bm{x}\bm{x}^{\top}$。由这些累计量恢复平面中心与散布矩阵：
+\begin{equation}
+\bm{c}=\bm{o}+\frac{\bm{s}}{N},\qquad
+\bm{A}=\frac{\bm{Q}}{N}-\frac{\bm{s}\bm{s}^{\top}}{N^{2}},
+\label{eq:23-plane}
+\end{equation}
+再取 $\bm{A}$ 最小特征值对应的单位特征向量作为法向：
+\begin{equation}
+\bm{A}\bm{n}=\lambda_{\min}(\bm{A})\,\bm{n},\qquad \norm{\bm{n}}=1.
+\label{eq:23-normal}
+\end{equation}
+达到更新上限后，进一步释放统计量，只保留匹配所需的平面信息。
+
+\begin{keybox}{这一改动为什么重要}
+原始点云地图的内存随点数线性增长，且每来一个新点都要重新遍历支持点拟合平面。改成“点矩 + 均值/协方差”后，每个平面只存固定大小的统计量，更新是 $O(1)$ 的加法。作者给出的实测结果是：Mid360 ramp 数据 CPU 时间减少 72.8\%、峰值内存减少 86.6\%；Mid70 TN07 数据分别减少 62.6\% 和 90.7\%。
+\end{keybox}
+
+\subsection{面建模与残差}
+
+建图点的测量误差和位姿误差会影响拟合出的平面，因此平面的中心和法向也带有不确定性。除此之外，实际墙面、地面未必完全平整，即使平均平面估得很准，局部点仍可能偏离它。ZLIO 把这两部分都计入观测方差：从支持点沿法向的散布中扣除已知噪声能解释的部分，剩余方差记为 $\tau^{2}$。
+
+对变换到 odom 系的扫描点 $\bm{p}_i$，记测量协方差 $\bm{\Sigma}_i$、平面参数协方差 $\bm{\Sigma}_\pi$、残差对平面参数的雅可比 $\bm{h}_i$，则点面残差及其方差为
+\begin{align}
+r_i &= \bm{n}^{\top}(\bm{p}_i-\bm{c}),\label{eq:23-residual}\\
+\sigma_i^{2} &= \bm{n}^{\top}\bm{\Sigma}_i\bm{n}+\tau^{2}+\bm{h}_i\bm{\Sigma}_\pi\bm{h}_i^{\top}.
+\label{eq:23-resvar}
+\end{align}
+多个点匹配到同一个地图平面时，会共享这份平面误差。如果把它们当作相互独立，点数越多，滤波器就越容易“过度相信”这个平面。ZLIO 的处理是\textbf{按平面分组}，保留平面参数误差带来的相关性。同组中两个不同点的残差协方差为
+\begin{equation}
+\Cov(r_i,r_j)\simeq\bm{h}_i\bm{\Sigma}_\pi\bm{h}_j^{\top},\qquad i\ne j.
+\label{eq:23-corr}
+\end{equation}
+实现时在平面的三个误差自由度内联合处理同组观测（两个法向方向偏差 + 沿法向的位置偏差），消去共享平面误差后，再把整组观测对位姿的约束交给滤波器，从而避免构造随点数增长的大协方差矩阵。记同平面残差向量 $\bm{r}_\pi$、雅可比 $\bm{H}_\pi$，最终残差项为
+\begin{equation}
+\bm{R}_\pi=\diag\left(\bm{n}^{\top}\bm{\Sigma}_i\bm{n}+\tau^{2}\right)+\bm{H}_\pi\bm{\Sigma}_\pi\bm{H}_\pi^{\top},\qquad
+E_\pi=\bm{r}_\pi^{\top}\bm{R}_\pi^{-1}\bm{r}_\pi.
+\label{eq:23-marginal}
+\end{equation}
+这是全书里少见的、把“观测相关性”显式处理的例子。大多数开源 LIO 直接把点面残差当独立，点数一多就会过拟合平面；Z-Localization 的做法值得借鉴。
+
+\subsection{时空自适应}
+
+\textbf{时间自适应}：ZLIO 希望更新频率介于 FAST-LIO 的整帧更新和 Point-LIO 的逐点更新之间，并根据运动与观测信息量自动调整。它把点云按采样时刻切成连续小段，每段去畸变后做一次滤波更新。每次更新后，根据近期线加速度、角加速度和当前点面观测的信息矩阵决定下一次更新间隔。记机体系下加速度与角加速度为 $\bm{\kappa}$，同一坐标系下按匹配点数平均的信息矩阵为 $\bar{\bm{\Lambda}}$，允许误差为 $\varepsilon$，则二阶运动项估计的偏差为
+\begin{equation}
+e^{2}(\Delta t)\simeq\frac{\Delta t^{4}}{4}\bm{\kappa}^{\top}\bar{\bm{\Lambda}}\bm{\kappa},
+\label{eq:23-time-err}
+\end{equation}
+令其等于 $\varepsilon^{2}$ 并解出
+\begin{equation}
+\Delta t_{\mathrm{next}}=\mathrm{clip}\left(\left(\frac{4\varepsilon^{2}}{\bm{\kappa}^{\top}\bar{\bm{\Lambda}}\bm{\kappa}}\right)^{1/4},\ \Delta t_{\min},\ \Delta t_{\max}\right).
+\label{eq:23-time}
+\end{equation}
+运动变化大、且这些变化会明显影响当前点面残差时，缩短间隔；反之延长间隔、积累更多点。本轮更新无效或分母为零时取上限。
+
+\textbf{空间自适应}：为减少对固定采样分辨率的依赖，让同一套参数适应不同大小的场景，ZLIO 取保留时间窗口内代表点到雷达距离的中位数并平滑，作为场景尺度；场景越开阔，目标点数越多。再根据目标点数 $N_k^{*}$ 与实际点数 $N_k$ 的差，用 PD 控制调整采样体素边长：
+\begin{equation}
+e_k=N_k^{*}-N_k,\qquad
+\ell_{k+1}=\mathrm{clip}\left(\ell_k-K_{p,k}e_k-K_{d,k}\frac{e_k-e_{k-1}}{\Delta t_k},\ \ell_{\min},\ \ell_{\max}\right).
+\label{eq:23-space}
+\end{equation}
+点数偏少时减小体素（保留更多点），偏多时增大体素。两个增益随场景尺度、点数误差及其变化调整。
+
+\subsection{不用在线动态点滤除}
+
+作者也尝试过在线滤除动态点，但没有找到能同时兼顾计算开销和滤除率的方法。比赛场景中定位特征更多来自墙壁和棚顶，加入动态点滤除前后的定位效果差距很小；考虑额外开销，最终没有在前端采用在线滤除，而是提供\textbf{离线}工具，在建图后清理保存的地图。
+
+\section{后端定位}\label{sec:23-backend}
+
+\subsection{因子图}
+
+后端因子图的每个节点对应一个关键帧，优化的是它在 \textbf{map 系}中的位置和姿态。图规模由固定时长的滑动窗口控制，窗口外的旧位姿通过边缘化移出（保留约束信息，见第 13 章）。开启 UWB 在线标定时，UWB 坐标系到 map 系的对齐以及时间偏置也作为共享变量持续保留在图中。
+
+图中的因子有：
+\begin{itemize}
+  \item \textbf{锚点先验}：初始化/恢复成功后，把可信位姿作为图中的锚点，形成位姿先验。
+  \item \textbf{里程计因子}：前端提供相邻关键帧之间的相对运动，把轨迹前后连接起来。
+  \item \textbf{先验图配准因子}：有先验地图时，扫描与地图配准提供当前关键帧的全局位姿及约束强度，用来校正前端漂移。
+  \item \textbf{回环因子}：没有先验地图时，回环匹配提供当前帧与历史帧之间的相对位姿，修正累积误差。
+  \item \textbf{UWB 因子}：约束天线位置，完成时间与坐标对齐后与 UWB 测量比较。
+  \item \textbf{重力方向因子}：无先验地图且启用 UWB 时，用前端的重力方向约束横滚和俯仰。
+\end{itemize}
+
+把这套因子图与第 13 章的位姿图对照，你会发现它就是一个“带多种观测的位姿图”：节点是位姿，边是相对位姿约束，只是观测来源更丰富。
+
+\subsection{状态机}
+
+后端不仅做优化，还负责判断“现在信不信得过”。它定义了五个状态：
+
+\begin{table}[htbp]
+  \centering
+  \caption{Z-Localization 后端的定位状态}\label{tab:23-states}
+  \small
+  \begin{tabular}{p{2.4cm}p{5.0cm}p{4.6cm}}
+    \toprule
+    状态 & 含义 & 进入/恢复条件 \\
+    \midrule
+    INITIALIZING & 等待首次定位成功 & 启动时；成功后进入 NORMAL \\
+    NORMAL & 定位正常 & 全局观测与预测一致，校正被接受 \\
+    OBS\_DEGRADED & 点云质量差、观测弱 & 可用全局观测与预测冲突，但证据不足以否定当前位姿；拒绝冲突校正，继续用前端相对运动 \\
+    SUSPECT & 前端漂移、初值已偏 & 冲突持续达阈值，或速度异常、无法局部匹配；保留前端，用地图/描述子/UWB 重新找 TF \\
+    LOST & 估计器故障或前端发散 & SUSPECT 连续恢复失败；需重置前端、重建局部里程计，再用先验图或 UWB 找回全局位姿 \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+判定逻辑分两步：先看点云能提供多少有效约束，再看配准/UWB 观测与当前预测是否一致。进入 SUSPECT 或 LOST 后，若已有可信位姿，输出会\textbf{冻结}在该位姿直到恢复成功——这比输出一个错误位姿要安全得多。这个“冻结而不是乱跳”的策略，在比赛里非常实用。
+
+\subsection{描述子}
+
+作者对描述子的理解很到位：“描述子本质上是在设计点云查询的键值对——用描述子作为键，关联地图中的位置和局部点云。新的点云到来时，先按描述子相似度找到候选位置，再通过点云配准确认位姿。”因此他们关心的是\textbf{相似度在候选位置上的分布}：正确位置附近能否形成足够尖锐、突出的峰值。
+
+\textbf{Scan Context（SC）}\cite{kim2018scancontext}：以雷达为中心，按距离和方位把点云划分为环和扇区，每格记录最高点高度，形成二维描述；比较时尝试不同旋转角度，找到最相似的位置与朝向，为后续配准提供候选和 yaw 初值。SC 对高度分布敏感，生成和查询时都要先做重力矫正、把点云调平。比赛地图只有约 200 个描述子，因此检索直接遍历即可，无需 KD-tree。
+
+\textbf{G-PROBE}\cite{gprobe2026}：复现了论文中的描述子与候选检索方法，面向 Avia、奥丁之眼这类\textbf{有限视场}点云。它把点云表示为带占据概率和不确定性的二维网格，并为地图准备不同方向的视场分支；检索时先筛候选，再在不同朝向下比较共同可见区域的占据与高度分布，同时降低那些在多个朝向上都相似的候选得分。作者指出这部分测试不充分、召回率未达 100\%，建议结合自己的雷达视场调参、充分验证后再用。
+
+\subsection{配准与验收}
+
+正常跟踪时，后端积累近期点云，结合当前预测位姿选取附近的先验子图，做点到面配准。初值好时直接细配准；对应点不足或残差大时，先粗配准再回到细层。
+
+弱观测下的求解参考了 DCReg 的思路。典型例子是实验室走廊：沿走廊前后移动一点，点云仍然贴住两侧墙面，配准很难判断这个方向的位置偏差。ZLIO 用\textbf{舒尔补}分别分析平移和旋转，再根据弱方向构造预条件器，改善求解的数值条件。
+
+配准后，根据残差尺度和海森矩阵对位姿误差做\textbf{白化}：强方向权重大，弱方向权重小，不可观方向不增加约束。再结合图预测的不确定性，通过 \textbf{NIS}（归一化新息平方）和卡方检验判断是否接受这次观测。正常跟踪可以使用部分方向的约束；初始化和重定位则要求\textbf{完整位姿}通过验收，再据此确定 TF 并建立锚点。第 2 章讲过，NIS 的二次型服从卡方分布，这里正是它的直接应用。
+
+\subsection{UWB 初始化}
+
+没有先验地图时，UWB 能提供位置，但单个位置无法确定前端 odom 系与全局坐标系之间的 yaw。ZLIO 把同一时刻的前端天线位置与 UWB 位置配对，通过一段运动求出两条轨迹之间的平移和 yaw，横滚俯仰沿用前端的重力方向。
+
+对水平平移和 yaw 的简化对齐模型做可观测性分析：把轨迹去中心、假设位置噪声独立各向同性且方差相同，得到信息矩阵
+\begin{equation}
+\mathcal{I}=\frac{1}{\sigma_p^{2}}
+\begin{bmatrix}
+N&0&0\\
+0&N&0\\
+0&0&\sum_i\norm{\tilde{\bm{p}}_i}^{2}
+\end{bmatrix},
+\label{eq:23-uwb-info}
+\end{equation}
+于是 yaw 的标准差近似为
+\begin{equation}
+\sigma_\psi\approx\frac{\sigma_p}{\sqrt{\sum_i\norm{\tilde{\bm{p}}_i}^{2}}}.
+\label{eq:23-yawstd}
+\end{equation}
+这个式子非常直观：停在原地时（$\tilde{\bm{p}}_i$ 都接近零）最后一项为零，yaw 无法确定；轨迹在水平面上展开后，航向信息迅速增加。所以“启动后跑开几米，yaw 就可观测了”不是玄学，而是式~\eqref{eq:23-yawstd} 的直接结论。
+
+\subsection{Reset}
+
+重置时，后端冻结当前输出并请求前端重置。前端完成重置、重新提供里程计和点云后，后端再接续或重新确定 $\text{map}\to\text{odom}$ 的 TF，恢复定位输出。作者坦言这套 reset 逻辑比较复杂，主要是为了尽量避免极端情况下的问题；如果场景简单，一个普通的重置服务可能就够了。
+
+\section{使用流程：从 bag 建图到先验定位}\label{sec:23-workflow}
+
+官方推荐的完整流程是：\textbf{回放建图 → 保存地图 → 自动清理 → CloudCompare 精修 → 网格生成地图包与描述子 → 先验定位}。关键命令如下（节选，完整参数见官方文档）：
+
+\begin{lstlisting}[language=bash, caption={Z-Localization 建图与定位的关键命令}]
+# 1. replay a bag and build the map
+ros2 launch bringup bringup.launch.py \
+  frontend_config:="$PWD/config/lio.yaml" \
+  backend_config:="$PWD/pcd/site.yaml" \
+  mode:=mapping use_sim_time:=true rviz:=true
+
+# 2. save the map bundle after the replay finishes
+ros2 service call /backend_node/save_map std_srvs/srv/Trigger "{}"
+
+# 3. remove dynamic ghost points offline (FreeDOM-style)
+ros2 run backend clean_map_bundle \
+  --in "$PWD/pcd/site_raw" --out "$PWD/pcd/site_auto_clean" \
+  --lidar-origin -0.011 -0.02329 0.04412
+
+# 4. rebuild map bundle and descriptors from the refined PCD
+ros2 run backend build_pcd_map_bundle \
+  --input "$PWD/pcd/site_refined.pcd" --out-bundle "$PWD/pcd/site_prior" \
+  --x-min 0 --x-max 28 --y-min 0 --y-max 15 \
+  --sensor-z 0.0 --bundle-step 1.5 \
+  --map-voxel 0.15 --scan-voxel 0.4 \
+  --descriptor-type scan_context --sc-lidar-height 0.35
+
+# 5. run localization against the prior map
+ros2 launch bringup bringup.launch.py \
+  frontend_config:="$PWD/config/lio.yaml" \
+  backend_config:="$PWD/pcd/site.yaml" \
+  mode:=localization prior_map:="$PWD/pcd/site_prior" \
+  use_sim_time:=true rviz:=true
+\end{lstlisting}
+
+流程里有几个值得注意的工程细节：
+\begin{itemize}
+  \item \textbf{建图与定位用同一套入口}，只是 \texttt{mode} 不同，这减少了“两套代码不一致”的风险；
+  \item \textbf{离线清理动态残影}参考 FreeDOM 的思路，作者实测“非常有效”，但仍不足以直接使用，需要 CloudCompare 手工收尾；
+  \item \textbf{描述子按网格重新生成}，而不是建图时直接保存——尤其雷达水平安装时，这样生成的描述子质量更好；
+  \item 保存地图包时保留\textbf{关键帧和局部点云}，后续清理需要它们；只存全局点云是不够的。
+\end{itemize}
+
+\section{与其他 LIO 方案的对比}\label{sec:23-compare}
+
+\begin{table}[htbp]
+  \centering
+  \caption{Z-Localization 与主流 LIO 方案的定位}\label{tab:23-compare}
+  \small
+  \begin{tabular}{p{2.6cm}p{3.4cm}p{3.2cm}p{4.2cm}}
+    \toprule
+    方案 & 核心结构 & 全局定位方式 & 适合场景 \\
+    \midrule
+    FAST-LIO2 & 紧耦合 IEKF + iKD-Tree & 无（需外接） & 单机建图/里程计，算力中等 \\
+    Point-LIO & 逐点更新 + 无帧累积 & 无（需外接） & 剧烈运动、IMU 易饱和 \\
+    LIO-SAM & 因子图 + 预积分 + 回环 & 回环 & 大范围建图，有回环 \\
+    Z-Localization & 前端 ZLIO + 后端因子图 & 先验图配准 + UWB + 回环 & 有场地先验、要求可恢复的比赛场景 \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+选型时的判断逻辑：
+\begin{enumerate}
+  \item 有没有\textbf{场地先验地图}？有 → 优先考虑 Z-Localization 这种前后端分离方案；没有 → FAST-LIO2/Point-LIO 先跑起来，或像 Z-Localization 那样用 UWB 过渡。
+  \item 会不会\textbf{剧烈运动/IMU 饱和}？会 → Point-LIO 或空间自适应采样；不会 → FAST-LIO2 足够。
+  \item 需不需要\textbf{定位失效后自动恢复}？需要 → 必须有后端状态机和重定位，这正是 Z-Localization 的核心价值。
+  \item 算力/内存是否紧张？紧张 → 注意其“用空间换时间”的后端设计（内存占用相对较高），可通过参数降低。
+\end{enumerate}
+
+\section{可借鉴的设计思想}\label{sec:23-lessons}
+
+即使你不用这套代码，它的几个设计决策也值得抄进自己的系统：
+\begin{enumerate}
+  \item \textbf{把“局部估计”和“全局校正”解耦}：不要让一个紧耦合滤波器同时承担两件事，否则发散时你无法定位问题。
+  \item \textbf{状态机比算法更重要}：比赛里“输出冻结”往往比“输出一个略错的位姿”更安全。
+  \item \textbf{地图存统计量而不是点}：精度损失很小，内存和更新开销大幅下降。
+  \item \textbf{显式处理观测相关性}：同一平面的点不独立，忽略相关性会让滤波器过度自信。
+  \item \textbf{先验地图要“精修 + 重新生成描述子”}：地图质量决定定位上限。
+  \item \textbf{用可观测性分析指导调参}：弱方向、yaw 可观测性、NIS 检验，都是把“玄学”变成“可测量”的手段。
+\end{enumerate}
+
+\begin{summary}
+
+\begin{enumerate}
+  \item Z-Localization 是面向比赛场景的 ROS 2 激光惯性定位栈，核心是\textbf{前端 ZLIO + 后端因子图}的分离架构。
+  \item 前端负责 odom 系内的局部估计：SE$_2$(3)$\ltimes\mathfrak{se}(3)$ 误差建模、不要求静止的初始化、DLIO 式去畸变、基于点矩的 VoxelMap。
+  \item 后端负责 map$\to$odom 的变换：多源因子图、五状态状态机、Scan Context/G-PROBE 描述子、带舒尔补白化的配准与 NIS 验收、UWB 对齐、Reset。
+  \item 时空自适应让前端在“整帧更新”与“逐点更新”之间自适应，兼顾精度与资源。
+  \item 它的工程取舍（冻结输出、离线清图、描述子重建、统计量地图）比具体公式更值得学习。
+\end{enumerate}
+
+\end{summary}
+
+\begin{problemset}
+
+  \item 为什么“把先验地图直接塞进 LIO”会导致发散时难以判断？拆成前后端后，哪些量变得可观测？
+  \item 由式~\eqref{eq:23-yawstd} 解释：为什么 UWB 初始化时“跑几米”就能确定 yaw？如果只走直线，yaw 能确定吗？
+  \item 点矩地图用 $N,\bm{s},\bm{Q}$ 三个统计量恢复平面。请写出由它们计算平面中心与协方差矩阵的完整步骤。
+  \item 状态机里 OBS\_DEGRADED 和 SUSPECT 的区别是什么？各自应该采取什么动作？
+  \item 如果你要把 Z-Localization 移植到只有 2D 雷达的机器人上，哪些模块需要改？哪些思想仍然适用？
+\end{problemset}
+
+\begin{reading}
+
+\begin{itemize}
+  \item \cite{zloc2026}：项目主页与 \texttt{docs/design.md}，本章的一手材料。
+  \item \cite{yuan2022voxelmap}：自适应体素地图的原始论文，理解地图结构的必读。
+  \item \cite{chen2023dlio}：连续时间去畸变思路的来源。
+  \item \cite{kim2018scancontext}、\cite{gprobe2026}：两种描述子的原理与适用条件。
+  \item \cite{equi2023}：SE$_2$(3) 等变误差建模的理论背景。
+\end{itemize}
+
+
+\end{reading}
+
+

@@ -1,0 +1,344 @@
+\chapter{全局路径规划}\label{ch:19-global-planning}
+
+\usetikzlibrary{arrows.meta,positioning,calc,fit,patterns,decorations.pathreplacing}
+
+\chapterintro{第~\ref{ch:18-nav-overview}~章把导航拆成“全局规划 + 局部规划”两层，本章专门讲全局规划：在一张已知的地图（栅格、路网、可通行区域）上，为机器人找一条从起点到目标点的路径。我们按“从严谨到实用”的顺序展开：先定义问题与评价标准，再讲 Dijkstra、A* 及其可采纳性证明，然后讲工业界最常用的三种加速/扩展——JPS（跳点搜索）、Hybrid A*（满足最小转弯半径）与 RRT*（高维采样），最后落到 Nav2 的规划器插件与路径平滑。学完本章，你应该能手推 A* 为什么最优、能根据底盘类型选规划器、并知道代价地图的代价值如何变成搜索的边权。}
+
+\section{问题定义与评价标准}\label{sec:19-problem}
+
+全局规划可以抽象成\textbf{图搜索}问题。把机器人可能处于的每个状态抽象成一个\textbf{节点}（node），把一次允许的转移抽象成一条\textbf{边}（edge），边上带非负代价 $c(n,n')>0$；给定起点 $s$ 与目标 $t$，要求一条路径 $\pi=(s=n_0,n_1,\dots,n_k=t)$，使其总代价
+\begin{equation}
+  C(\pi)=\sum_{i=0}^{k-1} c(n_i,n_{i+1})
+  \label{eq:19-pathcost}
+\end{equation}
+最小。2D 栅格地图上，节点就是格子，边是 4 邻接或 8 邻接的相邻格，$c$ 通常取 1（直走）与 $\sqrt2$（斜走），再加上该格的代价值惩罚。
+
+先用一个具体例子把符号落地：分辨率 $0.05\ \mathrm{m}$ 的栅格里，直走一格代价 1、实际长度 $0.05\ \mathrm{m}$；斜走一格代价 $\sqrt2\approx1.414$、实际长度 $0.0707\ \mathrm{m}$。若某格代价值 $c_{\mathrm{cell}}=100$（比较靠近障碍），工程上把它折算成额外代价，例如边权取 $w=1+3\cdot(100/254)\approx2.18$，于是规划器会“宁可绕一格也不贴着障碍走”。
+
+\begin{definition}[完备性、最优性、启发函数]
+\textbf{完备性}（completeness）：如果解存在，算法一定能在有限时间内找到一条解；\textbf{最优性}（optimality）：算法找到的解的代价等于最小代价 $C^*$；\textbf{启发函数}（heuristic）$h(n)$ 是对“从节点 $n$ 到目标的剩余代价”的估计，真实剩余最优代价记作 $h^*(n)$。若对所有 $n$ 都有 $0\le h(n)\le h^*(n)$，称 $h$ \textbf{可采纳}（admissible）；若还满足 $h(n)\le c(n,n')+h(n')$（三角不等式），称 $h$ \textbf{一致}（consistent，或单调）。
+\end{definition}
+
+用数字感受一下：在 $10\times10$ 栅格里从 $(1,1)$ 到 $(8,8)$，若只许四邻接直走，真实剩余代价 $h^*=7+7=14$。曼哈顿距离 $h=|8-1|+|8-1|=14$，恰好等于 $h^*$，既紧又可采纳；欧氏距离 $h=\sqrt{7^2+7^2}=9.90$，也可采纳但偏小；若误用“直线距离 $\times2$”$=19.8>h^*$，就\textbf{不可采纳}，A* 不再保证最优。
+
+\section{Dijkstra 算法}\label{sec:19-dijkstra}
+
+Dijkstra 是“无启发”的最短路：维护一个按 $g(n)$（从起点到 $n$ 的当前最优代价）排序的优先队列，每次弹出 $g$ 最小的节点并松弛它的邻居。
+
+\begin{pseudo}{Dijkstra（单源最短路）}
+  \item 初始化：$g(s)=0$，其余 $g(n)=+\infty$；优先队列 $Q$ 只放 $s$；closed 集为空
+  \item 当 $Q$ 非空：弹出 $g$ 最小的节点 $n$，若 $n=t$ 则回溯得到路径并返回
+  \item 若 $n\in$ closed 则跳过；把 $n$ 加入 closed
+  \item 对 $n$ 的每个邻居 $n'$：若 $g(n)+c(n,n')<g(n')$，则更新 $g(n')$，记录父节点为 $n$，把 $n'$ 压入 $Q$
+  \item 若 $Q$ 空了仍未到 $t$，说明不存在可行路径
+\end{pseudo}
+
+\textbf{正确性要点}：当 $n$ 被弹出时，$g(n)$ 已经是最优的。因为所有边权非负，任何“更短、但尚未发现的路径”都必须经过 $Q$ 中某个 $g$ 不小于 $g(n)$ 的节点，而它之后再走非负代价只会更贵——这与 $n$ 是当前最小矛盾。复杂度：用二叉堆实现时，每个节点入队/出队各 $O(\log V)$，每条边松弛一次，总计 $O((V+E)\log V)$；栅格图上 $E\approx4V$ 或 $8V$，故约 $O(V\log V)$。
+
+$10\times10$ 的图有 $V=100$ 个节点，计算量可忽略；换成 $1000\times1000$ 的室内地图，$V=10^6$，Dijkstra 就明显偏慢，这正是需要启发函数的原因。
+
+\section{A*：用启发函数剪枝}\label{sec:19-astar}
+
+A* 在 Dijkstra 上只改一处：优先队列按
+\begin{equation}
+  f(n)=g(n)+h(n)
+  \label{eq:19-f}
+\end{equation}
+排序。$g(n)$ 是“已经花的钱”，$h(n)$ 是“预计还要花的钱”，$f(n)$ 是“整条路径的预算估计”。因为 $h$ 把目标方向的信息带了进来，A* 会优先朝目标扩展，扩展节点数通常远少于 Dijkstra\cite{hart1968astar}。
+
+\subsection{可采纳性：为什么 $h\le h^*$ 就保证最优}
+
+这是本章最需要“真的推一遍”的定理。
+
+\begin{theorem}[A* 的最优性]
+若启发函数可采纳（$0\le h(n)\le h^*(n)$ 且 $h(t)=0$），边权非负，则 A* 返回的路径代价等于最优代价 $C^*$。
+\end{theorem}
+
+\textbf{证明}（反证法）。设最优路径为 $\pi^*$，代价 $C^*$。假设 A* 在弹出目标 $t$ 时返回的路径代价 $C>C^*$，即 $f(t)=g(t)+h(t)=C>C^*$。
+
+第一步，证明“前沿里始终存在 $\pi^*$ 上的节点，且其 $g$ 已是最优”。A* 每弹出一个节点就松弛其所有邻居，因此只要 $\pi^*$ 上某节点的前驱被扩展过，该节点就会被放进 open 表。初始时 $s=n_0$ 在 open 表且 $g(s)=0=g^*(s)$。假设弹出 $t$ 之前，$\pi^*$ 上已有 $n_0,\dots,n_{k-1}$ 被扩展且 $g(n_i)=g^*(n_i)$，则扩展 $n_{k-1}$ 时松弛边 $(n_{k-1},n_k)$，得到
+\begin{equation}
+  g(n_k)\le g(n_{k-1})+c(n_{k-1},n_k)=g^*(n_{k-1})+c(n_{k-1},n_k)=g^*(n_k).
+\end{equation}
+而 $g(n_k)$ 不可能小于最优前缀代价 $g^*(n_k)$（否则 $g^*(n_k)$ 就不是最优），故 $g(n_k)=g^*(n_k)$。归纳得：在弹出 $t$ 的时刻，$\pi^*$ 上第一个尚未被扩展的节点 $n$ 必在 open 表中，且 $g(n)=g^*(n)$。
+
+第二步，估计这个 $n$ 的 $f$ 值。由 $\pi^*$ 的最优性，$g^*(n)+h^*(n)=C^*$；又 $h$ 可采纳，$h(n)\le h^*(n)$，于是
+\begin{equation}
+  f(n)=g(n)+h(n)=g^*(n)+h(n)\le g^*(n)+h^*(n)=C^*.
+\end{equation}
+
+第三步，利用 A* 的“按 $f$ 最小弹出”性质。既然 $t$ 被弹出，说明它对所有 open 节点都有 $f(t)\le f(n)$，于是
+\begin{equation}
+  C=f(t)\le f(n)\le C^*,
+\end{equation}
+这与假设 $C>C^*$ 矛盾。因此 $C=C^*$，A* 返回最优解。证毕。
+
+这个证明用了三个前提：边权非负（保证“绕远不会更便宜”）、$h(t)=0$（目标处预算就是已花费）、$h$ 可采纳（保证估计不会高过真实），缺一不可。
+
+\subsection{一致性：为什么可以不重复扩展}
+
+若 $h$ 还满足一致性 $h(n)\le c(n,n')+h(n')$，则沿任意一条边 $n\to n'$，
+\begin{equation}
+  f(n)=g(n)+h(n)\le g(n)+c(n,n')+h(n')=f(n'),
+\end{equation}
+即 $f$ 沿路径单调不减。注意等式右端正是 $f(n')$，因为 $g(n')=g(n)+c(n,n')$ 是沿这条边到达 $n'$ 的代价（可能还不是最优，但上界成立）。
+
+由此可证“每个节点只扩展一次就得到最优 $g$”。设节点 $n$ 被弹出时 $g(n)>g^*(n)$。取最优路径上第一个尚未被扩展的节点 $n'$，由第一步同样的归纳可知 $g(n')=g^*(n')$。沿最优路径从 $n'$ 到 $n$ 反复使用一致性 $h(n_i)\le c(n_i,n_{i+1})+h(n_{i+1})$ 并求和，得到
+\begin{equation}
+  h(n')\le \bigl(g^*(n)-g^*(n')\bigr)+h(n).
+\end{equation}
+两边同加 $g^*(n')$：
+\begin{equation}
+  f(n')=g^*(n')+h(n')\le g^*(n)+h(n)<g(n)+h(n)=f(n),
+\end{equation}
+最后一个不等号用到了假设 $g^*(n)<g(n)$。于是 $f(n')<f(n)$，$n'$ 会被先弹出，与“$n$ 先弹出”矛盾。所以弹出时必有 $g(n)=g^*(n)$，closed 集不会误封节点，A* 无需重新打开已关闭节点。
+
+\subsection{启发函数的设计}
+
+设当前节点 $(x,y)$、目标 $(x_g,y_g)$，常用三种：
+
+\begin{itemize}
+  \item \textbf{曼哈顿距离} $h=|x-x_g|+|y-y_g|$：四邻接栅格的精确下界，可采纳且一致；上例 $h=14$。
+  \item \textbf{欧氏距离} $h=\sqrt{(x-x_g)^2+(y-y_g)^2}$：任意方向移动都适用；上例 $h=\sqrt{98}=9.90$，比曼哈顿松，扩展更多。
+  \item \textbf{对角距离}（八邻接、直走 1 斜走 $\sqrt2$）：设 $d_x=|x-x_g|$、$d_y=|y-y_g|$，则 $h=\max(d_x,d_y)+(\sqrt2-1)\min(d_x,d_y)$；上例 $h=7+0.414\times7=9.90$，数值与欧氏相同，但在八邻接图上更精确。
+\end{itemize}
+
+\textbf{启发函数越紧（越接近 $h^*$ 且不超过），扩展越少，但计算 $h$ 本身也越贵。}这是工程上的经典取舍：曼哈顿最便宜，欧氏最通用，八邻接地图上用对角距离。
+
+\subsection{$10\times10$ 网格手算例子}
+
+\begin{figure}[htbp]
+  \centering
+  \begin{tikzpicture}[scale=0.62, font=\footnotesize]
+    \draw[step=1cm, black!22, thin] (0,0) grid (7,7);
+    \foreach \x/\y in {0/0,1/0,0/1,1/1,2/0,2/1,2/2,2/3,2/4,4/4,5/4,4/5,4/6}
+      \fill[structurecolor!12] (\x,\y) rectangle ++(1,1);
+    \foreach \x/\y in {3/1,3/2,3/3}
+      \fill[black!55] (\x,\y) rectangle ++(1,1);
+    \draw[arrow, structurecolor, line width=1.1pt]
+      (0.5,0.5) -- (0.5,2.5) -- (2.5,2.5) -- (2.5,4.5)
+      -- (4.5,4.5) -- (4.5,6.5) -- (6.5,6.5);
+    \node[circle, fill=green!45!black, inner sep=1.2pt] at (0.5,0.5) {};
+    \node[below left, label] at (0.5,0.5) {$s$};
+    \node[circle, fill=red!70!black, inner sep=1.2pt] at (6.5,6.5) {};
+    \node[above right, label] at (6.5,6.5) {$t$};
+    \node[black!55, font=\scriptsize] at (3.5,2.5) {障碍};
+    \node[structurecolor, font=\scriptsize] at (1.5,1.5) {已扩展};
+  \end{tikzpicture}
+  \caption{A* 在栅格上的扩展与最终路径示意。浅色格是 $f$ 值相同、被优先扩展的“等值带”；深色格是障碍；折线是最终路径。启发函数的作用就是把扩展限制在朝目标的等值带内，而不是像 Dijkstra 那样铺满整张图。}
+  \label{fig:19-astar}
+\end{figure}
+
+设栅格 $10\times10$，坐标 $(x,y)$ 取 $0,\dots,9$，四邻接直走代价 1。起点 $s=(1,1)$，目标 $t=(8,8)$。障碍是一条横墙：第 $y=2$ 行的 $x=0,\dots,8$ 全部不可通行，只在 $(9,2)$ 留一个缺口，于是机器人必须先绕到最右侧，才能上到墙的上方。曼哈顿启发 $h=|8-x|+|8-y|$，扩展过程见表~\ref{tab:19-astar}。
+
+\begin{table}[htbp]
+  \centering
+  \caption{手算 A*：关键节点的 $g$、$h$、$f$}
+  \label{tab:19-astar}
+  \small
+  \begin{tabular}{llccc}
+    \toprule
+    节点 $(x,y)$ & 到达方式 & $g$ & $h$ & $f=g+h$ \\
+    \midrule
+    $(1,1)$ & 起点 & 0 & 14 & 14 \\
+    $(2,1)$ & 向右一步 & 1 & 13 & 14 \\
+    $(5,1)$ & 向右四步 & 4 & 10 & 14 \\
+    $(8,1)$ & 向右七步 & 7 & 7 & 14 \\
+    $(9,1)$ & 再向右一步 & 8 & 8 & 16 \\
+    $(9,3)$ & 经缺口上移 & 10 & 6 & 16 \\
+    $(9,7)$ & 沿右侧上行 & 14 & 2 & 16 \\
+    $(8,8)$ & 向左一步到达 & 16 & 0 & 16 \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+读表~\ref{tab:19-astar} 要注意两点。第一，墙下方一整排节点的 $f$ 都等于 14，A* 无法区分它们，只能全部扩展，这就是图~\ref{fig:19-astar} 里的“等值带”；启发函数在陷阱地形中会变“钝”。第二，真正的路径代价是 16，而 $h(s)=14$，说明曼哈顿距离是下界（可采纳），但低估了 2 步——多出来的 2 步正是绕墙的代价。若换用欧氏距离，$h(s)=9.90$，低估更多，扩展的节点只会更多。这解释了“为什么在长走廊、凹形房间里 A* 会退化成 Dijkstra”。
+
+\section{JPS：跳点搜索}\label{sec:19-jps}
+
+A* 的扩展量还可以再压：栅格上有大量节点处于同一方向、同一代价的“直道”上，逐个扩展毫无意义。JPS（Jump Point Search）\cite{harabor2011jps} 的思路是\textbf{只保留必须做决策的“跳点”}（jump point），直道中间的点直接跳过。
+
+核心概念是\textbf{强制邻居}（forced neighbor）：假设从父节点 $p$ 沿方向 $\bm{d}$ 走到当前节点 $x$。若 $x$ 的某个邻居 $n$ 不在 $\bm{d}$ 的“自然前进方向”上，但\textbf{不经过 $x$ 就无法从 $p$ 以最优代价到达 $n$}（典型情形是 $n$ 旁边紧贴障碍，$x$ 是该障碍的拐角），则 $n$ 是 $x$ 的强制邻居，$x$ 必须作为跳点保留。JPS 的规则是：沿方向 $\bm{d}$ 一直“跳”，直到（1）遇到强制邻居，（2）到达目标，（3）撞到障碍；遇到（1）（2）就把该点加入 open 表，遇到（3）则此方向作废。
+
+\begin{pseudo}{JPS 的跳点函数 Jump($x$, $\bm{d}$)}
+  \item $x' \gets x+\bm{d}$（沿方向走一步）
+  \item 若 $x'$ 不可通行，返回空
+  \item 若 $x'=t$，返回 $x'$
+  \item 若 $x'$ 存在强制邻居，返回 $x'$
+  \item 若 $\bm{d}$ 是对角方向：对两个正交分量分别递归 Jump($x'$, $\bm{d}_x$)、Jump($x'$, $\bm{d}_y$)，任一返回非空则返回 $x'$
+  \item 否则返回 Jump($x'$, $\bm{d}$)
+\end{pseudo}
+
+JPS 的最坏复杂度与 A* 同阶，但实际扩展节点数常减少一个数量级（开阔场景中甚至接近直线上的点数）。它的代价是：强制邻居的判定与对角递归让代码复杂，且依赖栅格的 8 邻接规则；在代价值不均匀的代价地图上，JPS 的“对称路径假设”不成立，效果会打折扣。
+
+\section{Hybrid A*：给车用的 A*}\label{sec:19-hybrid}
+
+普通 A* 的路径由栅格边组成，会出现 $45^\circ$ 折线，且隐含“可以原地转向、可以任意小半径转弯”的假设。轮式底盘（尤其阿克曼式）做不到：它有最小转弯半径 $R_{\min}$，不能横移，倒车也受限制。Hybrid A*\cite{dolgov2010hybridastar} 的做法是：\textbf{搜索状态仍是连续的 $(x,y,\theta)$，但用栅格做“已访问”去重}，扩展时不再连相邻格，而是用一串符合车辆运动学的\textbf{运动基元}（motion primitive）。
+
+最常用的基元来自自行车模型。设轴距 $L$、前轮转角 $\delta$、速度 $v$（可正可负），则
+\begin{equation}
+  \dot x=v\cos\theta,\qquad \dot y=v\sin\theta,\qquad \dot\theta=\frac{v\tan\delta}{L}.
+  \label{eq:19-bicycle}
+\end{equation}
+把 $\delta$ 固定为几个离散值（如 $-\delta_{\max},0,+\delta_{\max}$），把时间离散为步长 $\Delta t$，就得到一条短弧：
+\begin{equation}
+  x_{k+1}=x_k+v\Delta t\cos\theta_k,\quad
+  y_{k+1}=y_k+v\Delta t\sin\theta_k,\quad
+  \theta_{k+1}=\theta_k+\frac{v\Delta t\tan\delta_k}{L}.
+\end{equation}
+例如 $L=0.5\ \mathrm{m}$、$\delta_{\max}=30\degree$、$v=1\ \mathrm{m/s}$、$\Delta t=0.2\ \mathrm{s}$，则每步前进 $0.2\ \mathrm{m}$，转角增量 $\Delta\theta=0.2\times\tan30\degree/0.5=0.231\ \mathrm{rad}=13.2\degree$，对应的最小转弯半径 $R_{\min}=L/\tan\delta_{\max}=0.5/0.577=0.866\ \mathrm{m}$。
+
+“Hybrid”体现在两处：状态连续（$x,y,\theta$ 是实数），去重离散（把状态映射到索引 $(\lfloor x/\rho\rfloor,\lfloor y/\rho\rfloor,\lfloor\theta/\Delta\theta\rfloor)$ 记入 closed 表，$\rho$ 是栅格分辨率）。
+
+启发函数取两个下界的最大值：
+\begin{itemize}
+  \item $h_{\mathrm{kin}}$：忽略障碍、只考虑运动学的最短距离（Reeds-Shepp 曲线，允许前进 + 倒车；只许前进时用 Dubins 曲线）；
+  \item $h_{\mathrm{grid}}$：忽略运动学、用 2D 栅格 Dijkstra 算出的带障碍最短距离。
+\end{itemize}
+两者都是真实代价的下界（各自忽略了一部分约束），所以 $h=\max(h_{\mathrm{kin}},h_{\mathrm{grid}})$ 仍可采纳；取最大还能让搜索同时被“运动学可行”和“避开障碍”两个方向引导。
+
+代价函数除了路径长度，还要加惩罚项：倒车惩罚、换挡惩罚、转角变化惩罚、贴近障碍惩罚。工程上这些权重通常设成“1 m 倒车约等于 2--3 m 前进”的量级。
+
+\begin{figure}[htbp]
+  \centering
+  \begin{tikzpicture}[scale=0.95, font=\footnotesize]
+    \fill[structurecolor!8] (-0.4,-0.35) rectangle (0.4,0.35);
+    \draw[structurecolor, thick] (-0.4,-0.35) rectangle (0.4,0.35);
+    \fill[black!70] (-0.28,-0.3) rectangle (0.28,-0.22);
+    \fill[black!70] (-0.28,0.22) rectangle (0.28,0.3);
+    \draw[arrow] (0.4,0) -- (0.7,0) node[right, label] {$\theta$};
+    \draw[arrow, green!45!black, thick] (0.4,0.0) .. controls (1.4,0.1) and (2.0,0.9) .. (2.2,1.9)
+      node[above, label] {$\delta=+\delta_{\max}$};
+    \draw[arrow, black!70, thick] (0.4,0) -- (2.2,0) node[right, label] {$\delta=0$};
+    \draw[arrow, red!60!black, thick] (0.4,0.0) .. controls (1.4,-0.1) and (2.0,-0.9) .. (2.2,-1.9)
+      node[below, label] {$\delta=-\delta_{\max}$};
+  \end{tikzpicture}
+  \caption{Hybrid A* 从一个状态出发的三条运动基元：左转、直行、右转。每条基元都满足式~\eqref{eq:19-bicycle} 的自行车模型，因此生成的路径天然满足最小转弯半径；搜索时把每条基元的终点作为新状态压入 open 表。}
+  \label{fig:19-hybrid}
+\end{figure}
+
+Hybrid A* 适合车、差速底盘、以及一切“不能原地 $360^\circ$ 旋转”的平台。代价是状态空间变成三维，节点数明显增加；工程上常配“先粗后细”的两阶段（低分辨率搜索 + 高分辨率精修），以及 anytime 版本（先给一条可行解，再持续优化）。
+
+\section{采样规划：RRT 与 RRT*}\label{sec:19-sampling}
+
+当状态维数很高（机械臂 6--7 维、无人机 3 维位置 + 姿态）或地图没有显式栅格时，图搜索不再适用，改用\textbf{采样规划}：在状态空间随机撒点，把点连成一棵树，直到连到目标。
+
+RRT（快速扩展随机树）每次采样 $q_{\mathrm{rand}}$，在树中找最近节点 $q_{\mathrm{near}}$，从 $q_{\mathrm{near}}$ 朝 $q_{\mathrm{rand}}$ 走固定步长 $\eta$ 得到 $q_{\mathrm{new}}$，若边不与障碍相交则加入树。RRT 是概率完备的（采样足够多时以概率 1 找到解），但找到的路径往往很绕、不最优。
+
+RRT*\cite{karaman2011rrtstar} 做了两处关键改进。第一，\textbf{选择父节点}：不以“最近”为准，而是在半径 $r_n$ 内的所有节点中，选“把它接到 $q_{\mathrm{new}}$ 后总代价最小”的那个当父节点。第二，\textbf{重连}（rewire）：对半径 $r_n$ 内的每个节点 $q$，若“经过 $q_{\mathrm{new}}$ 到 $q$”比“$q$ 原来的路径”更短，就把 $q$ 的父节点改成 $q_{\mathrm{new}}$。选择半径随节点数增加而收缩，定义为
+\begin{equation}
+  r_n=\gamma\left(\frac{\log n}{n}\right)^{1/d}
+  \label{eq:19-rrtstar}
+\end{equation}
+其中 $n$ 是当前节点数，$d$ 是状态维数，$\gamma$ 是常数。$r_n$ 随 $n$ 增大而缩小：早期重连范围大（快速优化），后期范围小（局部精修）。在这套机制下，RRT* 是渐近最优的：采样数 $n\to\infty$ 时，返回路径的代价以概率 1 收敛到最优。
+
+\begin{figure}[htbp]
+  \centering
+  \begin{tikzpicture}[scale=1.35, font=\footnotesize]
+    \coordinate (root) at (0,0);
+    \coordinate (a) at (1.0,0.5);
+    \coordinate (b) at (1.8,1.4);
+    \coordinate (c) at (0.6,1.5);
+    \coordinate (d) at (2.4,0.9);
+    \coordinate (e) at (3.2,2.1);
+    \coordinate (f) at (2.1,2.8);
+    \coordinate (g) at (4.0,3.2);
+    \coordinate (q) at (2.6,1.7);
+    \draw[black!55, thick] (root) -- (a);
+    \draw[black!55, thick] (a) -- (b);
+    \draw[black!55, thick] (a) -- (c);
+    \draw[black!55, thick] (a) -- (d);
+    \draw[black!55, thick] (d) -- (e);
+    \draw[black!55, thick] (b) -- (f);
+    \draw[black!55, thick] (e) -- (g);
+    \draw[green!45!black, thick, dashed] (q) circle (1.2);
+    \draw[arrow, green!45!black, line width=1.2pt] (b) -- (q);
+    \draw[arrow, red!60!black, thick, dashed] (q) -- (e);
+    \foreach \p in {root,a,b,c,d,e,f,g}
+      \fill[structurecolor] (\p) circle (1.5pt);
+    \fill[green!45!black] (q) circle (1.8pt);
+    \node[below, label, green!45!black] at (q) {$q_{\mathrm{new}}$};
+    \node[circle, fill=red!70!black, inner sep=2pt] (goal) at (4.9,4.3) {};
+    \node[right, label] at (goal) {目标};
+    \node[green!45!black, label, above, sloped] at (2.2,1.55) {最优父节点};
+    \node[red!60!black, label, above, sloped] at (2.95,1.95) {重连};
+    \node[label, below left] at (root) {根};
+  \end{tikzpicture}
+  \caption{RRT* 的“选父节点 + 重连”。绿色虚线圈是选择半径 $r_n$；绿色实线是被选中的最优父边；红色虚线是重连后更短的连接。RRT* 用这种“不断改父节点”的方式，把一棵随机的树逐渐拉向最优解。}
+  \label{fig:19-rrtstar}
+\end{figure}
+
+工程上 RRT* 的主要问题是收敛慢、结果依赖随机数，所以常配 \textbf{Informed RRT*}：先用一次搜索找到初始解，再把采样限制在“代价不超过当前最优解”的椭圆内，加速收敛。高维机械臂规划多用 RRT-Connect 或 OMPL 里的各种变体。
+
+\section{其他经典方法与工程实践}\label{sec:19-others}
+
+\textbf{可视图}（visibility graph）：把障碍物的顶点与起终点两两连线，保留不与障碍相交的边，在图上跑 Dijkstra。它在多边形障碍中给出最短路径，节点数少、结果精确，但“贴边”太危险，且只适合多边形表示的地图。Voronoi 图则相反：它给出“离障碍最远”的路径，安全性好、长度偏长，适合做保守规划。第~\ref{ch:21-3d-nav}~章会看到 FAR Planner 如何在 3D 中增量维护可视图。
+
+\textbf{人工势场}（potential field）是另一类思路：把目标设为引力源、障碍设为斥力源，机器人沿合力方向走。它极快、极简单，但有局部极小值（机器人卡在凹形障碍前），第~\ref{ch:20-local-planning}~章会给出完整公式并讨论改进。
+
+在 Nav2 中，全局规划由 \texttt{planner\_server} 的插件实现，常用的有：
+
+\begin{itemize}
+  \item \texttt{NavfnPlanner}：在代价地图上跑 Dijkstra/A*（可切换），支持 4/8 邻接，最经典、最稳。
+  \item \texttt{SmacPlanner2D}：显式 A*，支持未知区域代价、可配置启发权重，适合 2D 差速底盘。
+  \item \texttt{SmacPlannerHybrid}：Hybrid A*，支持倒车、最小转弯半径，适合阿克曼与“不能原地转”的平台。
+  \item \texttt{SmacPlannerLattice}：状态格（lattice）规划，适合需要精确运动原语的场景。
+\end{itemize}
+
+\begin{lstlisting}[language=Python]
+# nav2_params.yaml (excerpt): pick and tune the global planner plugin
+planner_server:
+  ros__parameters:
+    planner_plugins: ["GridBased", "Hybrid"]
+    GridBased:                  # 2D A*/Dijkstra for differential drive
+      plugin: "nav2_navfn_planner/NavfnPlanner"
+      use_astar: true
+      tolerance: 0.5
+    Hybrid:                     # Hybrid A* for car-like platforms
+      plugin: "nav2_smac_planner/SmacPlannerHybrid"
+      motion_model: "DUBINS"    # use REEDS_SHEPP if reverse is allowed
+      minimum_turning_radius: 0.4
+\end{lstlisting}
+
+代价值如何进入搜索？NavFn 风格的实现把每个栅格的代价值 $c_{\mathrm{cell}}\in[0,254]$ 映射为附加代价
+\begin{equation}
+  w=c_{\mathrm{neutral}}+\kappa\,c_{\mathrm{cell}},
+\end{equation}
+其中中性代价 $c_{\mathrm{neutral}}$ 默认取 50（表示“平地上走一格的基准代价”），缩放系数 $\kappa$ 对应参数 \texttt{cost\_factor}，默认 3.0；致命障碍（254）直接禁止通行。这样“贴墙走”的边会明显变贵，规划器自然选择离墙远一点。
+
+最后，规划器给出的路径往往仍有小折角，Nav2 用 \texttt{smoother\_server} 做后处理：以“平滑项 + 贴近原路径项 + 曲率/障碍惩罚”构成目标函数，梯度下降迭代优化路径点。平滑后的路径更贴合底盘运动学，局部控制器跟踪起来也更轻松。
+
+\begin{summary}
+
+\begin{enumerate}
+  \item 全局规划是带非负边权的图搜索问题；完备性问“找不找得到”，最优性问“是否最短”，启发函数是对剩余代价的估计。
+  \item Dijkstra 无启发、保证最优，复杂度 $O((V+E)\log V)$；A* 用 $f=g+h$ 引导，$h$ 可采纳时最优，一致时可“不重开节点”。
+  \item 可采纳性证明的三步：前沿上存在最优路径节点且其 $g$ 已最优，于是该节点 $f\le C^*$；目标以最小 $f$ 弹出，故 $C\le C^*$。
+  \item 启发函数曼哈顿/欧氏/对角距离都是下界；越紧扩展越少；陷阱地形中 A* 会退化为等值带扩张。
+  \item JPS 用强制邻居跳过直道；Hybrid A* 用自行车模型基元 + 三维去重 + 双下界启发，解决最小转弯半径问题；RRT* 用“选父 + 重连 + 收缩半径”实现渐近最优。
+  \item 工程上按底盘选插件：2D 差速用 NavFn 或 Smac2D，阿克曼用 Smac Hybrid；代价值经“中性代价 + 缩放系数”映射为边权，最后用 \texttt{smoother\_server} 平滑。
+\end{enumerate}
+
+
+\end{summary}
+
+\begin{problemset}
+
+  \item 用反证法复述 A* 最优性证明的三步，并指出每一步用了哪个前提。
+  \item 在 $10\times10$ 栅格上，$s=(1,1)$、$t=(8,8)$，若某格被误标成致命障碍，曼哈顿启发是否仍然可采纳？启发值变不变？
+  \item 为什么 $h=\max(h_{\mathrm{kin}},h_{\mathrm{grid}})$ 仍然可采纳？如果取两者的最小值会怎样？
+  \item 给定 $L=0.6\ \mathrm{m}$、$\delta_{\max}=25\degree$，求最小转弯半径；若每步前进 $\Delta s=0.15\ \mathrm{m}$，求每步的转角增量。
+  \item 设计一个“凹形房间”地图，说明 A* 与 RRT* 各会表现如何；如果你只能改一个参数来加速 A*，改什么？
+\end{problemset}
+
+\begin{reading}
+
+\begin{itemize}
+  \item \cite{hart1968astar}：A* 的原始论文，可采纳性与一致性的定义都出自这里，证明写得比教材更原始也更清楚。
+  \item \cite{harabor2011jps}：JPS 原始论文，读它解决“直道上的节点为什么可以整段跳过”。
+  \item \cite{dolgov2010hybridastar}：Hybrid A* 的工程实现细节（启发、基元、两阶段搜索），自动驾驶规划必读。
+  \item \cite{karaman2011rrtstar}：RRT* 的渐近最优性证明与半径公式，想理解采样规划的理论极限就读它。
+\end{itemize}
+
+
+\end{reading}

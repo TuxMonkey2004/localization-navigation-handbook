@@ -1,0 +1,466 @@
+\chapter{标定与时间同步}\label{ch:26-calibration}
+\usetikzlibrary{arrows.meta}
+
+\chapterintro{标定是定位系统里"最不值得怀疑、却最常出错"的一环。算法调不好时，新手总怀疑滤波器，老手先怀疑标定：外参差 $1\degree$，10\,m 处就是 17\,cm；时间差 10\,ms，2\,m/s 时就是 2\,cm，而且这类误差会随运动放大，表现为"直着走没事，一转弯就飘"。本章把标定拆成四件事：相机内参（张正友法）、IMU 噪声（Allan 方差）、多传感器外参（手眼标定 $AX=XB$）、时间同步。每件事都给到从假设、公式到工程判据的完整链条，读完你应该能自己标定一台车，并判断结果到底"能用"还是"不能用"。}
+
+\section{为什么标定：误差是怎么被放大的}\label{sec:26-why}
+
+\textbf{外参误差与时间误差都是与运动耦合的误差}：静止时完全看不出来，一动就暴露。先算两个数建立量级感。
+
+\subsection{旋转外参误差：$d\sin\theta$}
+
+设雷达与机体之间存在未被补偿的旋转误差 $\theta$（俯仰、横滚或偏航任一分量），则距离 $d$ 处的点被放错的位置偏差约为
+\begin{equation}
+\delta=\norm{\bm{R}(\theta)-\bm{I}}\,d=2\sin\frac{\theta}{2}\,d\approx\theta d,
+\label{eq:26-leverarm}
+\end{equation}
+其中 $\bm{R}(\theta)$ 是绕某轴转 $\theta$ 的旋转矩阵；$\theta$ 很小时 $2\sin(\theta/2)\approx\theta$（弧度）。
+
+\begin{table}[htbp]
+  \centering
+  \caption{旋转外参误差造成的点位置偏差（cm，$\delta\approx\theta d$）}\label{tab:26-rot}
+  \small
+  \begin{tabular}{ccccc}
+    \toprule
+    $\theta$ $\backslash$ $d$ & 1\,m & 3\,m & 5\,m & 10\,m \\
+    \midrule
+    $0.5\degree$ & 0.9 & 2.6 & 4.4 & 8.7 \\
+    $1\degree$   & 1.7 & 5.2 & 8.7 & 17.5 \\
+    $2\degree$   & 3.5 & 10.5 & 17.5 & 34.9 \\
+    $5\degree$   & 8.7 & 26.2 & 43.6 & 87.2 \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+工程含义有两条：近处点（$1$--$3$\,m）对 $1\degree$ 误差不敏感，\textbf{所以"看起来建图还行"不能证明外参对}；定位时匹配的是 $8$--$15$\,m 外的墙与门，同样的 $1\degree$ 就是 15--25\,cm，表现为缓慢漂移或重定位错误。判据不是"图好看"，而是远处点云是否重影。
+
+\subsection{时间误差：$v\Delta t$}
+
+时间戳错位 $\Delta t$ 等价于把测量放错位置，偏差近似为
+\begin{equation}
+\delta=v\,\Delta t,
+\label{eq:26-timedelay}
+\end{equation}
+其中 $v$ 是该点相对机体的运动速度。
+
+\begin{table}[htbp]
+  \centering
+  \caption{时间不同步造成的位移偏差（mm，$\delta=v\Delta t$）}\label{tab:26-time}
+  \small
+  \begin{tabular}{ccccc}
+    \toprule
+    $\Delta t$ $\backslash$ $v$ & 0.5\,m/s & 1\,m/s & 2\,m/s & 4\,m/s \\
+    \midrule
+    1\,ms  & 0.5 & 1 & 2 & 4 \\
+    5\,ms  & 2.5 & 5 & 10 & 20 \\
+    10\,ms & 5 & 10 & 20 & 40 \\
+    20\,ms & 10 & 20 & 40 & 80 \\
+    50\,ms & 25 & 50 & 100 & 200 \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+最容易被忽略的是\textbf{半帧偏移}：有的雷达把一帧的时间戳打在帧\textbf{起始}时刻，有的打在\textbf{结束}时刻，10\,Hz 下二者差 100\,ms，比"时钟不同步"严重一个数量级。拿到任何一款雷达，第一件事是查手册确认时间戳定义。
+
+\section{外参的数学定义与标定链}\label{sec:26-extrinsic}
+
+全书约定 $T_{AB}=(\bm{R}_{AB},{}^{A}\bm{p}_{B})$ 表示"把 $B$ 系向量变到 $A$ 系"：${}^{A}\bm{p}=\bm{R}_{AB}{}^{B}\bm{p}+{}^{A}\bm{p}_{B}$。于是"雷达在机体系中的外参"记作 $T_{BL}$，反之 $T_{LB}=T_{BL}^{-1}$。
+
+\textbf{方向弄反是外参错误的第一大来源}，症状很有迷惑性：点云整体旋转/镜像，但建图"自洽"（所有点一致地错），只有和 IMU、视觉对比时才暴露。两个防错手段：一是\textbf{物理检验}——雷达水平放置、正前方 5\,m 放箱子，外参正确时应满足 $x\approx5$、$y\approx0$、$z\approx0$（机体 $x$ 前、$y$ 左、$z$ 上），任一符号反了立刻看出来；二是\textbf{只记一个方向关系}——$T_{BL}$ 的下标"先 $B$ 后 $L$"读作"$L$ 到 $B$"，代码里 \lstinline{extrinsic_T} 填 ${}^{B}\bm{p}_{L}$，\lstinline{extrinsic_R} 填 $\bm{R}_{BL}$，点云先乘 $\bm{R}_{BL}$ 再加 ${}^{B}\bm{p}_{L}$。
+
+标定量之间有依赖：手眼标定需要内参先标好，时间偏移又需要外参有初值。顺序与判据见表~\ref{tab:26-chain}。
+
+\begin{table}[htbp]
+  \centering
+  \caption{标定链：顺序、工具与验收判据}\label{tab:26-chain}
+  \small
+  \begin{tabular}{lllp{4.6cm}}
+    \toprule
+    顺序 & 标定量 & 常用工具 & 验收判据 \\
+    \midrule
+    1 & 相机内参、畸变 & OpenCV / Kalibr & 重投影 RMS $<0.5$\,px \\
+    2 & IMU 噪声与零偏 & imu\_utils & 重力模长 $9.81\pm0.1$ \\
+    3 & 相机-IMU 外参 + 时间偏移 & Kalibr & 重投影 $<1$\,px \\
+    4 & 雷达-IMU 外参 + 时间偏移 & 手眼标定 & 点云墙厚 $<2$\,cm \\
+    5 & 雷达-相机外参 & 标定板 + PnP & 投影边缘偏差 $<2$\,px \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+\section{相机内参：针孔模型与畸变}\label{sec:26-pinhole}
+
+相机系 $C$ 下的点 ${}^{C}\bm{P}=[X,Y,Z]^{\top}$（$Z$ 为深度）投到像素 $\bm{m}=[u,v]^{\top}$ 的过程是"先除以深度做透视，再乘内参矩阵"：
+\begin{equation}
+s\begin{bmatrix}u\\v\\1\end{bmatrix}=\bm{K}\begin{bmatrix}X\\Y\\Z\end{bmatrix},
+\qquad
+\bm{K}=\begin{bmatrix}f_x & s_0 & c_x\\ 0 & f_y & c_y\\ 0&0&1\end{bmatrix},
+\label{eq:26-project}
+\end{equation}
+其中 $s=Z$ 是齐次尺度，$f_x,f_y$ 是以像素为单位的焦距（$f_x=f/d_x$，$d_x$ 为像元尺寸），$(c_x,c_y)$ 是\textbf{主点}，$s_0$ 是像元倾斜项（多数相机可置零）。
+
+\textbf{数字例子}：$f_x=600$、$f_y=540$、$c_x=320$、$c_y=240$，${}^{C}\bm{P}=[1.0,0.5,2.0]^{\top}$\,m，则
+\begin{equation}
+u=600\times\frac{1.0}{2.0}+320=620,\qquad v=540\times\frac{0.5}{2.0}+240=375.
+\end{equation}
+若深度估计错了 10\%（$Z$ 从 2.0 变 2.2），$u$ 变成 592.7，横向误差 27\,px——这就是单目深度误差致命的来源。
+
+真实镜头不满足理想针孔。把像素反投影到归一化平面 $x=X/Z,\;y=Y/Z$，记 $r^2=x^2+y^2$，Brown--Conrady 模型把理想坐标映射成\textbf{含畸变}的坐标：
+\begin{equation}
+\begin{aligned}
+x_d &= x\bigl(1+k_1r^2+k_2r^4+k_3r^6\bigr)+2p_1xy+p_2\bigl(r^2+2x^2\bigr),\\
+y_d &= y\bigl(1+k_1r^2+k_2r^4+k_3r^6\bigr)+p_1\bigl(r^2+2y^2\bigr)+2p_2xy,
+\end{aligned}
+\label{eq:26-distort}
+\end{equation}
+再乘内参得到像素。$k_1,k_2,k_3$ 是\textbf{径向}畸变（$k_1<0$ 桶形，$k_1>0$ 枕形），$p_1,p_2$ 是\textbf{切向}畸变（镜头与成像面不平行）。以 $k_1=-0.28$、$x=y=0.35$（视场边缘）为例，$r^2=0.245$，$x_d=0.35(1-0.28\times0.245)=0.326$，边缘向内拉 0.024 个归一化单位，按 $f_x=600$ 算是 14.4\,px。
+
+\section{张正友标定法：从单应到内参}\label{sec:26-zhang}
+
+张正友 1999 年的平面标定法是今天所有相机内参标定的基础：用同一块平面棋盘在\textbf{不同姿态}下拍若干张图，无需知道棋盘位姿即可解出内参。下面完整推导。
+
+\subsection{第一步：平面到图像的单应}
+
+把世界系定在棋盘平面上，$Z=0$，角点 ${}^{W}\bm{M}=[X,Y,0]^{\top}$，齐次形式 $\tilde{\bm{M}}=[X,Y,0,1]^{\top}$。投影为 $s\,\tilde{\bm{m}}=\bm{K}[\bm{R}\,|\,\bm{t}]\tilde{\bm{M}}$。把 $\bm{R}$ 按列拆开，利用 $Z=0$ 把第三列乘掉：
+\begin{equation}
+s\begin{bmatrix}u\\v\\1\end{bmatrix}
+=\bm{K}\bigl[\bm{r}_1\;\bm{r}_2\;\bm{r}_3\;\bm{t}\bigr]
+\begin{bmatrix}X\\Y\\0\\1\end{bmatrix}
+=\bm{K}\bigl[\bm{r}_1\;\bm{r}_2\;\bm{t}\bigr]
+\begin{bmatrix}X\\Y\\1\end{bmatrix}.
+\label{eq:26-planehom}
+\end{equation}
+于是每张图定义一个 $3\times3$ 的\textbf{单应矩阵}：
+\begin{equation}
+\bm{H}=\bigl[\bm{h}_1\;\bm{h}_2\;\bm{h}_3\bigr]=\lambda\bm{K}\bigl[\bm{r}_1\;\bm{r}_2\;\bm{t}\bigr],
+\label{eq:26-homography}
+\end{equation}
+其中 $\lambda$ 是齐次尺度。给 4 组以上角点对应（世界坐标已知、像素可检测），$\bm{H}$ 能用 DLT 线性解出（每对点 2 个方程，8 个未知量）。
+
+\subsection{第二步：用旋转矩阵的正交性构造约束}
+
+关键观察：$\bm{r}_1,\bm{r}_2$ 是旋转矩阵的列，满足\textbf{单位长度}与\textbf{相互正交}：$\bm{r}_1^{\top}\bm{r}_2=0$，$\norm{\bm{r}_1}=\norm{\bm{r}_2}=1$。由 $\bm{h}_i=\lambda\bm{K}\bm{r}_i$ 得 $\bm{r}_i=\lambda^{-1}\bm{K}^{-1}\bm{h}_i$，代入正交条件并约掉 $\lambda^{-2}$：
+\begin{equation}
+\bm{h}_1^{\top}\bm{K}^{-\top}\bm{K}^{-1}\bm{h}_2=0,
+\label{eq:26-orth}
+\end{equation}
+代入等长条件：
+\begin{equation}
+\bm{h}_1^{\top}\bm{K}^{-\top}\bm{K}^{-1}\bm{h}_1=\bm{h}_2^{\top}\bm{K}^{-\top}\bm{K}^{-1}\bm{h}_2.
+\label{eq:26-equal}
+\end{equation}
+定义对称矩阵 $\bm{B}=\bm{K}^{-\top}\bm{K}^{-1}\in\mathbb{R}^{3\times3}$，上面两式就是关于 $\bm{B}$ 的两个线性约束。\textbf{每张图给出两个约束}，而 $\bm{B}$ 只有 6 个独立元素，所以 3 张不同姿态的图即可确定 $\bm{B}$。
+
+\subsection{第三步：把约束写成线性方程组}
+
+把 $\bm{B}$ 的 6 个独立元素排成 $\bm{b}=[B_{11},B_{12},B_{22},B_{13},B_{23},B_{33}]^{\top}$。对任意两列 $\bm{h}_i,\bm{h}_j$，二次型可写成内积 $\bm{h}_i^{\top}\bm{B}\bm{h}_j=\bm{v}_{ij}^{\top}\bm{b}$，其中
+\begin{equation}
+\bm{v}_{ij}=\begin{bmatrix}
+h_{i1}h_{j1}\\
+h_{i1}h_{j2}+h_{i2}h_{j1}\\
+h_{i2}h_{j2}\\
+h_{i3}h_{j1}+h_{i1}h_{j3}\\
+h_{i3}h_{j2}+h_{i2}h_{j3}\\
+h_{i3}h_{j3}
+\end{bmatrix}\in\mathbb{R}^{6}.
+\label{eq:26-vij}
+\end{equation}
+式~\eqref{eq:26-orth}、\eqref{eq:26-equal} 于是成为 $\bm{v}_{12}^{\top}\bm{b}=0$ 与 $(\bm{v}_{11}-\bm{v}_{22})^{\top}\bm{b}=0$。$n$ 张图堆成 $\bm{V}\bm{b}=\bm{0}$，$\bm{V}\in\mathbb{R}^{2n\times6}$。
+
+\textbf{尺度不确定性是本质的}：$\bm{K}$ 放大 $c$ 倍，$\bm{B}$ 缩小 $c^2$ 倍，约束完全不变。所以加 $\norm{\bm{b}}=1$，取 $\bm{V}^{\top}\bm{V}$ 最小特征值对应的特征向量（即 $\bm{V}$ 最小奇异值对应的右奇异向量）。实践中 $n\ge5$ 更抗噪，标定软件默认 20--30 张。
+
+\subsection{第四步：由 $\bm{B}$ 闭式解出内参}
+
+记 $f_x=\alpha$、$f_y=\beta$、$s_0=\gamma$、$c_x=u_0$、$c_y=v_0$，Zhang 给出的闭式解为
+\begin{equation}
+\begin{aligned}
+v_0 &= \frac{B_{12}B_{13}-B_{11}B_{23}}{B_{11}B_{22}-B_{12}^{2}},\qquad
+\lambda_0 = B_{33}-\frac{B_{13}^{2}+v_0\bigl(B_{12}B_{13}-B_{11}B_{23}\bigr)}{B_{11}},\\
+\alpha &= \sqrt{\frac{\lambda_0}{B_{11}}},\qquad
+\beta = \sqrt{\frac{\lambda_0 B_{11}}{B_{11}B_{22}-B_{12}^{2}}},\qquad
+\gamma = -\frac{B_{12}\alpha^{2}\beta}{\lambda_0},\qquad
+u_0 = \frac{\gamma v_0}{\beta}-\frac{B_{13}\alpha^{2}}{\lambda_0}.
+\end{aligned}
+\label{eq:26-intrinsic}
+\end{equation}
+$\lambda_0$ 正是那个被归一化掉的尺度；所有内参只依赖 $\bm{B}$ 元素之间的\textbf{比值}，因此尺度自动约掉。当像元近似正方形（$\gamma\approx0$，即 $B_{12}\approx0$）时退化为好记的形式：$u_0=-B_{13}/B_{11}$，$v_0=-B_{23}/B_{22}$，$\alpha=1/\sqrt{B_{11}}$，$\beta=1/\sqrt{B_{22}}$。
+
+\subsection{第五步：每张图的外参}
+
+由 $\bm{K}^{-1}\bm{h}_1=\lambda\bm{r}_1$ 取模长得 $\lambda=1/\norm{\bm{K}^{-1}\bm{h}_1}$，于是
+\begin{equation}
+\bm{r}_1=\frac{\bm{K}^{-1}\bm{h}_1}{\norm{\bm{K}^{-1}\bm{h}_1}},\qquad
+\bm{r}_2=\frac{\bm{K}^{-1}\bm{h}_2}{\norm{\bm{K}^{-1}\bm{h}_2}},\qquad
+\bm{r}_3=\bm{r}_1\times\bm{r}_2,\qquad
+\bm{t}=\frac{\bm{K}^{-1}\bm{h}_3}{\norm{\bm{K}^{-1}\bm{h}_1}}.
+\label{eq:26-extrinsic}
+\end{equation}
+两个细节：$\bm{r}_1,\bm{r}_2$ 因噪声不一定严格正交，$\bm{r}_3$ 用叉积保证右手系；$\lambda$ 的符号由"棋盘在相机前方"确定。最后对 $[\bm{r}_1\;\bm{r}_2\;\bm{r}_3]$ 做 SVD 投影到最近的旋转矩阵：$\bm{R}=\bm{U}\bm{V}^{\top}$，其中 $\bm{U}\bm{\Sigma}\bm{V}^{\top}$ 是那个近似矩阵的 SVD。
+
+\subsection{第六步：最大似然细化}
+
+前五步是最小化\textbf{代数误差}，不是真正的重投影误差，且还没考虑畸变。真正的目标是让所有角点的重投影误差平方和最小：
+\begin{equation}
+J\bigl(\{\bm{K},k_1,k_2,p_1,p_2\},\{\bm{R}_i,\bm{t}_i\}\bigr)
+=\sum_{i=1}^{n}\sum_{j=1}^{m}\norm{\bm{m}_{ij}-\hat{\bm{m}}\bigl(\bm{K},k_{1:3},p_{1:2},\bm{R}_i,\bm{t}_i,{}^{W}\bm{M}_j\bigr)}^{2},
+\label{eq:26-reproj}
+\end{equation}
+其中 $\bm{m}_{ij}$ 是第 $i$ 张图第 $j$ 个角点的检测像素，$\hat{\bm{m}}$ 由式~\eqref{eq:26-project}、\eqref{eq:26-distort} 算出。用 Levenberg--Marquardt 求解，初值取前五步结果（畸变初值取 0）。未知量 $4+5+6n$ 个，单目 20 张图约 129 个，OpenCV 利用稀疏结构加速。
+
+\textbf{判据}：$\sqrt{J/(nm)}$ 即"重投影 RMS"，单位像素。$<0.3$\,px 很好，$0.3$--$0.5$\,px 正常，$>1$\,px 说明角点检测或模型有问题。一组 $640\times480$ 相机的正常结果是 $f_x=615.3$、$f_y=616.1$、$c_x=322.7$、$c_y=241.2$、$k_1=-0.2887$、$k_2=0.0721$、$p_1=0.0003$、$p_2=-0.0002$、RMS $0.31$\,px——注意 $f_x\approx f_y$、主点接近图像中心；若主点偏离中心超过图像宽度的 10\%，先查是不是角点顺序错了。
+
+\textbf{实践要点}：(1) 图要覆盖画面四角与中心，畸变系数靠边缘样本；(2) 平面与像平面夹角取 $30\degree$--$60\degree$，全正对着拍会让单应退化；(3) 15--30 张，包含平移、旋转、远近变化；(4) 板子必须平且够大，纸贴不平会让 RMS 永远卡在 1\,px 以上；(5) 标定前后不能动对焦环。
+
+\section{IMU 标定与 Allan 方差}\label{sec:26-imu}
+
+陀螺与加速度计的测量可写成
+\begin{equation}
+\tilde{\bm{\omega}}=\bigl(\bm{I}+\bm{S}_g\bigr)\bm{M}_g\bm{\omega}+\bm{b}_g+\bm{n}_g,\qquad
+\tilde{\bm{a}}=\bigl(\bm{I}+\bm{S}_a\bigr)\bm{M}_a\bm{a}+\bm{b}_a+\bm{n}_a,
+\label{eq:26-imuerr}
+\end{equation}
+其中 $\bm{S}$ 是尺度因子误差，$\bm{M}$ 是轴间非正交，$\bm{b}$ 是零偏，$\bm{n}$ 是白噪声。零偏造成随时间线性累积的漂移，可标定也可在线估计；尺度/轴间是常值矩阵误差，绕一圈会表现为"转 $90\degree$ 实际积分出 $91\degree$"；白噪声不可标定，只能用统计量描述。
+
+\textbf{零偏与尺度的六面法}：把 IMU 静置在六个正交朝向各 30--60\,s。加速度计每面测得模长应为 9.81，用六面数据可同时解出 $\bm{b}_a$ 与 $\bm{S}_a$（$\bm{M}_a$ 一般取单位阵）。陀螺零偏取长时间静置的均值，但要注意\textbf{零偏随温度漂移}，规范做法是上电预热 5--10 分钟再取。
+
+\subsection{Allan 方差：定义}
+
+白噪声与零偏这类随机过程不能用一个数描述，要看它在不同时间尺度上的表现。设采样间隔为 $\tau_0$，得到序列 $y[1],\dots,y[N]$（陀螺为角速度，加速度计为比力）。取簇长度 $m$，把序列分成 $K=\lfloor N/m\rfloor$ 个不重叠的簇，簇内平均为
+\begin{equation}
+\bar{y}_k=\frac{1}{m}\sum_{i=1}^{m}y\bigl[(k-1)m+i\bigr],\qquad k=1,\dots,K,
+\label{eq:26-cluster}
+\end{equation}
+对应平均时间 $\tau=m\tau_0$。\textbf{Allan 方差}定义为相邻簇平均之差的方差的一半：
+\begin{equation}
+\sigma_A^{2}(\tau)=\frac{1}{2(K-1)}\sum_{k=1}^{K-1}\bigl(\bar{y}_{k+1}-\bar{y}_k\bigr)^{2},
+\qquad \sigma_A(\tau)=\sqrt{\sigma_A^{2}(\tau)}.
+\label{eq:26-allan}
+\end{equation}
+为什么除以 2？若相邻簇平均独立、方差各为 $\sigma^2$，差值方差是 $2\sigma^2$，除以 2 正好还原单点方差。为什么用"相邻差分"而不用"减去总均值"？因为后者会把零偏漂移当成正常波动滤掉，而 Allan 方差要保留慢变信息。
+
+它与功率谱密度的关系是
+\begin{equation}
+\sigma_A^{2}(\tau)=4\int_{0}^{\infty}S_y(f)\,\frac{\sin^{4}(\pi f\tau)}{(\pi f\tau)^{2}}\,\diff f,
+\label{eq:26-allanpsd}
+\end{equation}
+传递函数相当于一个随 $\tau$ 变形的带通滤波器：$\tau$ 小只看高频，$\tau$ 大只看低频。\textbf{所以一条 $\sigma_A(\tau)$ 曲线能同时分离出好几类噪声}，这正是它的价值。
+
+\begin{figure}[htbp]
+  \centering
+  \begin{tikzpicture}[x=1.35cm,y=1.05cm,font=\small]
+    \draw[-{Stealth[length=2mm]}, thick] (0,0) -- (7.2,0) node[right] {$\log\tau$};
+    \draw[-{Stealth[length=2mm]}, thick] (0,0) -- (0,4.9) node[above] {$\log\sigma_A(\tau)$};
+    \node[below left,font=\footnotesize] at (0,0) {$\tau_0$};
+    \draw[thick, structurecolor] (0.35,4.35) -- (2.55,3.25);
+    \draw[thick, structurecolor] (2.55,3.25) -- (3.75,3.15);
+    \draw[thick, structurecolor] (3.75,3.15) -- (6.55,4.55);
+    \node[font=\footnotesize, anchor=south west] at (0.35,4.4) {$-\tfrac12$：角度随机游走};
+    \node[font=\footnotesize, anchor=south] at (3.15,3.3) {$0$：零偏不稳定性};
+    \node[font=\footnotesize, anchor=north west] at (4.45,4.6) {$+\tfrac12$：速率随机游走};
+    \draw[dashed, black!50] (2.55,0) -- (2.55,3.25);
+    \node[below,font=\footnotesize] at (2.55,0) {$\tau=1$\,s};
+    \draw[dashed, black!50] (0,3.25) -- (2.55,3.25) node[above left,font=\footnotesize,pos=0.12] {$\sigma_A(1\,\mathrm{s})=N$};
+    \draw[dashed, black!50] (0,3.15) -- (3.75,3.15) node[below right,font=\footnotesize,pos=0.08] {$0.664\,B$};
+  \end{tikzpicture}
+  \caption{Allan 偏差曲线的双对数示意。左段斜率 $-1/2$ 是白噪声（角度/速度随机游走），中间平台是零偏不稳定性，右段斜率 $+1/2$ 是速率随机游走。}\label{fig:26-allan}
+\end{figure}
+
+\subsection{怎么从曲线上读参数}
+
+各类噪声的双对数斜率不同，可以逐段拟合（表~\ref{tab:26-allan}）。
+
+\begin{table}[htbp]
+  \centering
+  \caption{Allan 偏差的斜率与噪声类型（$y$ 为角速度或比力）}\label{tab:26-allan}
+  \small
+  \begin{tabular}{llcl}
+    \toprule
+    噪声类型 & $\sigma_A(\tau)$ 的形式 & 斜率 & 参数读法 \\
+    \midrule
+    量化噪声 & $\sqrt{3}\,Q/\tau$ & $-1$ & 左端最陡段 \\
+    角度（速度）随机游走 & $N/\sqrt{\tau}$ & $-1/2$ & $\tau=1$\,s 处数值 $=N$ \\
+    零偏不稳定性 & $0.664\,B$ & $0$ & 平台高度 $/0.664$ \\
+    速率随机游走 & $K\sqrt{\tau/3}$ & $+1/2$ & 右段斜率拟合 \\
+    漂移率斜坡 & $R\tau/\sqrt{2}$ & $+1$ & 最右端上扬段 \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+\begin{keybox}{读数口诀（只记这一条就够用）}
+\textbf{$\tau=1$\,s 处读到的 $\sigma_A$，数值上就是这个传感器的噪声密度}（陀螺单位 $^{\circ}$/s/$\sqrt{\mathrm{Hz}}$，加速度计单位 m/s$^2$/$\sqrt{\mathrm{Hz}}$）。陀螺的噪声密度乘 60 即得常用的 $^{\circ}$/$\sqrt{\mathrm{h}}$。
+\end{keybox}
+
+\textbf{数字例子}：某 MEMS 陀螺静置 2\,h 的 Allan 曲线在 $\tau=1$\,s 处读得 $\sigma_A=0.014\,^{\circ}$/s，换成 SI 单位并换算成角度随机游走：
+\begin{equation}
+N_g=0.014\times\frac{\pi}{180}=2.44\times10^{-4}\ \mathrm{rad/s/\sqrt{Hz}},
+\qquad N_g\times60=0.84\ ^{\circ}\mathrm{/\sqrt{h}},
+\end{equation}
+与 datasheet 的 0.014\,$^{\circ}$/s/$\sqrt{\mathrm{Hz}}$ 一致。若 IMU 以 $f_s=200$\,Hz 输出，带宽取 $f_s/2$，则单样本标准差 $\sigma=N_g\sqrt{f_s/2}=2.4\times10^{-3}$\,rad/s$\approx0.14\,^{\circ}$/s。曲线平台在 $\tau\approx50$\,s 处约 $1.5\,^{\circ}$/h，得零偏不稳定性 $B=1.5/0.664\approx2.3\,^{\circ}$/h，即静止时零偏在几十秒尺度上有约 $1.1\times10^{-5}$\,rad/s 的随机浮动。
+
+\subsection{从 Allan 读数到滤波器参数}
+
+LIO/VIO 里要填的是协方差，不是曲线本身，转换只有两步：测量噪声取 $N_g^2$、$N_a^2$（FAST-LIO 的 \lstinline{gyr_cov}、\lstinline{acc_cov}），零偏随机游走取速率随机游走系数的平方 $K^2$（\lstinline{b_gyr_cov}、\lstinline{b_acc_cov}）。不同开源仓库对"连续时间噪声密度"的约定差一个 $\Delta t$ 的幂次，\textbf{同一个 IMU 在不同仓库的最优值可能相差一个常数因子，这是正常的}。工程做法：用 Allan 读数给量级初值，再在同一段 bag 上微调——噪声项调大更信 IMU，调小更信点云（见第~\ref{ch:27-tuning}~章）。
+
+\section{雷达-IMU 外参：手眼标定 $AX=XB$}\label{sec:26-handeye}
+
+待求量是 $X=T_{LI}$（把 IMU 系点变到雷达系），6 个自由度。已知两路轨迹：雷达里程计给出的 $T_{WL}(t_k)$、IMU 积分给出的 $T_{WI}(t_k)$。真实关系为
+\begin{equation}
+T_{WI}(t)=T_{WL}(t)\,X.
+\label{eq:26-handerel}
+\end{equation}
+
+\textbf{推导 $AX=XB$。}取两个时刻 $t_1,t_2$。先在 $t_1$ 左乘逆：
+\begin{equation}
+T_{WI}(t_1)^{-1}=\bigl(T_{WL}(t_1)X\bigr)^{-1}=X^{-1}T_{WL}(t_1)^{-1}.
+\end{equation}
+再右乘 $t_2$ 的式子 $T_{WI}(t_2)=T_{WL}(t_2)X$：
+\begin{equation}
+T_{WI}(t_1)^{-1}T_{WI}(t_2)=X^{-1}T_{WL}(t_1)^{-1}T_{WL}(t_2)X.
+\end{equation}
+左边是 IMU 的相对运动 $B=T_{I_1I_2}$，右边括号内是雷达的相对运动 $A=T_{L_1L_2}$，于是 $B=X^{-1}AX$，等价于
+\begin{equation}
+A\,X=X\,B.
+\label{eq:26-axxb}
+\end{equation}
+把 $X=(\bm{R}_X,\bm{t}_X)$ 展开，它同时给出旋转与平移两组方程：
+\begin{align}
+\bm{R}_A\bm{R}_X &= \bm{R}_X\bm{R}_B, \label{eq:26-axxbrot}\\
+\bm{R}_A\bm{t}_X+\bm{t}_A &= \bm{R}_X\bm{t}_B+\bm{t}_X
+\;\Longrightarrow\;
+\bigl(\bm{R}_A-\bm{I}\bigr)\bm{t}_X=\bm{R}_X\bm{t}_B-\bm{t}_A.
+\label{eq:26-axxbt}
+\end{align}
+\textbf{关键结构}：式~\eqref{eq:26-axxbrot} 只含 $\bm{R}_X$，所以\textbf{先解旋转、再解平移}，两步都是线性最小二乘。
+
+\textbf{第一步：解旋转。}把旋转写成四元数，$AX=XB$ 变成
+\begin{equation}
+\bm{q}_A\otimes\bm{q}_X=\bm{q}_X\otimes\bm{q}_B.
+\label{eq:26-quat}
+\end{equation}
+定义左乘与右乘矩阵（$\bm{q}=[q_0,\bm{q}_v^{\top}]^{\top}$）：
+\begin{equation}
+[\bm{q}]_L=\begin{bmatrix}q_0&-\bm{q}_v^{\top}\\ \bm{q}_v&q_0\bm{I}+[\bm{q}_v]_{\times}\end{bmatrix},\qquad
+[\bm{q}]_R=\begin{bmatrix}q_0&-\bm{q}_v^{\top}\\ \bm{q}_v&q_0\bm{I}-[\bm{q}_v]_{\times}\end{bmatrix},
+\end{equation}
+它们满足 $[\bm{q}]_L\bm{q}'=\bm{q}\otimes\bm{q}'$、$[\bm{q}]_R\bm{q}'=\bm{q}'\otimes\bm{q}$。于是
+\begin{equation}
+\bigl([\bm{q}_A]_L-[\bm{q}_B]_R\bigr)\bm{q}_X=\bm{0}.
+\label{eq:26-quatlinear}
+\end{equation}
+每对运动给 4 个方程，堆成 $\bm{M}\bm{q}_X=\bm{0}$（$\bm{M}\in\mathbb{R}^{4K\times4}$），取最小奇异值对应的右奇异向量再归一化即为 $\bm{q}_X$。
+
+\textbf{可解性条件}：所有旋转轴必须"张开"。若机器人只绕竖直轴原地转，$A,B$ 的旋转轴都平行，$\bm{M}$ 秩不足，$X$ 中绕该轴的分量不可观。所以标定轨迹必须包含绕至少两个不平行轴的旋转：前后倾斜、左右横滚、加上偏航，各转 $30\degree$ 以上。
+
+\textbf{第二步：解平移。}$\bm{R}_X$ 已知后，式~\eqref{eq:26-axxbt} 是线性方程组，堆 $K$ 对运动：
+\begin{equation}
+\begin{bmatrix}\bm{R}_A^{(1)}-\bm{I}\\ \vdots\\ \bm{R}_A^{(K)}-\bm{I}\end{bmatrix}\bm{t}_X
+=\begin{bmatrix}\bm{R}_X\bm{t}_B^{(1)}-\bm{t}_A^{(1)}\\ \vdots\\ \bm{R}_X\bm{t}_B^{(K)}-\bm{t}_A^{(K)}\end{bmatrix},
+\label{eq:26-tls}
+\end{equation}
+即 $\bm{D}\bm{t}_X=\bm{c}$ 的 $\mathbb{R}^{3K\times3}$ 最小二乘，解 $\hat{\bm{t}}_X=(\bm{D}^{\top}\bm{D})^{-1}\bm{D}^{\top}\bm{c}$。可解性同样要求旋转轴张开：若所有轴相同，$\bm{R}_A-\bm{I}$ 的零空间方向一致，沿该方向平移不可观。
+
+\textbf{第三步：非线性细化。}代数解在噪声下不是最优，最后在 $\SE(3)$ 上用残差
+\begin{equation}
+\bm{e}_R^{(k)}=\log\!\Bigl(\bigl(\bm{R}_A^{(k)}\bm{R}_X\bigr)^{\top}\bm{R}_X\bm{R}_B^{(k)}\Bigr),\qquad
+\bm{e}_t^{(k)}=\bigl(\bm{R}_A^{(k)}-\bm{I}\bigr)\bm{t}_X-\bm{R}_X\bm{t}_B^{(k)}+\bm{t}_A^{(k)}
+\end{equation}
+做最小二乘（Ceres/GTSAM 均可），初值取前两步结果。$\log$ 是 $\SO(3)\to\so(3)$ 的对数映射（第~\ref{ch:02-math} 章）。当雷达帧率低而运动剧烈时，两帧之间不能当成瞬时刚体变换，此时应改用连续时间轨迹模型，同时估计外参与时间偏移。
+
+\section{时间同步与时间偏移估计}\label{sec:26-time}
+
+一台机器人上至少四类时间源，精度差几个数量级（表~\ref{tab:26-clocksync}）。最省事又最有效的做法是\textbf{硬件触发}：让主时钟同时触发相机曝光与雷达扫描起始，驱动把触发时刻写进 \lstinline{header.stamp}，采样时刻在物理上就对齐了。
+
+\begin{table}[htbp]
+  \centering
+  \caption{常见时间同步方案}\label{tab:26-clocksync}
+  \small
+  \begin{tabular}{llll}
+    \toprule
+    方案 & 典型精度 & 成本 & 适用 \\
+    \midrule
+    系统时钟（无同步） & 秒级漂移 & 0 & 不可用于融合 \\
+    NTP（\lstinline{chrony}） & 0.1--10\,ms & 0 & 一般用途、跨机器 \\
+    PTP（IEEE 1588，硬件时间戳） & $<1\,\mu$s & 需支持 PTP 的网卡 & 多相机、多雷达 \\
+    GPS/PPS 秒脉冲 & $<100$\,ns & 需 GPS 模块 & 室外、多机对齐 \\
+    硬件触发线 & 曝光级（$\mu$s） & 需相机/雷达支持 & 视觉-惯性标配 \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+\textbf{ROS 2 里的两个开关必须分清}：\lstinline{use_sim_time:=true} 时节点的 \lstinline{now()} 来自 \lstinline{/clock} 而非系统时钟，回放 bag 必须打开它并加 \lstinline{--clock}；消息里的 \lstinline{header.stamp} 是\textbf{传感器采集时刻}，与 \lstinline{/clock} 无关，回放不会重新打时间戳，所以录制时同步必须已经做好。检查手段是 \lstinline{ros2 bag info} 看时长与消息数、\lstinline{ros2 topic echo --field header.stamp} 对比 \lstinline{date +%s\%N}，以及回放时看 TF 是否频繁报 \lstinline{ExtrapolationException}。
+
+\textbf{偏移 $\delta t$ 的估计。}即使时钟同步，传感器内部仍有固定延迟：相机从曝光到驱动拿到图像通常 10--50\,ms，雷达时间戳可能打在帧首或帧尾。把这类偏移统一记作 $\delta t$，含义是"测量实际对应 $t-\delta t$ 时刻的状态"。它在 $\delta t$ 内产生的位姿误差是
+\begin{equation}
+\delta\bm{p}\approx\bm{v}\,\delta t,\qquad \delta\bm{\theta}\approx\bm{\omega}\,\delta t.
+\label{eq:26-dt}
+\end{equation}
+三种估计方法：(1) \textbf{一维搜索}——把点云到地图的平均残差看成 $\delta t$ 的函数，在 $[-0.1,0.1]$\,s 内粗扫，再用抛物线拟合 $J(\delta t_i)\approx J_{\min}+\tfrac12J''(\delta t_i-\hat{\delta t})^2$ 求极值；(2) \textbf{联合优化}——把 $(X,\delta t)$ 一起做非线性优化，按式~\eqref{eq:26-dt} 补偿后代入式~\eqref{eq:26-axxb} 求残差，交替优化 3--5 轮；(3) \textbf{互相关}——对雷达里程计与 IMU 积分的速度曲线做互相关，峰值位置即 $\delta t$，快但只在有明显加减速时有效。
+
+\textbf{验证}：$\delta t$ 标好后，静止时墙厚不变（时间偏移不影响静止），快速旋转时点云不再"扇开"；把 $\delta t$ 人为置零再跑一遍，若轨迹明显变差，说明这个参数确实重要。
+
+\section{标定验证与常见错误}\label{sec:26-verify}
+
+标定做完不等于做完，必须验证。四条判据按顺序查，任何一条不过都不要上车：
+
+\begin{enumerate}
+  \item \textbf{重力模长}：静止时 $\norm{\tilde{\bm{a}}}=9.81\pm0.1$\,m/s$^2$；否则是加速度计尺度或零偏错。
+  \item \textbf{点云墙厚}：静态场景叠加 20 帧，墙与地面厚度应 $<2$\,cm。厚度随距离增大是旋转外参误差，厚度与距离无关是平移误差或时间偏移。
+  \item \textbf{回环闭合}：走矩形回到起点，位置差 $<5$\,cm、角度差 $<1\degree$。
+  \item \textbf{图像叠加}：点云投影到图像，边缘对齐、无系统偏移、无随位置的扭曲。
+\end{enumerate}
+
+\begin{table}[htbp]
+  \centering
+  \caption{标定类故障的现象、原因与处理}\label{tab:26-errors}
+  \footnotesize
+  \begin{tabular}{p{2.9cm}p{3.5cm}p{3.2cm}p{4.5cm}}
+    \toprule
+    现象 & 可能原因 & 快速检查 & 处理 \\
+    \midrule
+    点云整体旋转固定角度 & 外参旋转符号/方向反 & 看正前方箱子的 $x,y,z$ & 重标或按定义改正号 \\
+    点云镜像 & 坐标系手性错 & 检查是否右手系 & 改约定或加镜像修正 \\
+    轨迹一直向一侧漂 & 陀螺零偏未标/符号错 & 静止 60\,s 看积分角度 & 重取零偏，查外参方向 \\
+    快速旋转时点云扇开 & 时间偏移大 & 静/动对比墙厚 & 估 $\delta t$ 并补偿 \\
+    静止时点云就厚 & 外参平移或雷达内参错 & 近距离叠加 20 帧 & 检查平移与外参 \\
+    相机图像边缘扭曲 & 畸变系数错 & 直线在图上是否直 & 重标内参，查 $k_1$ 符号 \\
+    融合后重力方向偏 & 加速度计未标 & 静止模长是否 9.81 & 六面法重标 \\
+    漂移快、协方差收缩过快 & 零偏随机游走参数过小 & 看协方差曲线 & 调大 \lstinline{b_gyr_cov} \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+\begin{summary}
+
+\begin{enumerate}
+  \item 旋转外参误差按 $d\theta$ 放大、时间误差按 $v\Delta t$ 放大：$1\degree$ 在 10\,m 处 17.5\,cm，10\,ms 在 2\,m/s 时 2\,cm；近处建图看不出，远处定位才暴露。
+  \item 标定链有依赖顺序：内参 $\to$ IMU 噪声/零偏 $\to$ 相机-IMU $\to$ 雷达-IMU $\to$ 雷达-相机，每步都有量化判据。
+  \item 张正友法：由 $\bm{H}=\lambda\bm{K}[\bm{r}_1\;\bm{r}_2\;\bm{t}]$ 与旋转列的正交单位性得 $\bm{h}_1^{\top}\bm{B}\bm{h}_2=0$、$\bm{h}_1^{\top}\bm{B}\bm{h}_1=\bm{h}_2^{\top}\bm{B}\bm{h}_2$，解 $\bm{V}\bm{b}=\bm{0}$ 得 $\bm{B}$（差一尺度），再闭式解内参，最后用重投影误差做 LM 细化。
+  \item 内参判据：重投影 RMS $<0.5$\,px，$f_x\approx f_y$，主点接近图像中心。
+  \item Allan 方差用相邻簇平均之差的方差的一半定义；$\tau=1$\,s 处读数即噪声密度，斜率 $-1/2$ 是随机游走、$0$ 是零偏不稳定性、$+1/2$ 是速率随机游走。
+  \item 手眼标定：由 $T_{WI}=T_{WL}X$ 消去世界系得 $AX=XB$，先解四元数方程得到 $\bm{R}_X$，再解 $(\bm{R}_A-\bm{I})\bm{t}_X=\bm{R}_X\bm{t}_B-\bm{t}_A$ 得 $\bm{t}_X$；要求旋转轴张开。
+  \item 时间偏移影响为 $\delta\bm{p}\approx\bm{v}\delta t$、$\delta\bm{\theta}\approx\bm{\omega}\delta t$；根本解决办法是硬件触发 + PTP 或 GPS 秒脉冲。
+\end{enumerate}
+
+
+\end{summary}
+
+\begin{problemset}
+
+  \item 某雷达与 IMU 的外参偏航角差 $1.5\degree$。估算 10\,m 处点的偏差；若只在 2\,m 内建图，这个误差会被发现吗？
+  \item 从 $\bm{H}=\lambda\bm{K}[\bm{r}_1\;\bm{r}_2\;\bm{t}]$ 出发，说明 3 张不同姿态的图为何恰好能定出内参；若 3 张姿态相同，方程会怎么退化？
+  \item 证明 $\bm{B}$ 只能确定到相差一个尺度，并说明式~\eqref{eq:26-intrinsic} 为什么不受尺度影响。
+  \item 某陀螺 Allan 曲线 $\tau=1$\,s 处 $\sigma_A=0.02\,^{\circ}$/s，$\tau=100$\,s 处平台 $\sigma_A=2\,^{\circ}$/h。求 $N_g$（两种单位）与 $B$。
+  \item 手眼标定中若机器人只绕竖直轴旋转，$X$ 的哪几个分量不可观？分别从 $\bm{M}\bm{q}_X=\bm{0}$ 的秩和 $(\bm{R}_A-\bm{I})$ 的零空间解释。
+  \item 雷达时间戳打在帧尾、驱动又加了 30\,ms 传输延迟，而代码把它当作帧首采集时刻。等效 $\delta t$ 是多少？10\,Hz、2\,m/s 下误差多大？
+\end{problemset}
+
+\begin{reading}
+
+\begin{itemize}
+  \item Zhang 的原始论文 \href{https://ieeexplore.ieee.org/document/888718}{A Flexible New Technique for Camera Calibration}（PAMI 2000）：本章第~\ref{sec:26-zhang} 节的全部推导都来自这里，附录 B 给出式~\eqref{eq:26-intrinsic} 的完整形式。
+  \item Sola 的 IMU 误差状态文档 \cite{sola2017eskf}：噪声建模与离散化约定讲得最清楚，适合搞不清"噪声密度"与"离散协方差"换算的人。
+  \item Kalibr wiki 与 OpenCV 标定文档：前者给出相机-IMU 连续时间标定的完整流程与激励要求，后者给出畸变模型与工程细节。
+  \item \href{https://github.com/rpng/imu_utils}{imu\_utils}：输入一段静止数据即输出 Allan 曲线与噪声参数，可直接用表~\ref{tab:26-allan} 的读法练手。
+\end{itemize}
+
+
+\end{reading}

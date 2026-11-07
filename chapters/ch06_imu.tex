@@ -1,0 +1,545 @@
+﻿\chapter{IMU 姿态解算与航迹推算}\label{ch:06-imu}
+
+\chapterintro{IMU 是本篇最特殊的传感器：它测的不是位移，而是角速度与比力；数据最「脏」，噪声、零偏、温漂全在里面；但它又是唯一在轮子打滑、激光退化、相机过曝时仍然工作的传感器。本章把 IMU 从「一个报姿态的模块」讲清楚：测量模型怎么来、噪声怎么离散化、姿态怎么用四元数更新、横滚俯仰为什么能从重力读出来而偏航不能、互补滤波与 Mahony 为什么有效、ESKF 的 15 维公式每一块怎么推、以及为什么纯 IMU 位置积分几十秒就废。公式较多，请动笔跟着推。}
+
+\section{IMU 测量模型与噪声}\label{sec:06-model}
+
+IMU 通常包含三轴陀螺仪与三轴加速度计。陀螺仪测的是机体系相对惯性系的角速度；加速度计测的是\textbf{比力}（specific force），即单位质量所受的非引力合力，在地表附近近似等于「加速度减重力」。沿用全书符号：$\bm{g}=[0,0,-9.81]^{\top}$ 为世界系下的重力向量，$\bm{\omega}$ 为机体系下的真实角速度，$\bm{a}_W$ 为机体系原点在世界系下的真实加速度。记 IMU 测量值为 $\tilde{\bm{\omega}}$、$\tilde{\bm{a}}$，则
+\begin{equation}
+  \tilde{\bm{\omega}} = \bm{\omega} + \bm{b}_g + \bm{n}_g,
+  \qquad
+  \tilde{\bm{a}} = \bm{R}_{WB}^{\top}\left(\bm{a}_W - \bm{g}\right) + \bm{b}_a + \bm{n}_a.
+  \label{eq:06-measure}
+\end{equation}
+逐项解释：$\bm{b}_g,\bm{b}_a$ 是陀螺仪、加速度计的\textbf{零偏}（bias），是一条缓慢变化的非零常值；$\bm{n}_g,\bm{n}_a$ 是零均值高斯白噪声；$\bm{R}_{WB}^{\top}(\bm{a}_W-\bm{g})$ 说明加速度计测的是本体系下的比力——静止时 $\bm{a}_W=0$，读数不是零，而是 $-\bm{R}^{\top}\bm{g}$，这就是为什么静置的 IMU 加速度读数约为 $9.81\,\mathrm{m/s^2}$ 且指向「上」。零偏本身也在缓慢游走，建模为
+\begin{equation}
+  \dot{\bm{b}}_g = \bm{n}_{bg},
+  \qquad
+  \dot{\bm{b}}_a = \bm{n}_{ba},
+  \label{eq:06-bias-rw}
+\end{equation}
+其中 $\bm{n}_{bg},\bm{n}_{ba}$ 也是零均值白噪声。这种「白噪声的积分」叫\textbf{随机游走}（random walk）。
+
+\subsection{从连续噪声到离散噪声}
+
+仿真与滤波都需要离散时间的噪声参数，而传感器手册给的是连续时间的噪声密度。下面把两套参数的关系推出来。连续时间白噪声 $\bm{n}(t)\in\mathbb{R}^{3}$ 定义为
+\begin{equation}
+  \E\left[\bm{n}(t)\right]=\bm{0},
+  \qquad
+  \E\left[\bm{n}(t)\bm{n}(t')^{\top}\right]=\sigma_c^{2}\,\delta(t-t')\,\bm{I},
+  \label{eq:06-white-cont}
+\end{equation}
+其中 $\delta(\cdot)$ 是狄拉克函数，$\sigma_c$ 是\textbf{连续噪声密度}，单位是「物理量单位 / $\sqrt{\mathrm{Hz}}$」（陀螺仪常见的 $0.01\degree/\mathrm{s}/\sqrt{\mathrm{Hz}}$ 即属此类）。滤波器在周期 $\Delta t$ 内实际用到的是该区间上的平均噪声
+\begin{equation}
+  \bm{n}_d = \frac{1}{\Delta t}\int_{t_k}^{t_k+\Delta t}\bm{n}(t)\,\diff t.
+\end{equation}
+它的方差由式~\eqref{eq:06-white-cont} 的二重积分得到：
+\begin{align}
+  \E\left[\bm{n}_d\bm{n}_d^{\top}\right]
+  &= \frac{1}{\Delta t^{2}}\int_{t_k}^{t_k+\Delta t}\!\!\int_{t_k}^{t_k+\Delta t}
+     \E\left[\bm{n}(t)\bm{n}(t')^{\top}\right]\diff t\,\diff t' \notag\\
+  &= \frac{\sigma_c^{2}}{\Delta t^{2}}\int_{t_k}^{t_k+\Delta t}\!\!\int_{t_k}^{t_k+\Delta t}
+     \delta(t-t')\,\bm{I}\,\diff t\,\diff t' \notag\\
+  &= \frac{\sigma_c^{2}}{\Delta t^{2}}\int_{t_k}^{t_k+\Delta t}\bm{I}\,\diff t
+  = \frac{\sigma_c^{2}}{\Delta t}\,\bm{I}.
+  \label{eq:06-white-disc}
+\end{align}
+第二个等号用了「$\delta$ 函数只在 $t=t'$ 处非零」的性质：先对 $t'$ 积分得到 $\bm{I}$，再对 $t$ 积分得到 $\Delta t\,\bm{I}$。于是离散噪声的标准差为
+\begin{equation}
+  \sigma_d = \frac{\sigma_c}{\sqrt{\Delta t}}.
+  \label{eq:06-sigma-disc}
+\end{equation}
+注意 $\Delta t$ 越小，$\sigma_d$ 越大：单次采样的噪声更「尖」，但积分一段时间后的总方差 $\sigma_d^{2}\Delta t=\sigma_c^{2}\Delta t$ 随时间线性增长，与物理直觉一致。
+
+对零偏随机游走式~\eqref{eq:06-bias-rw} 在一个周期上积分，得 $\bm{b}_{k+1}-\bm{b}_k=\int_{t_k}^{t_k+\Delta t}\bm{n}_b(t)\diff t$，其方差为
+\begin{equation}
+  \E\left[\left(\bm{b}_{k+1}-\bm{b}_k\right)\left(\bm{b}_{k+1}-\bm{b}_k\right)^{\top}\right]
+  = \sigma_{bc}^{2}\,\Delta t\,\bm{I},
+\end{equation}
+即零偏离散化后的标准差为
+\begin{equation}
+  \sigma_{bd} = \sigma_{bc}\sqrt{\Delta t}.
+  \label{eq:06-bias-disc}
+\end{equation}
+与白噪声相反，随机游走的离散标准差随 $\Delta t$ 的平方根增大。
+
+\begin{example}[把手册参数变成滤波器参数]
+某 IMU 陀螺噪声密度 $0.01\degree/\mathrm{s}/\sqrt{\mathrm{Hz}}$，零偏随机游走 $0.001\degree/\mathrm{s}/\sqrt{\mathrm{s}}$，滤波周期 $\Delta t=5\,\mathrm{ms}$。由式~\eqref{eq:06-sigma-disc}，单周期角速度噪声标准差为 $0.01/\sqrt{0.005}\approx0.141\degree/\mathrm{s}$；由式~\eqref{eq:06-bias-disc}，单周期零偏随机游走标准差为 $0.001\times\sqrt{0.005}\approx7.1\times10^{-5}\,\degree/\mathrm{s}$。两者相差三个数量级，这就是为什么陀螺零偏可以近似当常值、而噪声必须每个周期都处理。
+\end{example}
+
+\section{姿态表示与四元数更新}\label{sec:06-quaternion}
+
+\textbf{姿态解算}（attitude estimation）指利用陀螺仪积分、加速度计重力观测（以及磁力计）估计机体相对世界系的旋转 $\bm{R}_{WB}$。工程上几乎都用单位四元数存储：$\bm{q}=[q_w,q_x,q_y,q_z]^{\top}$，$\norm{\bm{q}}=1$。四元数乘法定义为
+\begin{equation}
+  \bm{q}_1\otimes\bm{q}_2
+  = \begin{bmatrix}
+    w_1w_2-\bm{v}_1^{\top}\bm{v}_2\\
+    w_1\bm{v}_2+w_2\bm{v}_1+\bm{v}_1\times\bm{v}_2
+  \end{bmatrix},
+  \label{eq:06-qmul}
+\end{equation}
+其中 $\bm{v}=[q_x,q_y,q_z]^{\top}$ 是四元数的向量部分。单位四元数到旋转矩阵的完整换算是
+\begin{equation}
+  \bm{R}(\bm{q}) = \begin{bmatrix}
+    1-2(q_y^{2}+q_z^{2}) & 2(q_xq_y-q_wq_z) & 2(q_xq_z+q_wq_y)\\
+    2(q_xq_y+q_wq_z) & 1-2(q_x^{2}+q_z^{2}) & 2(q_yq_z-q_wq_x)\\
+    2(q_xq_z-q_wq_y) & 2(q_yq_z+q_wq_x) & 1-2(q_x^{2}+q_y^{2})
+  \end{bmatrix}.
+  \label{eq:06-q2R}
+\end{equation}
+
+\textbf{运动学方程。}设机体角速度在机体系下为 $\bm{\omega}$，考察极短时间 $\diff t$ 内的姿态变化。由于 $\bm{\omega}$ 是机体系下的量，增量旋转应右乘：
+\begin{equation}
+  \bm{q}(t+\diff t) = \bm{q}(t)\otimes\exp\left(\tfrac{1}{2}\bm{\omega}\diff t\right).
+\end{equation}
+当 $\diff t$ 很小时，四元数指数映射一阶近似为 $\exp(\tfrac{1}{2}\bm{\omega}\diff t)\approx[1,\ \tfrac{1}{2}\bm{\omega}\diff t]$（完整形式为 $[\cos(\theta/2),\ \bm{u}\sin(\theta/2)]$，$\theta=\norm{\bm{\omega}}\diff t$）。代入并取极限：
+\begin{align}
+  \frac{\bm{q}(t+\diff t)-\bm{q}(t)}{\diff t}
+  &= \frac{1}{\diff t}\left(\bm{q}(t)\otimes\begin{bmatrix}1\\ \tfrac{1}{2}\bm{\omega}\diff t\end{bmatrix}
+     - \bm{q}(t)\otimes\begin{bmatrix}1\\ \bm{0}\end{bmatrix}\right) \notag\\
+  &= \bm{q}(t)\otimes\begin{bmatrix}0\\ \tfrac{1}{2}\bm{\omega}\end{bmatrix}
+  = \frac{1}{2}\,\bm{q}(t)\otimes\begin{bmatrix}0\\ \bm{\omega}\end{bmatrix}.
+\end{align}
+于是得到四元数运动学方程
+\begin{equation}
+  \dot{\bm{q}} = \frac{1}{2}\,\bm{q}\otimes\begin{bmatrix}0\\ \bm{\omega}\end{bmatrix}.
+  \label{eq:06-qdot}
+\end{equation}
+离散实现中直接用估计角速度做增量更新：
+\begin{equation}
+  \bm{q}_{k+1} = \bm{q}_k\otimes\exp\left(\tfrac{1}{2}\left(\tilde{\bm{\omega}}_k-\hat{\bm{b}}_{g,k}\right)\Delta t\right),
+  \label{eq:06-q-update}
+\end{equation}
+指数项按 $\theta=\norm{\bm{\omega}}\Delta t$、$\bm{u}=\bm{\omega}/\theta$ 算成 $[\cos(\theta/2),\ \bm{u}\sin(\theta/2)]$，更新后归一化。
+
+\begin{keybox}{四元数更新的两个易错点}
+\begin{enumerate}
+  \item 左乘还是右乘：$\bm{q}_{WB}\otimes\delta\bm{q}$ 是「绕机体系轴转」，$\delta\bm{q}\otimes\bm{q}_{WB}$ 是「绕世界系轴转」。用机体系角速度必须右乘。
+  \item 归一化：数值积分会让范数缓慢偏离 1，每次更新后应归一化，否则式~\eqref{eq:06-q2R} 得到的矩阵不再正交。
+\end{enumerate}
+\end{keybox}
+
+\section{由加速度计估计重力方向与横滚俯仰}\label{sec:06-gravity}
+
+静止或匀速运动时 $\bm{a}_W\approx\bm{0}$，式~\eqref{eq:06-measure} 的加速度计读数（忽略噪声与零偏）为
+\begin{equation}
+  \tilde{\bm{a}} = -\bm{R}_{WB}^{\top}\bm{g}.
+  \label{eq:06-static-acc}
+\end{equation}
+记重力大小 $g_0=9.81$，则 $-\bm{g}=[0,0,g_0]^{\top}$。设 $\bm{R}_{WB}=\bm{R}_z(\psi)\bm{R}_y(\theta)\bm{R}_x(\phi)$（先横滚 $\phi$、再俯仰 $\theta$、最后偏航 $\psi$），下面展开式~\eqref{eq:06-static-acc}。先算两个基本旋转矩阵的乘积：
+\begin{equation}
+  \bm{R}_y(\theta)\bm{R}_x(\phi)
+  = \begin{bmatrix}
+    \cos\theta & 0 & \sin\theta\\
+    0 & 1 & 0\\
+    -\sin\theta & 0 & \cos\theta
+  \end{bmatrix}
+  \begin{bmatrix}
+    1 & 0 & 0\\
+    0 & \cos\phi & -\sin\phi\\
+    0 & \sin\phi & \cos\phi
+  \end{bmatrix}
+  = \begin{bmatrix}
+    \cos\theta & \sin\theta\sin\phi & \sin\theta\cos\phi\\
+    0 & \cos\phi & -\sin\phi\\
+    -\sin\theta & \cos\theta\sin\phi & \cos\theta\cos\phi
+  \end{bmatrix}.
+\end{equation}
+记这个矩阵为 $\bm{M}$。由于 $\bm{R}_{WB}=\bm{R}_z(\psi)\bm{M}$，而 $\bm{R}_z$ 只作用于 $x,y$ 分量、不改变 $z$ 分量，所以 $\bm{R}_{WB}^{\top}\bm{e}_z$（即重力方向）的 $z$ 分量等于 $\bm{M}^{\top}\bm{e}_z$ 的 $z$ 分量。$\bm{M}^{\top}$ 的第三行就是 $\bm{M}$ 的第三列 $[\sin\theta\cos\phi,\ -\sin\phi,\ \cos\theta\cos\phi]$，于是
+\begin{equation}
+  \tilde{\bm{a}} = g_0\begin{bmatrix}
+    \sin\theta\cos\phi\\
+    -\sin\phi\\
+    \cos\theta\cos\phi
+  \end{bmatrix}.
+  \label{eq:06-acc-expand}
+\end{equation}
+由第二、三分量解出横滚，由第一、三分量解出俯仰：
+\begin{equation}
+  \phi = \arctan2\left(-\tilde{a}_y,\ \tilde{a}_z\right),
+  \qquad
+  \theta = \arctan2\left(\tilde{a}_x,\ \sqrt{\tilde{a}_y^{2}+\tilde{a}_z^{2}}\right).
+  \label{eq:06-roll-pitch}
+\end{equation}
+有些资料写成 $\phi=\arctan2(a_y,a_z)$、$\theta=\arctan2(-a_x,\sqrt{a_y^2+a_z^2})$，那是把重力方向取反的约定；两种写法只差整体符号，使用时必须与自己的加速度计符号约定一致。
+
+\textbf{为什么偏航不可观测？}式~\eqref{eq:06-acc-expand} 中没有 $\psi$：绕世界系 $z$ 轴的旋转矩阵 $\bm{R}_z(\psi)$ 被 $\bm{R}_z^{\top}$ 作用在 $\bm{e}_z$ 上时满足 $\bm{R}_z^{\top}\bm{e}_z=\bm{e}_z$，因此 $\bm{R}_{WB}^{\top}\bm{g}$ 与 $\psi$ 无关。物理上，重力方向只提供「哪边是下」，无法提供「哪边是北」——绕重力轴的旋转不改变任何加速度计读数。这就是所谓\textbf{重力对齐}（gravity alignment）：加速度计只能把姿态对齐到重力方向（两个自由度），第三个自由度（偏航）必须靠磁力计、轮速、激光或视觉提供。
+
+\begin{figure}[htbp]
+  \centering
+  \begin{tikzpicture}[scale=0.72]
+    \draw[-stealth, thick] (0,0) -- (3.6,0) node[right, font=\footnotesize] {$x_W$};
+    \draw[-stealth, thick] (0,0) -- (0,3.4) node[above, font=\footnotesize] {$z_W$（上）};
+    \draw[-stealth, very thick, red!60!black] (1.2,2.8) -- (1.2,1.2) node[midway, right, font=\footnotesize] {$\bm{g}$};
+    \draw[thick, fill=structurecolor!10, rotate around={-25:(1.2,1.7)}] (0.55,1.5) rectangle (1.85,1.9);
+    \draw[-stealth, structurecolor, rotate around={-25:(1.2,1.7)}] (1.2,1.7) -- (1.85,1.7) node[right, font=\footnotesize] {$x_B$};
+    \draw[-stealth, structurecolor, rotate around={-25:(1.2,1.7)}] (1.2,1.7) -- (1.2,2.35) node[above, font=\footnotesize] {$z_B$};
+    \draw[dashed, black!40] (1.2,1.7) -- (2.2,1.7);
+    \draw (1.85,1.7) arc (0:-25:0.65);
+    \node[font=\footnotesize] at (2.35,1.5) {$\theta$};
+    \node[font=\footnotesize, align=center] at (1.0,-0.4) {静止时加速度计测的是比力\\$\tilde{\bm{a}}=-\bm{R}_{WB}^{\top}\bm{g}$};
+  \end{tikzpicture}
+  \caption{加速度计测量重力方向示意。静止时读数只与「$z_B$ 轴相对重力的倾角」有关，与绕重力轴的偏航角 $\psi$ 无关，因此重力只能观测横滚与俯仰两个自由度。}
+  \label{fig:06-gravity}
+\end{figure}
+
+\section{互补滤波与 Mahony 滤波}\label{sec:06-complementary}
+
+陀螺积分短期准、长期漂；加速度计长期无漂、短期噪声大。两者恰好互补，于是有了\textbf{互补滤波}（complementary filter）。设真实角度为 $\theta$，陀螺积分得到 $\theta_g$（含低频漂移），加速度计得到 $\theta_a$（含高频噪声）。取一阶低通、高通滤波器
+\begin{equation}
+  H_{\text{LP}}(s)=\frac{\omega_c}{s+\omega_c},
+  \qquad
+  H_{\text{HP}}(s)=\frac{s}{s+\omega_c},
+  \label{eq:06-filters}
+\end{equation}
+其中 $\omega_c$ 是截止角频率。两者之和恒为 1：$H_{\text{LP}}+H_{\text{HP}}=(s+\omega_c)/(s+\omega_c)=1$，于是
+\begin{equation}
+  \hat{\theta}(s) = H_{\text{LP}}(s)\,\theta_a(s) + H_{\text{HP}}(s)\,\theta_g(s).
+  \label{eq:06-complementary}
+\end{equation}
+这就是互补滤波：两个通道的传递函数互补成 1，低频信加速度计（不受漂移影响），高频信陀螺（不受噪声影响）。用后向差分 $s\approx(1-z^{-1})/\Delta t$ 离散化，得
+\begin{equation}
+  \hat{\theta}_k = \alpha\left(\hat{\theta}_{k-1}+\omega_k\Delta t\right) + (1-\alpha)\,\theta_{a,k},
+  \qquad
+  \alpha = \frac{\omega_c\Delta t}{1+\omega_c\Delta t}.
+  \label{eq:06-comp-discrete}
+\end{equation}
+工程上常写成 $\alpha=\tau/(\tau+\Delta t)$，$\tau$ 是时间常数。$\alpha$ 越接近 1 越信任陀螺，越接近 0 越信任加速度计；典型值 $0.95$--$0.99$。
+
+\textbf{Mahony 滤波。}互补滤波逐轴处理横滚俯仰，难以直接推广到三维。Mahony 的做法是构造一个三维「姿态误差」向量，再用 PI 控制器把它反馈到角速度上。加速度计测得的方向归一化为 $\hat{\bm{a}}=\tilde{\bm{a}}/\norm{\tilde{\bm{a}}}$，当前姿态估计预测的「上」方向为 $\hat{\bm{g}}_b=\hat{\bm{R}}^{\top}\bm{e}_z$。定义误差
+\begin{equation}
+  \bm{e} = \hat{\bm{g}}_b\times\hat{\bm{a}}.
+  \label{eq:06-mahony-err}
+\end{equation}
+\textbf{为什么这样定义？}设真实姿态与估计姿态差一个小角度 $\delta\bm{\theta}$，即 $\bm{R}=\hat{\bm{R}}\exp(\delta\bm{\theta}^{\wedge})$。真实「上」方向在机体系下为 $\bm{u}=\bm{R}^{\top}\bm{e}_z$，代入 $\bm{R}^{\top}=\exp(-\delta\bm{\theta}^{\wedge})\hat{\bm{R}}^{\top}\approx(\bm{I}-\delta\bm{\theta}^{\wedge})\hat{\bm{R}}^{\top}$：
+\begin{equation}
+  \bm{u} \approx \left(\bm{I}-\delta\bm{\theta}^{\wedge}\right)\hat{\bm{g}}_b
+  = \hat{\bm{g}}_b - \delta\bm{\theta}\times\hat{\bm{g}}_b
+  = \hat{\bm{g}}_b + \hat{\bm{g}}_b\times\delta\bm{\theta},
+\end{equation}
+其中最后一步用了 $-\delta\bm{\theta}\times\hat{\bm{g}}_b=\hat{\bm{g}}_b\times\delta\bm{\theta}$。又因为静止时 $\hat{\bm{a}}$ 就是 $\bm{u}$，代入式~\eqref{eq:06-mahony-err}：
+\begin{equation}
+  \bm{e} = \hat{\bm{g}}_b\times\left(\hat{\bm{g}}_b+\hat{\bm{g}}_b\times\delta\bm{\theta}\right)
+  = \hat{\bm{g}}_b\times\left(\hat{\bm{g}}_b\times\delta\bm{\theta}\right)
+  = \hat{\bm{g}}_b\left(\hat{\bm{g}}_b^{\top}\delta\bm{\theta}\right)-\delta\bm{\theta}
+  = -\left(\bm{I}-\bm{P}\right)\delta\bm{\theta},
+  \label{eq:06-mahony-linear}
+\end{equation}
+最后一步用了向量三重积公式 $\bm{a}\times(\bm{b}\times\bm{c})=\bm{b}(\bm{a}\cdot\bm{c})-\bm{c}(\bm{a}\cdot\bm{b})$ 与 $\bm{P}=\hat{\bm{g}}_b\hat{\bm{g}}_b^{\top}$。式~\eqref{eq:06-mahony-linear} 说明两件事：$\bm{e}$ 等于「姿态误差中垂直于重力方向的那一部分」取负；平行于重力方向（即偏航）的误差被投影矩阵 $\bm{I}-\bm{P}$ 滤掉，所以 Mahony 只能修正横滚俯仰。
+
+既然 $\bm{e}$ 指向「把估计转回真值」的方向，把它按 PI 律加进角速度即可收敛：
+\begin{equation}
+  \bm{\omega}_{\text{cmd}} = \tilde{\bm{\omega}} - \hat{\bm{b}}_g + K_p\,\bm{e} + K_i\int\bm{e}\,\diff t,
+  \qquad
+  \dot{\hat{\bm{b}}}_g = -K_i\,\bm{e}.
+  \label{eq:06-mahony}
+\end{equation}
+比例项 $K_p\bm{e}$ 负责快速纠正倾斜；积分项同时估计陀螺零偏——当姿态稳定、$\bm{e}\to0$ 时 $\hat{\bm{b}}_g$ 停止变化，残差被积分吸收。注意 $\bm{e}$ 恒为零只说明估计方向与加速度计一致，偏航仍自由漂移，所以 Mahony 只适用于「横滚俯仰必须准、偏航交给别的传感器」的场景（第~\ref{ch:09-fusion}~章）。
+
+\section{ESKF：误差状态卡尔曼滤波}\label{sec:06-eskf}
+
+\subsection{先复习普通卡尔曼滤波}
+
+线性高斯系统 $\bm{x}_{k+1}=\bm{F}_k\bm{x}_k+\bm{w}_k$、$\bm{z}_k=\bm{H}_k\bm{x}_k+\bm{v}_k$，其中 $\bm{w}_k\sim\mathcal{N}(\bm{0},\bm{Q}_k)$、$\bm{v}_k\sim\mathcal{N}(\bm{0},\bm{R}_k)$ 且相互独立。卡尔曼滤波 \cite{kalman1960} 的预测与更新为
+\begin{equation}
+  \hat{\bm{x}}_k^{-}=\bm{F}_{k-1}\hat{\bm{x}}_{k-1},
+  \qquad
+  \bm{P}_k^{-}=\bm{F}_{k-1}\bm{P}_{k-1}\bm{F}_{k-1}^{\top}+\bm{Q}_{k-1},
+  \label{eq:06-kf-predict}
+\end{equation}
+\begin{equation}
+  \bm{K}_k=\bm{P}_k^{-}\bm{H}_k^{\top}\left(\bm{H}_k\bm{P}_k^{-}\bm{H}_k^{\top}+\bm{R}_k\right)^{-1},
+  \qquad
+  \hat{\bm{x}}_k=\hat{\bm{x}}_k^{-}+\bm{K}_k\left(\bm{z}_k-\bm{H}_k\hat{\bm{x}}_k^{-}\right),
+  \label{eq:06-kf-update}
+\end{equation}
+\begin{equation}
+  \bm{P}_k=\left(\bm{I}-\bm{K}_k\bm{H}_k\right)\bm{P}_k^{-}.
+  \label{eq:06-kf-cov}
+\end{equation}
+预测把不确定性按动力学传播，更新用测量收缩不确定性；$\bm{K}$ 是「测量比先验可信多少」的加权。这些公式成立的前提是系统线性、噪声高斯——IMU 的姿态部分是矩阵乘法，不是向量加法，直接套 EKF 会在线性化处引入误差，于是有了 ESKF。
+
+\subsection{误差状态的定义}
+
+\textbf{ESKF 误差状态}（error-state Kalman filter）的核心思想：把真实状态写成「名义状态 $\oplus$ 小误差」。对 IMU 惯导取 15 维状态
+\begin{equation}
+  \bm{x} = \left(\bm{p},\ \bm{v},\ \bm{R},\ \bm{b}_g,\ \bm{b}_a\right),
+  \qquad
+  \delta\bm{x} = \left(\delta\bm{p},\ \delta\bm{v},\ \delta\bm{\theta},\ \delta\bm{b}_g,\ \delta\bm{b}_a\right)\in\mathbb{R}^{15},
+  \label{eq:06-state}
+\end{equation}
+其中 $\bm{p},\bm{v}\in\mathbb{R}^{3}$ 是世界系下的位置与速度，$\bm{R}\in SO(3)$，$\bm{b}_g,\bm{b}_a\in\mathbb{R}^{3}$。真实状态与名义状态的关系为
+\begin{equation}
+  \bm{p}=\hat{\bm{p}}+\delta\bm{p},\quad
+  \bm{v}=\hat{\bm{v}}+\delta\bm{v},\quad
+  \bm{R}=\hat{\bm{R}}\exp\left(\delta\bm{\theta}^{\wedge}\right),\quad
+  \bm{b}_g=\hat{\bm{b}}_g+\delta\bm{b}_g,\quad
+  \bm{b}_a=\hat{\bm{b}}_a+\delta\bm{b}_a.
+  \label{eq:06-error-def}
+\end{equation}
+注意姿态不能写成「$\hat{\bm{R}}+\delta\bm{\theta}$」——旋转矩阵相加后不再正交，必须写成名义旋转右乘一个小旋转。
+
+\subsection{误差状态运动方程}
+
+把式~\eqref{eq:06-error-def} 代入真实状态的动力学，减去名义状态的动力学，保留一阶项。
+
+\textbf{位置误差。}由 $\dot{\bm{p}}=\bm{v}$ 与 $\dot{\hat{\bm{p}}}=\hat{\bm{v}}$ 直接相减得
+\begin{equation}
+  \delta\dot{\bm{p}} = \delta\bm{v}.
+  \label{eq:06-dp}
+\end{equation}
+\textbf{速度误差。}真实加速度与名义加速度分别为
+\begin{equation}
+  \bm{a}_W = \bm{R}\left(\tilde{\bm{a}}-\bm{b}_a-\bm{n}_a\right)+\bm{g},
+  \qquad
+  \hat{\bm{a}}_W = \hat{\bm{R}}\left(\tilde{\bm{a}}-\hat{\bm{b}}_a\right)+\bm{g}.
+\end{equation}
+两式相减得 $\delta\dot{\bm{v}}=\bm{a}_W-\hat{\bm{a}}_W$。代入 $\bm{R}=\hat{\bm{R}}(\bm{I}+\delta\bm{\theta}^{\wedge})$ 与 $\bm{b}_a=\hat{\bm{b}}_a+\delta\bm{b}_a$：
+\begin{align}
+  \bm{a}_W-\hat{\bm{a}}_W
+  &= \hat{\bm{R}}\left(\bm{I}+\delta\bm{\theta}^{\wedge}\right)
+     \left(\tilde{\bm{a}}-\hat{\bm{b}}_a-\delta\bm{b}_a-\bm{n}_a\right)
+     - \hat{\bm{R}}\left(\tilde{\bm{a}}-\hat{\bm{b}}_a\right) \notag\\
+  &= \hat{\bm{R}}\Big[\left(\bm{I}+\delta\bm{\theta}^{\wedge}\right)\left(\tilde{\bm{a}}-\hat{\bm{b}}_a\right)
+     -\left(\bm{I}+\delta\bm{\theta}^{\wedge}\right)\left(\delta\bm{b}_a+\bm{n}_a\right)
+     -\left(\tilde{\bm{a}}-\hat{\bm{b}}_a\right)\Big].
+\end{align}
+第二项里 $\delta\bm{\theta}^{\wedge}(\delta\bm{b}_a+\bm{n}_a)$ 是两个小量相乘，属于二阶项，按一阶近似舍去；第一项与第三项相消后剩下 $\delta\bm{\theta}^{\wedge}(\tilde{\bm{a}}-\hat{\bm{b}}_a)$。于是
+\begin{equation}
+  \delta\dot{\bm{v}}
+  = \hat{\bm{R}}\left[\delta\bm{\theta}^{\wedge}\left(\tilde{\bm{a}}-\hat{\bm{b}}_a\right)
+    -\delta\bm{b}_a-\bm{n}_a\right]
+  = -\hat{\bm{R}}\left(\tilde{\bm{a}}-\hat{\bm{b}}_a\right)^{\wedge}\delta\bm{\theta}
+    -\hat{\bm{R}}\,\delta\bm{b}_a-\hat{\bm{R}}\,\bm{n}_a,
+  \label{eq:06-dv}
+\end{equation}
+最后一步用了 $\delta\bm{\theta}^{\wedge}\bm{x}=-\bm{x}^{\wedge}\delta\bm{\theta}$。式~\eqref{eq:06-dv} 说明三件事：姿态误差会「漏」到速度里（耦合项 $-\hat{\bm{R}}\bm{a}_b^{\wedge}$，其中 $\bm{a}_b=\tilde{\bm{a}}-\hat{\bm{b}}_a$）；加速度计零偏误差直接进速度；噪声经当前姿态旋转到世界系。
+
+\textbf{姿态误差。}对 $\bm{R}=\hat{\bm{R}}\exp(\delta\bm{\theta}^{\wedge})$ 求导，代入真实/名义动力学 $\dot{\bm{R}}=\bm{R}\bm{\omega}^{\wedge}$、$\dot{\hat{\bm{R}}}=\hat{\bm{R}}\hat{\bm{\omega}}^{\wedge}$（$\hat{\bm{\omega}}=\tilde{\bm{\omega}}-\hat{\bm{b}}_g$）：
+\begin{align}
+  \dot{\bm{R}} &= \dot{\hat{\bm{R}}}\exp(\delta\bm{\theta}^{\wedge})
+                 +\hat{\bm{R}}\frac{\diff}{\diff t}\exp(\delta\bm{\theta}^{\wedge})
+  \approx \hat{\bm{R}}\hat{\bm{\omega}}^{\wedge}\left(\bm{I}+\delta\bm{\theta}^{\wedge}\right)
+  +\hat{\bm{R}}\delta\dot{\bm{\theta}}^{\wedge},
+\end{align}
+另一方面 $\bm{\omega}=\tilde{\bm{\omega}}-\bm{b}_g-\bm{n}_g=\hat{\bm{\omega}}-\delta\bm{b}_g-\bm{n}_g$，故
+\begin{equation}
+  \dot{\bm{R}} = \bm{R}\bm{\omega}^{\wedge}
+  \approx \hat{\bm{R}}\left(\bm{I}+\delta\bm{\theta}^{\wedge}\right)
+  \left(\hat{\bm{\omega}}^{\wedge}-\delta\bm{b}_g^{\wedge}-\bm{n}_g^{\wedge}\right).
+\end{equation}
+令两式右边相等，两边左乘 $\hat{\bm{R}}^{\top}$，只保留一阶项：
+\begin{equation}
+  \hat{\bm{\omega}}^{\wedge}+\hat{\bm{\omega}}^{\wedge}\delta\bm{\theta}^{\wedge}+\delta\dot{\bm{\theta}}^{\wedge}
+  = \hat{\bm{\omega}}^{\wedge}-\delta\bm{b}_g^{\wedge}-\bm{n}_g^{\wedge}
+    +\delta\bm{\theta}^{\wedge}\hat{\bm{\omega}}^{\wedge}.
+\end{equation}
+消去两边的 $\hat{\bm{\omega}}^{\wedge}$，移项得
+\begin{equation}
+  \delta\dot{\bm{\theta}}^{\wedge}
+  = \delta\bm{\theta}^{\wedge}\hat{\bm{\omega}}^{\wedge}-\hat{\bm{\omega}}^{\wedge}\delta\bm{\theta}^{\wedge}
+    -\delta\bm{b}_g^{\wedge}-\bm{n}_g^{\wedge}.
+\end{equation}
+用反对称矩阵恒等式 $\bm{a}^{\wedge}\bm{b}^{\wedge}-\bm{b}^{\wedge}\bm{a}^{\wedge}=(\bm{a}\times\bm{b})^{\wedge}$，第一项为 $(\delta\bm{\theta}\times\hat{\bm{\omega}})^{\wedge}$；而 $\delta\bm{\theta}\times\hat{\bm{\omega}}=-\hat{\bm{\omega}}\times\delta\bm{\theta}=-\hat{\bm{\omega}}^{\wedge}\delta\bm{\theta}$。脱掉 $\wedge$ 得
+\begin{equation}
+  \delta\dot{\bm{\theta}} = -\hat{\bm{\omega}}^{\wedge}\,\delta\bm{\theta}-\delta\bm{b}_g-\bm{n}_g.
+  \label{eq:06-dtheta}
+\end{equation}
+\textbf{零偏误差。}零偏的随机游走对真实与名义状态相同，相减后噪声保留：
+\begin{equation}
+  \delta\dot{\bm{b}}_g = \bm{n}_{bg},
+  \qquad
+  \delta\dot{\bm{b}}_a = \bm{n}_{ba}.
+  \label{eq:06-dbias}
+\end{equation}
+
+\subsection{离散化、状态转移矩阵与过程噪声}
+
+把式~\eqref{eq:06-dp}、\eqref{eq:06-dv}、\eqref{eq:06-dtheta}、\eqref{eq:06-dbias} 写成 $\delta\dot{\bm{x}}=\bm{A}\,\delta\bm{x}+\bm{B}\bm{n}$，$\bm{A}$ 是 $15\times15$ 分块矩阵：
+\begin{equation}
+  \bm{A} = \begin{bmatrix}
+    \bm{0} & \bm{I} & \bm{0} & \bm{0} & \bm{0}\\
+    \bm{0} & \bm{0} & -\hat{\bm{R}}\bm{a}_b^{\wedge} & \bm{0} & -\hat{\bm{R}}\\
+    \bm{0} & \bm{0} & -\hat{\bm{\omega}}^{\wedge} & -\bm{I} & \bm{0}\\
+    \bm{0} & \bm{0} & \bm{0} & \bm{0} & \bm{0}\\
+    \bm{0} & \bm{0} & \bm{0} & \bm{0} & \bm{0}
+  \end{bmatrix},
+  \qquad \bm{a}_b=\tilde{\bm{a}}-\hat{\bm{b}}_a.
+  \label{eq:06-A}
+\end{equation}
+一阶离散化 $\bm{F}=\bm{I}+\bm{A}\Delta t$，逐块写出：
+\begin{equation}
+  \bm{F} = \begin{bmatrix}
+    \bm{I} & \bm{I}\Delta t & \bm{0} & \bm{0} & \bm{0}\\
+    \bm{0} & \bm{I} & -\hat{\bm{R}}\bm{a}_b^{\wedge}\Delta t & \bm{0} & -\hat{\bm{R}}\Delta t\\
+    \bm{0} & \bm{0} & \bm{I}-\hat{\bm{\omega}}^{\wedge}\Delta t & -\bm{I}\Delta t & \bm{0}\\
+    \bm{0} & \bm{0} & \bm{0} & \bm{I} & \bm{0}\\
+    \bm{0} & \bm{0} & \bm{0} & \bm{0} & \bm{I}
+  \end{bmatrix}.
+  \label{eq:06-F}
+\end{equation}
+逐块解释：第一行表示位置误差由速度误差积分而来；第二行表示速度误差由「姿态误差耦合的加速度」与「加速度计零偏误差」驱动，这两块分别是 $\partial\dot{\bm{v}}/\partial\delta\bm{\theta}$ 与 $\partial\dot{\bm{v}}/\partial\delta\bm{b}_a$ 乘以 $\Delta t$；第三行表示姿态误差由「自身随角速度旋转」与「陀螺零偏误差」驱动；第四、五行表示零偏误差本身不传播，只有噪声驱动。过程噪声协方差（一阶离散）为
+\begin{equation}
+  \bm{Q}_d = \mathrm{diag}\left(\bm{0},\ \sigma_{a}^{2}\Delta t\,\bm{I},\ \sigma_{g}^{2}\Delta t\,\bm{I},\ \sigma_{bg}^{2}\Delta t\,\bm{I},\ \sigma_{ba}^{2}\Delta t\,\bm{I}\right),
+  \label{eq:06-Qd}
+\end{equation}
+其中 $\sigma_a,\sigma_g$ 是加速度计、陀螺仪的连续噪声密度，$\sigma_{bg},\sigma_{ba}$ 为零偏随机游走密度；系数 $\Delta t$ 正是式~\eqref{eq:06-white-disc}、\eqref{eq:06-bias-disc} 的结论。位置块为零，因为位置误差的随机性完全来自速度误差的积分。
+
+\subsection{观测方程、更新与重置}
+
+\textbf{位置观测。}若外部（激光、视觉、轮速积分）给出世界系位置 $\bm{z}_p=\bm{p}+\bm{n}_p$，残差 $\bm{r}=\bm{z}_p-\hat{\bm{p}}$，则
+\begin{equation}
+  \bm{H}_p = \left[\bm{I}\ \ \bm{0}\ \ \bm{0}\ \ \bm{0}\ \ \bm{0}\right]\in\mathbb{R}^{3\times15}.
+\end{equation}
+\textbf{本体系速度观测。}轮式里程计给出机体系速度 $\bm{z}_v=\bm{R}_{WB}^{\top}\bm{v}_W+\bm{n}_v$。对姿态误差求雅可比：$\bm{R}^{\top}\approx(\bm{I}-\delta\bm{\theta}^{\wedge})\hat{\bm{R}}^{\top}$，故
+\begin{equation}
+  \bm{z}_v \approx \hat{\bm{R}}^{\top}\hat{\bm{v}}+\hat{\bm{R}}^{\top}\delta\bm{v}
+  -\delta\bm{\theta}^{\wedge}\hat{\bm{R}}^{\top}\hat{\bm{v}}
+  = \hat{\bm{R}}^{\top}\hat{\bm{v}}+\hat{\bm{R}}^{\top}\delta\bm{v}
+  +\left(\hat{\bm{R}}^{\top}\hat{\bm{v}}\right)^{\wedge}\delta\bm{\theta},
+\end{equation}
+其中用了 $-\delta\bm{\theta}^{\wedge}\bm{w}=\bm{w}^{\wedge}\delta\bm{\theta}$。于是
+\begin{equation}
+  \bm{H}_v = \left[\bm{0}\ \ \hat{\bm{R}}^{\top}\ \ \left(\hat{\bm{R}}^{\top}\hat{\bm{v}}\right)^{\wedge}\ \ \bm{0}\ \ \bm{0}\right]\in\mathbb{R}^{3\times15}.
+  \label{eq:06-Hv}
+\end{equation}
+这两项很有代表性：位置观测只「看」位置块；速度观测同时通过 $\hat{\bm{R}}^{\top}$ 与姿态误差耦合，所以它还能顺带修正姿态。残差 $\bm{r}=\bm{z}-\bm{h}(\hat{\bm{x}})$，按式~\eqref{eq:06-kf-update} 算 $\bm{K}$ 与 $\delta\hat{\bm{x}}$，再注入名义状态：
+\begin{equation}
+  \hat{\bm{p}}\leftarrow\hat{\bm{p}}+\delta\hat{\bm{p}},\quad
+  \hat{\bm{v}}\leftarrow\hat{\bm{v}}+\delta\hat{\bm{v}},\quad
+  \hat{\bm{R}}\leftarrow\hat{\bm{R}}\exp\left(\delta\hat{\bm{\theta}}^{\wedge}\right),\quad
+  \hat{\bm{b}}_g\leftarrow\hat{\bm{b}}_g+\delta\hat{\bm{b}}_g,\quad
+  \hat{\bm{b}}_a\leftarrow\hat{\bm{b}}_a+\delta\hat{\bm{b}}_a.
+  \label{eq:06-inject}
+\end{equation}
+注入后误差状态被「用掉」，应重置为零。由于旋转的注入不是加法，协方差需要乘重置雅可比：
+\begin{equation}
+  \bm{P}\leftarrow\bm{G}\,\bm{P}\,\bm{G}^{\top},
+  \qquad
+  \bm{G}=\mathrm{diag}\left(\bm{I},\ \bm{I},\ \bm{I}-\tfrac{1}{2}\left[\delta\hat{\bm{\theta}}\right]^{\wedge},\ \bm{I},\ \bm{I}\right).
+  \label{eq:06-reset}
+\end{equation}
+$\bm{G}$ 的姿态块来自「注入后新误差状态与旧误差状态之差」的一阶展开；$\delta\hat{\bm{\theta}}$ 很小时 $\bm{G}\approx\bm{I}$，许多实现直接省略这一步。完整推导见 \cite{sola2017eskf}，李群视角见 \cite{barfoot2017state}。
+
+\begin{figure}[htbp]
+  \centering
+  \begin{tikzpicture}[node distance=6mm and 13mm]
+    \node[block] (imu) {IMU 测量\\$\tilde{\bm{\omega}},\tilde{\bm{a}}$};
+    \node[block, right=of imu] (nom) {名义状态\\积分预测};
+    \node[block, right=of nom] (f) {误差协方差\\$\bm{F},\bm{Q}_d$ 传播};
+    \node[block, below=of f] (upd) {卡尔曼更新\\$\bm{K}$、$\delta\hat{\bm{x}}$};
+    \node[block, left=of upd] (inj) {误差注入\\与 $\bm{P}$ 重置};
+    \node[block, left=of inj] (out) {输出位姿\\$T_{WB}$};
+    \node[block2, above=of upd] (obs) {外部观测\\位置 / 速度};
+    \draw[-stealth, thick] (imu) -- (nom);
+    \draw[-stealth, thick] (nom) -- (f);
+    \draw[-stealth, thick] (f) -- (upd);
+    \draw[-stealth, thick] (obs) -- (upd);
+    \draw[-stealth, thick] (upd) -- (inj);
+    \draw[-stealth, thick] (inj) -- (out);
+    \draw[-stealth, thick, dashed] (inj.north) |- (nom.south);
+  \end{tikzpicture}
+  \caption{ESKF 的单次迭代。IMU 驱动名义状态积分与误差状态协方差传播；有观测时做卡尔曼更新，把 $\delta\hat{\bm{x}}$ 注入名义状态并重置协方差；注入后的名义状态继续作为下一次积分的起点。}
+  \label{fig:06-eskf}
+\end{figure}
+
+\begin{pseudo}{ESKF 单次迭代（IMU 预测 + 观测更新）}
+  \item 读取 $\tilde{\bm{\omega}},\tilde{\bm{a}}$ 与时间间隔 $\Delta t$
+  \item 名义状态预测：$\hat{\bm{a}}_W\leftarrow\hat{\bm{R}}(\tilde{\bm{a}}-\hat{\bm{b}}_a)+\bm{g}$
+  \item \quad $\hat{\bm{p}}\leftarrow\hat{\bm{p}}+\hat{\bm{v}}\Delta t+\tfrac{1}{2}\hat{\bm{a}}_W\Delta t^{2}$，$\hat{\bm{v}}\leftarrow\hat{\bm{v}}+\hat{\bm{a}}_W\Delta t$
+  \item \quad $\hat{\bm{R}}\leftarrow\hat{\bm{R}}\exp((\tilde{\bm{\omega}}-\hat{\bm{b}}_g)^{\wedge}\Delta t)$
+  \item 协方差预测：由式~\eqref{eq:06-F}、\eqref{eq:06-Qd} 算 $\bm{P}\leftarrow\bm{F}\bm{P}\bm{F}^{\top}+\bm{Q}_d$
+  \item 若本周期有观测 $\bm{z}$：$\bm{r}\leftarrow\bm{z}-\bm{h}(\hat{\bm{x}})$，$\bm{S}\leftarrow\bm{H}\bm{P}\bm{H}^{\top}+\bm{R}$
+  \item \quad $\bm{K}\leftarrow\bm{P}\bm{H}^{\top}\bm{S}^{-1}$，$\delta\hat{\bm{x}}\leftarrow\bm{K}\bm{r}$
+  \item \quad 按式~\eqref{eq:06-inject} 注入，按式~\eqref{eq:06-reset} 重置 $\bm{P}$
+\end{pseudo}
+
+\textbf{ESKF 与 EKF 的对比。}普通 EKF 直接在 15 维状态上线性化，姿态块要处理「旋转矩阵加向量」的非法运算，且线性化点离真值越远误差越大。ESKF 的线性化点始终在名义状态附近，误差状态每次更新后被重置、始终很小，因此线性化误差小；姿态更新用指数映射保持正交性；协方差描述小误差，数值条件更好。代价是多一套注入与重置的簿记。
+
+\section{航迹推算与零速修正}\label{sec:06-strapdown}
+
+\textbf{航迹推算}（strapdown，捷联惯导）就是按测量模型把加速度积分两次。由式~\eqref{eq:06-measure} 去掉噪声并用估计零偏：
+\begin{equation}
+  \hat{\bm{a}}_W = \hat{\bm{R}}\left(\tilde{\bm{a}}-\hat{\bm{b}}_a\right)+\bm{g},
+  \label{eq:06-acc-world}
+\end{equation}
+然后欧拉积分
+\begin{equation}
+  \hat{\bm{v}}_{k+1}=\hat{\bm{v}}_k+\hat{\bm{a}}_{W,k}\Delta t,
+  \qquad
+  \hat{\bm{p}}_{k+1}=\hat{\bm{p}}_k+\hat{\bm{v}}_k\Delta t+\tfrac{1}{2}\hat{\bm{a}}_{W,k}\Delta t^{2}.
+  \label{eq:06-integration}
+\end{equation}
+\textbf{为什么纯 IMU 位置会很快不可用？}设加速度计零偏残差为 $b$，则速度误差按 $bt$ 增长、位置误差按 $\tfrac{1}{2}bt^{2}$ 增长。取 $b=0.01\,\mathrm{m/s^2}$、$t=60\,\mathrm{s}$，得 $\Delta p\approx\tfrac{1}{2}\times0.01\times60^{2}=18\,\mathrm{m}$。更隐蔽的是姿态误差：一个 $0.01\degree$ 的倾角误差 $\epsilon=1.75\times10^{-4}\,\mathrm{rad}$ 会把重力「漏」进水平加速度，产生 $g_0\epsilon\approx1.7\times10^{-3}\,\mathrm{m/s^{2}}$ 的虚假加速度，60\,s 后位置误差约 $\tfrac{1}{2}g_0\epsilon t^{2}\approx3.1\,\mathrm{m}$。这就是为什么纯 IMU 必须配合外部观测使用，也是第~\ref{ch:09-fusion}~章融合动机的定量依据。
+
+\textbf{零速修正}（zero velocity update, ZUPT）是最廉价的修正手段：机器人静止时真实速度为零，把「速度为零」当作一次观测即可约束速度与零偏。检测条件通常是「角速度模长小于阈值、加速度模长接近 $g_0$、且持续若干周期」。触发后构造伪观测 $\bm{z}_v=\bm{0}$：
+\begin{equation}
+  \bm{r} = \bm{0}-\hat{\bm{v}},\qquad
+  \bm{H}=\left[\bm{0}\ \ \bm{I}\ \ \bm{0}\ \ \bm{0}\ \ \bm{0}\right],
+\end{equation}
+按式~\eqref{eq:06-kf-update} 更新。零速时速度误差被观测直接压小，同时通过 $\bm{F}$ 的耦合把零偏误差也约束住，这就是「ZUPT 能估零偏」的机理。工程上 $\bm{R}$ 不能过大（没效果）也不能过小（误检测时会把状态错误拉回）。
+
+\begin{keybox}{ZUPT 的三条工程经验}
+\begin{enumerate}
+  \item 检测比修正更重要：先保证「确实静止」再修正，宁可漏检不要误检。
+  \item 静止判据用滑动窗口（如连续 10 个周期都满足），单周期判据容易被撞击或振动骗过。
+  \item ZUPT 只约束速度与零偏，不约束位置；位置漂移需要外部绝对观测来消除。
+\end{enumerate}
+\end{keybox}
+
+\section{工程实现：ROS 2 中的 IMU}\label{sec:06-engineering}
+
+ROS 2 的 \texttt{sensor\_msgs/msg/Imu} 包含 \texttt{orientation}（四元数）、\texttt{angular\_velocity}（rad/s）、\texttt{linear\_acceleration}（m/s$^2$，是比力而非世界系加速度）以及三组协方差。最常见的坑：
+
+\begin{itemize}
+  \item \textbf{单位与坐标系}：角速度必须转成 rad/s，IMU 轴系必须通过外参与全书约定（$x$ 前、$y$ 左、$z$ 上）统一，否则重力方向符号全错。
+  \item \textbf{协方差}：填的是测量噪声而非零偏随机游走，混填会让滤波器过度自信。
+  \item \textbf{振动}：高速运动时振动使加速度模长远超重力，静止检测会失效。
+\end{itemize}
+
+\textbf{IMU 预积分}（preintegration）是另一种使用方式：在两个关键帧 $i,j$ 之间，把 IMU 测量积分成与初始状态无关的相对运动量
+\begin{equation}
+  \Delta\bm{R}_{ij}=\prod_{k=i}^{j-1}\exp\left(\left(\tilde{\bm{\omega}}_k-\hat{\bm{b}}_g\right)^{\wedge}\Delta t\right),
+  \quad
+  \Delta\bm{v}_{ij}=\sum_{k=i}^{j-1}\Delta\bm{R}_{ik}\left(\tilde{\bm{a}}_k-\hat{\bm{b}}_a\right)\Delta t,
+  \label{eq:06-preint}
+\end{equation}
+$\Delta\bm{p}_{ij}$ 则由 $\Delta\bm{v}_{ik}$ 与加速度再做一次积分得到。
+从而在优化时用 $\bm{R}_j=\bm{R}_i\Delta\bm{R}_{ij}$、$\bm{v}_j=\bm{v}_i+\bm{g}\Delta t_{ij}+\bm{R}_i\Delta\bm{v}_{ij}$、$\bm{p}_j=\bm{p}_i+\bm{v}_i\Delta t_{ij}+\tfrac{1}{2}\bm{g}\Delta t_{ij}^{2}+\bm{R}_i\Delta\bm{p}_{ij}$ 恢复状态，不必重复积分原始 IMU 数据。零偏更新后只需对预积分量做一阶修正。其噪声传播与图优化中的用法见第~\ref{ch:13-backend}~章与 \cite{forster2017preintegration}。
+
+\begin{summary}
+
+\begin{enumerate}
+  \item IMU 测量模型：$\tilde{\bm{\omega}}=\bm{\omega}+\bm{b}_g+\bm{n}_g$，$\tilde{\bm{a}}=\bm{R}^{\top}(\bm{a}_W-\bm{g})+\bm{b}_a+\bm{n}_a$；零偏按随机游走建模。
+  \item 白噪声离散化 $\sigma_d=\sigma_c/\sqrt{\Delta t}$，零偏随机游走 $\sigma_{bd}=\sigma_{bc}\sqrt{\Delta t}$，两者都由积分方差推出。
+  \item 四元数运动学 $\dot{\bm{q}}=\tfrac12\bm{q}\otimes[0,\bm{\omega}]$，离散更新 $\bm{q}_{k+1}=\bm{q}_k\otimes\exp(\tfrac12\bm{\omega}\Delta t)$，必须右乘并归一化。
+  \item 静止时加速度计读数为 $-\bm{R}^{\top}\bm{g}$，可解出横滚与俯仰；偏航不可观测，因为绕重力轴旋转不改变读数。
+  \item 互补滤波把低频的加速度计与高频的陀螺按 $H_{\text{LP}}+H_{\text{HP}}=1$ 合成；Mahony 用叉乘误差 $\bm{e}=\hat{\bm{g}}_b\times\hat{\bm{a}}$ 加 PI 反馈，误差只含垂直重力方向的分量。
+  \item ESKF 以 $\bm{R}=\hat{\bm{R}}\exp(\delta\bm{\theta}^{\wedge})$ 定义误差状态，15 维 $\bm{F}$ 由式~\eqref{eq:06-F} 给出，每块都对应一条一阶误差传播；更新后要注入并重置。
+  \item 纯 IMU 位置误差随 $t^{2}$ 增长：$b_a=0.01\,\mathrm{m/s^2}$ 时 60\,s 约 18\,m，$0.01\degree$ 倾角误差时约 3\,m。
+  \item ZUPT 用「速度为零」的伪观测约束速度与零偏，检测的可靠性比修正本身更重要。
+\end{enumerate}
+
+
+\end{summary}
+
+\begin{problemset}
+
+  \item 由式~\eqref{eq:06-white-cont} 完整重推 $\sigma_d=\sigma_c/\sqrt{\Delta t}$ 与 $\sigma_{bd}=\sigma_{bc}\sqrt{\Delta t}$，并说明两者随 $\Delta t$ 的变化方向为何相反。
+  \item 取 $\bm{q}=[\cos(\pi/8),\ 0,\ 0,\ \sin(\pi/8)]$，用式~\eqref{eq:06-q2R} 求 $\bm{R}$，并验证它是绕 $z$ 轴转 $\pi/4$。
+  \item 用式~\eqref{eq:06-roll-pitch} 计算 $\tilde{\bm{a}}=[0.5,\ 0.3,\ 9.7]^{\top}$ 对应的横滚与俯仰，并解释为什么偏航无法从这组数得到。
+  \item 写出 Mahony 误差 $\bm{e}$ 的一阶展开，证明 $\bm{e}=-(\bm{I}-\hat{\bm{g}}_b\hat{\bm{g}}_b^{\top})\delta\bm{\theta}$，并说明为什么偏航分量不进入误差。
+  \item 推导式~\eqref{eq:06-F} 中「速度误差对姿态误差」那一块的来源，并说明为什么系数是 $\hat{\bm{R}}\bm{a}_b^{\wedge}$ 而不是 $\bm{a}_b^{\wedge}\hat{\bm{R}}$。
+  \item 设加速度计零偏残差 $0.02\,\mathrm{m/s^2}$、陀螺零偏残差 $0.05\degree/\mathrm{s}$，估算 30\,s 后的位置误差量级，并判断哪个误差源主导。
+\end{problemset}
+
+\begin{reading}
+
+\begin{itemize}
+  \item Sola 的 ESKF 教程（\href{https://arxiv.org/abs/1711.02508}{arXiv:1711.02508}）：本章第 6 节几乎逐式对应。
+  \item Barfoot《State Estimation for Robotics》（\href{https://books.google.com/books?id=jfZFDwAAQBAJ}{Cambridge, 2017}）：李群视角下的误差状态与协方差传播。
+  \item Mahony 2008 与 Madgwick 2011 的开源实现（\href{https://x-io.co.uk/open-source-imu-and-ahrs-algorithms/}{x-io.co.uk}）：工程细节与参数整定。
+\end{itemize}
+
+
+\end{reading}

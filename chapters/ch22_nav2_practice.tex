@@ -1,0 +1,241 @@
+\chapter{2D 建图 + 导航完整链路实战}\label{ch:22-nav2-practice}
+
+\usetikzlibrary{arrows.meta,positioning,calc,fit,patterns,decorations.pathreplacing}
+
+\chapterintro{前面各章把导航拆成定位、建图、全局规划、局部规划分别讲完了。但真正让机器人跑起来，难点往往不在单个算法，而在“把它们按正确的顺序、正确的坐标系、正确的频率接起来”。本章就是一次完整的工程串联：先用 Cartographer 建一张 2D 栅格地图并存成 pgm/yaml，再用 AMCL 在这张图上定位，最后用 Nav2 做规划与控制。我们会给出可用的配置骨架、仿真验证步骤，以及一张“现象 $\rightarrow$ 原因 $\rightarrow$ 解决”的排查表。学完本章，你应该能从零把一台差速底盘在仿真里跑通，并知道每个环节出错时该看哪里。}
+
+\section{全链路总览}\label{sec:22-pipeline}
+
+整条链路分两个阶段。\textbf{建图阶段}：跑 Cartographer\cite{hess2016cartographer}，订阅激光 \texttt{/scan} 与轮式里程计 \texttt{/odom}，边建图边发布 \texttt{map}$\to$\texttt{odom} 变换，最终导出 pgm 图片与 yaml 描述文件。\textbf{导航阶段}：用 \texttt{map\_server} 加载刚才的地图作为静态层，用 AMCL\cite{fox2003amcl} 在图上做粒子滤波定位并发布 \texttt{map}$\to$\texttt{odom}，Nav2\cite{macenski2020nav2} 的行为树调度全局规划与控制，输出 \texttt{/cmd\_vel} 给底盘。
+
+\begin{figure}[htbp]
+  \centering
+  \begin{tikzpicture}[font=\footnotesize,
+      box/.style={rectangle, rounded corners=2pt, draw=structurecolor, thick,
+                  fill=structurecolor!8, minimum height=7mm, minimum width=26mm, align=center}]
+    % mapping stage (left column)
+    \node[box] (scan) at (0,0) {激光 \texttt{/scan}};
+    \node[box] (carto) at (0,-1.3) {Cartographer\\{\scriptsize 建图}};
+    \node[box] (mapfile) at (0,-2.6) {map.pgm\\{\scriptsize + map.yaml}};
+    % navigation stage (right column)
+    \node[box] (server) at (6.6,0) {\texttt{map\_server}};
+    \node[box] (amcl) at (6.6,-1.3) {AMCL\\{\scriptsize 定位}};
+    \node[box] (nav) at (6.6,-2.6) {Nav2\\{\scriptsize 规划 + 控制}};
+    \node[box] (base) at (6.6,-3.9) {底盘\\{\scriptsize \texttt{/cmd\_vel}}};
+    \draw[arrow] (scan) -- (carto);
+    \draw[arrow] (carto) -- node[label, right]{保存} (mapfile);
+    \draw[arrow] (server) -- (amcl);
+    \draw[arrow] (amcl) -- node[label, right]{位姿} (nav);
+    \draw[arrow] (nav) -- (base);
+    \draw[arrow, dashed] (mapfile.east) -- node[label, above, sloped]{map.yaml} (server.west);
+    \node[structurecolor, label] at (0,0.75) {\textbf{建图阶段}};
+    \node[structurecolor, label] at (6.6,0.75) {\textbf{导航阶段}};
+  \end{tikzpicture}
+  \caption{2D 建图 + 导航全链路。左列是建图阶段：Cartographer 把激光与里程计变成地图文件；右列是导航阶段：map\_server 提供先验地图，AMCL 提供定位，Nav2 完成规划与控制。两个阶段共用同一张地图与同一套坐标系约定；导航阶段 AMCL 同样订阅 \texttt{/scan}，图中为清晰起见省略。}
+  \label{fig:22-pipeline}
+\end{figure}
+
+理解这条链路要抓住一个关键点：\textbf{建图与导航是两个“换人不换地图”的进程}。建图时 \texttt{map}$\to$\texttt{odom} 由 Cartographer 发布；切到导航后，必须把 Cartographer 关掉，改由 AMCL 发布 \texttt{map}$\to$\texttt{odom}。如果两个节点同时发布这一段 TF，tf2 会认为树里有多个父节点，整棵 TF 树失效——这是新手最常踩的坑之一。
+
+\section{Cartographer 建图实操}\label{sec:22-carto}
+
+\subsection{配置文件}
+
+Cartographer 用 Lua 配置，2D 建图的入口参数通常从一个 \texttt{backpack\_2d.lua} 派生。下面是一份精简的配置骨架（参数值按 $0.05\ \mathrm{m}$ 分辨率、室内场景给出，可按场地调整）：
+
+\begin{lstlisting}[language=bash]
+-- my_2d.lua : minimal Cartographer 2D configuration
+include "backpack_2d.lua"
+
+TRAJECTORY_BUILDER_2D.min_range = 0.3
+TRAJECTORY_BUILDER_2D.max_range = 30.0
+TRAJECTORY_BUILDER_2D.missing_data_ray_length = 5.0
+TRAJECTORY_BUILDER_2D.use_imu_data = false
+TRAJECTORY_BUILDER_2D.num_accumulated_range_data = 1
+TRAJECTORY_BUILDER_2D.voxel_filter_size = 0.025
+TRAJECTORY_BUILDER_2D.submaps.num_range_data = 90
+TRAJECTORY_BUILDER_2D.submaps.grid_options_2d.resolution = 0.05
+
+MAP_BUILDER.use_trajectory_builder_2d = true
+POSE_GRAPH.optimize_every_n_nodes = 90
+POSE_GRAPH.constraint_builder.min_score = 0.65
+POSE_GRAPH.constraint_builder.global_localization_min_score = 0.7
+\end{lstlisting}
+
+\begin{sloppypar}
+几个参数值得解释：\texttt{min\_range} 与 \texttt{max\_range} 是激光可用距离，设错会把地面或远处噪点当障碍；\texttt{voxel\_filter\_size} 是体素降采样尺寸，越小越精细但越耗 CPU；\texttt{submaps.num\_range\_data}=90 表示每 90 帧激光构成一个子图，太大则回环约束少、建图容易漂；\texttt{resolution}=0.05 是最终栅格分辨率，$10\ \mathrm{m}\times10\ \mathrm{m}$ 的场地对应 $200\times200$ 的栅格，正好与第~\ref{ch:18-nav-overview}~章的代价地图分辨率一致。若雷达有 IMU 且已标定，把 \texttt{use\_imu\_data} 打开能显著改善快速转向时的建图质量。
+\end{sloppypar}
+
+\subsection{建图、结束与导出}
+
+启动建图后，遥控机器人把场地走一遍（尽量走小闭环、每个角落都扫到），然后结束轨迹并导出：
+
+\begin{lstlisting}[language=bash]
+# ROS 2: start mapping (ROS 1 uses roslaunch cartographer_ros ...)
+ros2 launch cartographer_ros backpack_2d.launch.py
+
+# After finishing the tour: close trajectory 0, then write state
+ros2 service call /finish_trajectory cartographer_ros_msgs/srv/FinishTrajectory \
+  "{trajectory_id: 0}"
+ros2 service call /write_state cartographer_ros_msgs/srv/WriteState \
+  "{filename: '${HOME}/maps/map.pbstream'}"
+
+# Convert the pbstream into pgm + yaml for map_server
+ros2 run cartographer_ros cartographer_pbstream_to_ros_map \
+  -map_filestem=${HOME}/maps/map -pbstream_filename=${HOME}/maps/map.pbstream \
+  -resolution=0.05
+\end{lstlisting}
+
+导出后得到 \texttt{map.pgm}（灰度图：白=自由、黑=占据、灰=未知）与 \texttt{map.yaml}（分辨率、原点、阈值）。\texttt{map.yaml} 里的 \texttt{origin} 是地图左下角在世界系中的位姿，\texttt{resolution} 必须与实际一致，否则导航时障碍会整体缩放或偏移——这类错误表现为“地图看起来对，但机器人总是撞同一面墙”。
+
+\subsection{建图质量自检}
+
+在建图现场就应该检查四件事，而不是等导航失败再回头：\textbf{墙是否直}（走一圈回到起点，墙若重影说明回环没生效）；\textbf{角落是否闭合}（房间四角应是直角，若歪说明里程计外参或时间同步有问题）；\textbf{动态物体是否被抹掉}（人走过留下的“鬼影”应被后续观测覆盖）；\textbf{未知区域是否太多}（大片灰色意味着没扫到，导航时会被当成障碍或直接判无路）。第~\ref{ch:15-cartographer}~章讲的子图与回环机制，正是这些现象背后的原因。
+
+\section{Nav2 配置}\label{sec:22-nav2}
+
+\subsection{参数文件骨架}
+
+Nav2 的参数集中在 \texttt{nav2\_params.yaml}，按节点分段。下面是一份能跑起来的最小骨架（只保留关键项，实际使用请复制官方完整文件再改）：
+
+\begin{lstlisting}[language=Python]
+amcl:                       # localization on the saved map
+  ros__parameters:
+    use_sim_time: True
+    min_particles: 500
+    max_particles: 2000
+    laser_model_type: likelihood_field
+bt_navigator:               # behavior-tree scheduler
+  ros__parameters:
+    global_frame: map
+    robot_base_frame: base_link
+planner_server:             # global planning
+  ros__parameters:
+    expected_planner_frequency: 1.0
+    planner_plugins: ["GridBased"]
+    GridBased:
+      plugin: "nav2_navfn_planner/NavfnPlanner"
+      tolerance: 0.5
+      use_astar: true
+controller_server:          # local planning / tracking
+  ros__parameters:
+    controller_frequency: 20.0
+    controller_plugins: ["FollowPath"]
+    FollowPath:
+      plugin: "dwb_core::DWBLocalPlanner"
+      max_vel_x: 0.26
+      max_vel_theta: 1.0
+\end{lstlisting}
+
+要点：\texttt{amcl} 的粒子数与激光模型决定定位稳定性，室内小场地 500--2000 个粒子够用；\texttt{planner\_server} 的 \texttt{tolerance} 表示“离目标多近算到达”，设太小会在终点附近反复规划；控制频率取 \texttt{controller\_frequency}=20.0，对应第~\ref{ch:20-local-planning}~章说的实时要求；\texttt{max\_vel\_x}=0.26 是 TurtleBot3 的典型值，实车按自己底盘改。
+
+\subsection{地图、定位与生命周期}
+
+导航启动时，\texttt{map\_server} 读 \texttt{map.yaml} 与 \texttt{map.pgm}，把它们发布成 \texttt{/map} 话题与静态层；AMCL 订阅 \texttt{/scan}、\texttt{/map}，发布 \texttt{map}$\to$\texttt{odom} 与 \texttt{/amcl\_pose}。\textbf{AMCL 需要一个初始位姿}：在 RViz 里用“2D Pose Estimate”点一下，或者在启动参数里给初始位姿；不给的话粒子会撒满整张地图，表现为“定位一直跳、规划路径乱飞”。
+
+启动顺序由 \texttt{lifecycle\_manager} 保证：每个 Nav2 节点都是生命周期节点，状态依次是“未配置 $\rightarrow$ 未激活 $\rightarrow$ 激活”；管理器按依赖顺序调用 \texttt{configure} 与 \texttt{activate}，避免“控制器先于代价地图就绪”这类竞争条件。这就是第~\ref{ch:18-nav-overview}~章说“Nav2 不是一个程序，而是一组被编排的节点”的工程含义。
+
+\begin{figure}[htbp]
+  \centering
+  \begin{tikzpicture}[font=\small,
+      box/.style={rectangle, rounded corners=2pt, draw=structurecolor, thick,
+                  fill=structurecolor!8, minimum height=8mm, minimum width=32mm, align=center}]
+    \node[box] (map) at (0,2.4) {\texttt{map}$\to$\texttt{odom}\\{\scriptsize AMCL 发布，可跳变}};
+    \node[box] (odom) at (0,1.2) {\texttt{odom}$\to$\texttt{base\_link}\\{\scriptsize 里程计发布，连续}};
+    \node[box] (base) at (0,0) {\texttt{base\_link}$\to$\texttt{laser}\\{\scriptsize 静态外参，URDF}};
+    \draw[arrow] (map) -- (odom);
+    \draw[arrow] (odom) -- (base);
+    \draw[decorate, decoration={brace, amplitude=5pt}, thick, structurecolor]
+      (-2.35,2.9) -- (-2.35,-0.5);
+    \node[structurecolor, label, rotate=90, above] at (-2.7,1.2) {导航阶段必须全部连通};
+  \end{tikzpicture}
+  \caption{导航阶段的 TF 链。三段变换分别由 AMCL、里程计、URDF 发布：\texttt{map}$\to$\texttt{odom} 可跳变（重定位时瞬间修正），\texttt{odom}$\to$\texttt{base\_link} 必须连续（否则局部控制抖动），传感器外参静态。任何一段断开或重复发布，都会让整条链路不可用。}
+  \label{fig:22-tf}
+\end{figure}
+
+\subsection{仿真验证}
+
+配置好之后，先在仿真里验证，再上实车。TurtleBot3 是官方示例中最省事的一套：
+
+\begin{lstlisting}[language=bash]
+# Terminal 1: simulation world
+export TURTLEBOT3_MODEL=burger
+ros2 launch turtlebot3_gazebo turtlebot3_world.launch.py
+
+# Terminal 2: navigation (map + AMCL + Nav2 + RViz)
+ros2 launch nav2_bringup tb3_simulation_launch.py \
+  map:=${HOME}/maps/map.yaml use_sim_time:=true
+
+# Then in RViz: set "2D Pose Estimate", send a "2D Goal Pose"
+\end{lstlisting}
+
+仿真验证的判据是三个“能”：能在地图上定位（$\texttt{/amcl\_pose}$ 稳定、粒子云收敛）、能规划（全局路径在 RViz 里出现且不穿墙）、能跟踪（机器人沿路径走、遇到新障碍能绕）。三个都过，再上实车；实车上还要额外验证急停、通信丢包与电池电压低时的行为。
+
+\section{常见问题排查表}\label{sec:22-debug}
+
+\begin{table}[htbp]
+  \centering
+  \caption{全链路常见故障：现象 $\rightarrow$ 原因 $\rightarrow$ 解决}
+  \label{tab:22-debug}
+  \small
+  \begin{tabular}{p{3.2cm}p{4.6cm}p{4.8cm}}
+    \toprule
+    现象 & 可能原因 & 解决 \\
+    \midrule
+    地图漂移、墙重影 & 回环未触发、里程计标定差、时间不同步 & 建图走小闭环、查轮径/轮距与时间戳 \\
+    定位跳变、粒子散开 & 未给初始位姿、激光与地图不匹配、场景变化大 & 给初始位姿、检查外参、必要时重定位 \\
+    规划失败（无路径） & 目标在膨胀区/未知区、\texttt{tolerance} 太小 & 调小 \texttt{inflation\_radius}、给 1--2 格容差 \\
+    机器人原地转 & 全局路径不可达或控制器无可行轨迹 & 看 \texttt{/local\_costmap} 是否被堵、检查恢复行为 \\
+    机器人不动 & TF 断链、\texttt{/cmd\_vel} 未下发、生命周期未激活 & \texttt{tf2\_echo}、\texttt{ros2 topic hz}、看日志 \\
+    代价地图不更新 & 传感器话题没接、\texttt{update\_frequency}=0 & 查 \texttt{/scan} 频率、查 layer 配置 \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+表~\ref{tab:22-debug} 的排查顺序建议固定成一套流程：先确认话题在不在（\texttt{ros2 topic list} 与 \texttt{ros2 topic hz}），再确认 TF 通不通（\texttt{tf2\_echo}），然后确认数值对不对（在 RViz 里看地图、粒子与代价地图），最后才怀疑算法。绝大多数“导航不工作”都能在前两步定位，因为算法本身很少突然坏掉，坏掉的通常是数据流。
+
+\section{性能、安全与恢复行为}\label{sec:22-safety}
+
+\textbf{性能}：20 Hz 控制频率下，主要 CPU 开销在代价地图更新（5 Hz）与局部规划（每周期几十条轨迹）；全局规划 1 Hz，开销小。若 CPU 超载，先降 \texttt{costmap} 的更新频率与分辨率，再降局部规划采样数，最后才降控制频率（控制频率一降，避障反应就慢）。
+
+\textbf{安全}：Nav2 的 \texttt{behavior\_server} 提供三类恢复行为——\texttt{spin}（原地旋转重新观测）、\texttt{backup}（后退脱困）、\texttt{wait}（等待障碍消失）。行为树里通常写成“规划失败 $\rightarrow$ 清空代价地图 $\rightarrow$ 旋转 $\rightarrow$ 再规划 $\rightarrow$ 后退”，层层兜底。但恢复行为不是万能的：如果定位已经错了，旋转只会让错误更大，所以\textbf{恢复行为之前必须确认定位健康}。
+
+\textbf{急停}：工程上必须有独立于 Nav2 的急停链路（物理按钮或 \texttt{/cmd\_vel} 上的看门狗），不能只依赖行为树。看门狗的逻辑很简单：超过 $T$ 毫秒没收到新指令就下发零速度；$T$ 一般取 200--500 ms，取太小会被正常抖动误触发，取太大则失去保护意义。
+
+\textbf{速度平滑}：\texttt{velocity\_smoother} 对 \texttt{/cmd\_vel} 做限幅与一阶低通，保证加速度不超限；调它的时候要注意，平滑太强会让避障“变肉”，反应慢半拍。
+
+\begin{summary}
+
+\begin{enumerate}
+  \item 全链路是“建图阶段”与“导航阶段”两段：Cartographer 出 pgm/yaml，map\_server 加载，AMCL 定位，Nav2 规划控制；两段共用一张地图与一套坐标系。
+  \item 建图阶段结束要 \texttt{finish\_trajectory} 并 \texttt{write\_state} 导出 pbstream，再转成 pgm/yaml；\texttt{map.yaml} 的 \texttt{origin} 与 \texttt{resolution} 必须准确。
+  \item 导航阶段必须把 \texttt{map}$\to$\texttt{odom} 的发布权从 Cartographer 交给 AMCL，禁止两个节点同时发布；AMCL 必须给初始位姿。
+  \item Nav2 参数按节点分段：AMCL 粒子数、planner 的频率与容差、controller 的 20 Hz 与速度上限是最常调的几项；生命周期管理器保证启动顺序。
+  \item 排查固定顺序：先话题、再 TF、再数值、最后算法；表~\ref{tab:22-debug} 覆盖了最常见的六类故障。
+  \item 安全靠三层：行为树的恢复行为、独立急停/看门狗、速度平滑；恢复行为之前要先确认定位健康。
+\end{enumerate}
+
+
+\end{summary}
+
+\begin{problemset}
+
+  \item 如果建图时忘了 \texttt{finish\_trajectory} 直接 \texttt{write\_state}，导出的地图可能有什么问题？
+  \item AMCL 不给初始位姿时，粒子会撒在哪里？为什么表现为“路径乱飞”而不是“机器人不动”？
+  \item 一个 $10\ \mathrm{m}\times10\ \mathrm{m}$ 的场地，分辨率 $0.05\ \mathrm{m}$，地图 pgm 至少多大？若分辨率改成 $0.1\ \mathrm{m}$，建图与导航各有什么变化？
+  \item 机器人“原地转”与“不动”分别优先检查什么？请按本章的排查顺序各写三步。
+  \item 为什么急停不能只靠 Nav2 的恢复行为？给出一个恢复行为反而让情况变糟的具体场景。
+  \item 把本章的链路换成“用 FAST-LIO2 建 3D 图 + 导出 2D 栅格”的方案，需要额外做哪几步？
+\end{problemset}
+
+\begin{reading}
+
+\begin{itemize}
+  \item \cite{hess2016cartographer}：Cartographer 原始论文，理解子图、回环与位姿图之后再调 \texttt{backpack\_2d.lua} 会有的放矢。
+  \item \cite{fox2003amcl}：AMCL 的自适应粒子数（KLD-Sampling），理解“为什么粒子数会自适应”有助于调定位。
+  \item \cite{macenski2020nav2}：Nav2 设计论文，配置项与节点关系以它和官方文档为准。
+  \item Nav2 官方文档 \href{https://docs.nav2.org}{docs.nav2.org} 与 Cartographer ROS 文档 \href{https://google-cartographer-ros.readthedocs.io}{google-cartographer-ros.readthedocs.io}：参数默认值与 launch 示例。
+\end{itemize}
+
+
+\end{reading}

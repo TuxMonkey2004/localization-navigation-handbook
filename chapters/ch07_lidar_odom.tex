@@ -1,0 +1,383 @@
+﻿\chapter{激光里程计与扫描匹配}\label{ch:07-lidar-odom}
+
+\chapterintro{激光雷达给的是「一圈点的三维坐标」，它不告诉你自己动了多少，却把周围几何形状以毫米级精度记录下来。于是激光里程计的核心问题变成：给定两帧点云，如何求出它们之间的相对位姿？这就是\textbf{扫描匹配}（scan matching）。本章从「最小化对应点距离」这一句话出发，把 ICP 的闭式解一步步推完，再讲点到面残差的 Gauss-Newton 求解、NDT 的高斯化建模、LOAM 的特征匹配框架，最后用信息矩阵的特征值解释「为什么激光里程计在长廊里会失效」。学完本章，你应当能看懂 FAST-LIO、LOAM、Cartographer 前端里那些矩阵是怎么来的。}
+
+\section{为什么用 LiDAR 做里程计}\label{sec:07-why}
+
+激光雷达的优势是几何精度高、不受光照影响、测距范围远：一个 16 线雷达在 10\,m 处的测距误差通常只有几厘米，而两帧点云之间的相对位姿可以由成百上千个点共同约束，理论上精度可以做到行程的 $0.1\,\%$--$1\,\%$。它不依赖纹理，所以在白墙、暗处、逆光等视觉失效的场景仍然可用。
+
+缺点同样明显：点云稀疏且分布不均（近处密、远处疏），对几何结构敏感（长廊、大平面、空旷场地里约束不足），并且存在\textbf{运动畸变}——雷达转一圈需要 $100\,\mathrm{ms}$，这期间机器人已经动了，一帧点云的各个点其实是在不同位姿下测到的（去畸变的方法见第~\ref{ch:16-lio-evolution}~章）。此外还有数据量大、算力消耗高的问题。
+
+激光里程计和 SLAM 的关系是：它只负责「相邻帧之间怎么动」，不建全局地图、不做回环。SLAM 篇（第~\ref{ch:11-slam-framework}~章）会把它当作前端的一部分。
+
+\section{点云配准的问题定义}\label{sec:07-registration}
+
+\begin{definition}[扫描匹配与点云配准]
+给定源点云 $\mathcal{P}=\{\bm{p}_i\}_{i=1}^{N}$ 与目标点云 $\mathcal{Q}=\{\bm{q}_j\}_{j=1}^{M}$（都在同一坐标系下表达，例如雷达系），\textbf{点云配准}（point cloud registration）指求一个刚体变换 $T=(\bm{R},\bm{t})\in SE(3)$，使变换后的源点云与目标点云尽量重合；\textbf{扫描匹配}（scan matching）特指以激光扫描为输入的配准，它是激光里程计的核心步骤。
+\end{definition}
+
+最自然的度量是「对应点距离平方和」：假设已经知道每个 $\bm{p}_i$ 与哪个 $\bm{q}_i$ 对应，则
+\begin{equation}
+  \min_{\bm{R}\in SO(3),\ \bm{t}\in\mathbb{R}^{3}}
+  \sum_{i=1}^{N}\norm{\bm{R}\bm{p}_i+\bm{t}-\bm{q}_i}^{2}.
+  \label{eq:07-icp-problem}
+\end{equation}
+但「哪个点对应哪个点」本身也不知道，于是问题变成鸡生蛋：知道对应关系就能求变换，知道变换就能找对应关系。ICP（iterative closest point）的解法是交替迭代：用当前变换找最近邻作为对应，再用对应求变换。
+
+\begin{definition}[最近邻与 KD 树]
+对点 $\bm{p}$，它在目标点云中的\textbf{最近邻}（nearest neighbor）是 $\argmin_{\bm{q}\in\mathcal{Q}}\norm{\bm{p}-\bm{q}}$。若对每个点都暴力扫描全部 $M$ 个点，单次查找是 $O(M)$；\textbf{KD 树}（k-d tree）把点云按坐标轴递归二分建树，把单次最近邻查询降到平均 $O(\log M)$，是 ICP 能实时运行的关键数据结构。
+\end{definition}
+
+\section{ICP：从闭式解到迭代流程}\label{sec:07-icp}
+
+\subsection{点到点 ICP 的闭式解}
+
+先解决「对应关系已知」时的子问题。目标函数
+\begin{equation}
+  J(\bm{R},\bm{t}) = \sum_{i=1}^{N}\norm{\bm{R}\bm{p}_i+\bm{t}-\bm{q}_i}^{2}
+\end{equation}
+对 $\bm{t}$ 是二次的，可以直接求极值。对 $\bm{t}$ 求偏导（对向量求导，梯度为零向量）：
+\begin{equation}
+  \frac{\partial J}{\partial \bm{t}}
+  = \sum_{i=1}^{N}2\left(\bm{R}\bm{p}_i+\bm{t}-\bm{q}_i\right)=\bm{0}
+  \ \Longrightarrow\
+  N\bm{t} = \sum_{i=1}^{N}\bm{q}_i - \bm{R}\sum_{i=1}^{N}\bm{p}_i.
+\end{equation}
+记质心 $\bar{\bm{p}}=\frac{1}{N}\sum_i\bm{p}_i$、$\bar{\bm{q}}=\frac{1}{N}\sum_i\bm{q}_i$，则
+\begin{equation}
+  \bm{t} = \bar{\bm{q}}-\bm{R}\bar{\bm{p}}.
+  \label{eq:07-icp-t}
+\end{equation}
+把式~\eqref{eq:07-icp-t} 代回 $J$，并记去质心坐标 $\tilde{\bm{p}}_i=\bm{p}_i-\bar{\bm{p}}$、$\tilde{\bm{q}}_i=\bm{q}_i-\bar{\bm{q}}$：
+\begin{align}
+  \bm{R}\bm{p}_i+\bm{t}-\bm{q}_i
+  &= \bm{R}\left(\tilde{\bm{p}}_i+\bar{\bm{p}}\right)+\bar{\bm{q}}-\bm{R}\bar{\bm{p}}-\left(\tilde{\bm{q}}_i+\bar{\bm{q}}\right)
+  = \bm{R}\tilde{\bm{p}}_i-\tilde{\bm{q}}_i,
+\end{align}
+于是
+\begin{equation}
+  J = \sum_{i=1}^{N}\norm{\bm{R}\tilde{\bm{p}}_i-\tilde{\bm{q}}_i}^{2}
+  = \sum_{i=1}^{N}\left(\tilde{\bm{p}}_i^{\top}\tilde{\bm{p}}_i+\tilde{\bm{q}}_i^{\top}\tilde{\bm{q}}_i
+  -2\tilde{\bm{q}}_i^{\top}\bm{R}\tilde{\bm{p}}_i\right).
+  \label{eq:07-icp-decoupled}
+\end{equation}
+前两项与 $\bm{R}$ 无关，因此最小化 $J$ 等价于最大化
+\begin{equation}
+  \sum_{i=1}^{N}\tilde{\bm{q}}_i^{\top}\bm{R}\tilde{\bm{p}}_i
+  = \tr\left(\bm{R}\sum_{i=1}^{N}\tilde{\bm{p}}_i\tilde{\bm{q}}_i^{\top}\right)
+  = \tr\left(\bm{R}\bm{W}\right),
+  \label{eq:07-icp-trace}
+\end{equation}
+其中第一步用了 $\bm{a}^{\top}\bm{b}=\tr(\bm{b}\bm{a}^{\top})$，并定义了 $3\times3$ 矩阵
+\begin{equation}
+  \bm{W} = \sum_{i=1}^{N}\tilde{\bm{p}}_i\tilde{\bm{q}}_i^{\top}.
+  \label{eq:07-icp-W}
+\end{equation}
+现在问题变成「在 $SO(3)$ 上最大化 $\tr(\bm{R}\bm{W})$」。对 $\bm{W}$ 做奇异值分解（SVD）：
+\begin{equation}
+  \bm{W} = \bm{U}\bm{\Sigma}\bm{V}^{\top},
+  \qquad
+  \bm{\Sigma}=\diag(\sigma_1,\sigma_2,\sigma_3),\quad \sigma_1\ge\sigma_2\ge\sigma_3\ge0.
+\end{equation}
+代入目标函数并利用迹的循环置换性质 $\tr(ABC)=\tr(BCA)$：
+\begin{equation}
+  \tr(\bm{R}\bm{W}) = \tr\left(\bm{R}\bm{U}\bm{\Sigma}\bm{V}^{\top}\right)
+  = \tr\left(\bm{\Sigma}\,\bm{V}^{\top}\bm{R}\,\bm{U}\right).
+\end{equation}
+记 $\bm{A}=\bm{V}^{\top}\bm{R}\bm{U}$。由于 $\bm{V},\bm{R},\bm{U}$ 都是正交阵，$\bm{A}$ 也是正交阵，其列向量是单位向量，故对角元满足 $A_{ii}\le1$。于是
+\begin{equation}
+  \tr(\bm{R}\bm{W}) = \sum_{k=1}^{3}\sigma_k A_{kk}
+  \le \sum_{k=1}^{3}\sigma_k\norm{A_{kk}}
+  \le \sum_{k=1}^{3}\sigma_k.
+\end{equation}
+上界 $\sum_k\sigma_k$ 当且仅当 $A_{kk}=1$（$k=1,2,3$）时取到，此时 $\bm{A}=\bm{I}$，即
+\begin{equation}
+  \bm{V}^{\top}\bm{R}\bm{U}=\bm{I}
+  \ \Longrightarrow\
+  \bm{R}=\bm{V}\bm{U}^{\top}.
+  \label{eq:07-icp-R}
+\end{equation}
+\textbf{反射情形。}式~\eqref{eq:07-icp-R} 只有在 $\det(\bm{V}\bm{U}^{\top})=+1$ 时才是合法的旋转；若 $\det(\bm{V}\bm{U}^{\top})=-1$，说明最优解是「旋转 + 镜像」，必须改成旋转。此时取
+\begin{equation}
+  \bm{R} = \bm{V}\,\diag(1,1,-1)\,\bm{U}^{\top},
+  \label{eq:07-icp-Rfix}
+\end{equation}
+它等价于把 $\bm{V}$ 的最后一列取反，在保持正交的前提下使 $\det=+1$，并且是满足该约束时使 $\sum_k\sigma_k A_{kk}$ 最大的选择（因为取反只影响最小的 $\sigma_3$ 对应的那一项）。求出 $\bm{R}$ 后，由式~\eqref{eq:07-icp-t} 得 $\bm{t}=\bar{\bm{q}}-\bm{R}\bar{\bm{p}}$。
+
+\begin{keybox}{ICP 闭式解的三步记忆法}
+\begin{enumerate}
+  \item 去质心：$\tilde{\bm{p}}_i=\bm{p}_i-\bar{\bm{p}}$，$\tilde{\bm{q}}_i=\bm{q}_i-\bar{\bm{q}}$，把平移分离出去；
+  \item 攒矩阵 $\bm{W}=\sum\tilde{\bm{p}}_i\tilde{\bm{q}}_i^{\top}$，做 SVD $\bm{W}=\bm{U}\bm{\Sigma}\bm{V}^{\top}$；
+  \item 取 $\bm{R}=\bm{V}\bm{U}^{\top}$（$\det<0$ 时用 $\bm{V}\mathrm{diag}(1,1,-1)\bm{U}^{\top}$），$\bm{t}=\bar{\bm{q}}-\bm{R}\bar{\bm{p}}$。
+\end{enumerate}
+\end{keybox}
+
+\subsection{迭代流程、对应关系与收敛}
+
+闭式解要求对应关系已知，而实际只知点云。ICP 用「最近邻 + 闭式解」交替逼近，单次迭代流程如下面的伪代码所示。
+
+\begin{pseudo}{点到点 ICP 的单次迭代}
+  \item 输入：源点云 $\mathcal{P}$、目标点云 $\mathcal{Q}$、当前变换 $T=(\bm{R},\bm{t})$
+  \item 把源点云变换到目标系：$\bm{p}_i'\leftarrow\bm{R}\bm{p}_i+\bm{t}$
+  \item 对每个 $\bm{p}_i'$，在 KD 树中查最近邻 $\bm{q}_{c(i)}$
+  \item 剔除坏对应：距离 $\norm{\bm{p}_i'-\bm{q}_{c(i)}}>\tau_d$ 或法向夹角大的点对丢弃
+  \item 用剩下的点对，按式~\eqref{eq:07-icp-W}、\eqref{eq:07-icp-R}、\eqref{eq:07-icp-t} 求新变换 $\Delta T$
+  \item 更新 $T\leftarrow\Delta T\,T$（或右乘，取决于变换定义约定）
+  \item 若残差相对变化小于阈值或达到最大迭代次数则停止，否则回到第 2 步
+\end{pseudo}
+
+几点工程经验：\textbf{初值}很重要——ICP 只有局部收敛性，两帧之间转得太快或位移太大时最近邻会连错，导致收敛到错误解，所以实际系统会用 IMU 或匀速模型预测初值；\textbf{外点剔除}必须有——动态物体、遮挡边缘、雷达噪点都会产生距离很大的错误对应，通常按距离阈值（如 $3\sigma$）或法向一致性剔除；\textbf{收敛判据}一般用相邻两次迭代的残差下降量，而不是只看迭代次数。
+
+\textbf{ICP 的精度与局限。}点到点 ICP 的残差直接是欧氏距离，它隐含假设「场景中任意方向都有足够约束」。在走廊里，沿走廊方向平移几乎不改变点到点距离，这个方向就不可观（第~\ref{sec:07-degeneracy}~节详述）。点到面 ICP 通过引入法向信息缓解了这个问题，也是现代 LIO 系统的默认选择。
+
+\begin{figure}[htbp]
+  \centering
+  \begin{tikzpicture}[scale=1.0]
+    \fill[structurecolor!6] (0,0) rectangle (2.6,3.0);
+    \fill[structurecolor!6] (4.2,0) rectangle (6.8,3.0);
+    \node[font=\footnotesize] at (1.3,3.3) {源点云 $\mathcal{P}$（当前帧）};
+    \node[font=\footnotesize] at (5.5,3.3) {目标点云 $\mathcal{Q}$（上一帧）};
+    \foreach \x/\y in {0.6/2.4, 1.2/1.8, 0.7/1.0, 1.6/2.6, 1.8/0.6, 2.1/1.5} {
+      \fill[structurecolor] (\x,\y) circle (1.6pt);
+    }
+    \foreach \x/\y in {4.7/2.5, 5.3/1.9, 4.8/1.1, 5.7/2.7, 5.9/0.7, 6.2/1.6} {
+      \fill[red!60!black] (\x,\y) circle (1.6pt);
+    }
+    \draw[-stealth, thick, black!55] (0.6,2.4) -- (4.7,2.5);
+    \draw[-stealth, thick, black!55] (1.2,1.8) -- (5.3,1.9);
+    \draw[-stealth, thick, black!55] (0.7,1.0) -- (4.8,1.1);
+    \draw[-stealth, thick, black!55] (1.6,2.6) -- (5.7,2.7);
+    \draw[-stealth, thick, black!55] (1.8,0.6) -- (5.9,0.7);
+    \draw[-stealth, thick, black!55] (2.1,1.5) -- (6.2,1.6);
+    \node[font=\footnotesize] at (3.4,0.25) {最近邻对应关系};
+  \end{tikzpicture}
+  \caption{点到点 ICP 的一步。对当前帧每个点找到上一帧的最近点，用这些对应点对求闭式刚体变换；迭代若干次后对应关系与变换同时收敛。}
+  \label{fig:07-icp}
+\end{figure}
+
+\subsection{点到面 ICP 与 Gauss-Newton 求解}
+
+点到点残差对「沿平面方向的滑动」不敏感，点到面残差则直接把点压到平面上。设目标点云中与 $\bm{p}_i$ 对应的平面参数为 $(\bm{n}_i,\bm{q}_i)$，其中 $\bm{n}_i$ 是单位法向、$\bm{q}_i$ 是平面上一点。\textbf{点到面残差}（point-to-plane residual）定义为点 $\bm{p}_i$ 到该平面的有符号距离：
+\begin{equation}
+  r_i = \bm{n}_i^{\top}\left(\bm{R}\bm{p}_i+\bm{t}-\bm{q}_i\right).
+  \label{eq:07-p2plane}
+\end{equation}
+它是非线性的（$\bm{R}$ 在旋转）。设当前估计附近的旋转增量为 $\delta\bm{\theta}$，用一阶近似 $\bm{R}\approx(\bm{I}+\delta\bm{\theta}^{\wedge})\bm{R}_0$；为简洁起见把 $\bm{R}_0\bm{p}_i$ 记作 $\bm{p}_i$（即先变换到当前估计的坐标系），并把 $\bm{t}$ 写成增量形式：
+\begin{align}
+  r_i &\approx \bm{n}_i^{\top}\left[\left(\bm{I}+\delta\bm{\theta}^{\wedge}\right)\bm{p}_i+\bm{t}-\bm{q}_i\right] \notag\\
+  &= \bm{n}_i^{\top}\left(\bm{p}_i-\bm{q}_i\right)+\bm{n}_i^{\top}\bm{t}
+     +\bm{n}_i^{\top}\delta\bm{\theta}^{\wedge}\bm{p}_i.
+\end{align}
+最后一项用 $\bm{n}^{\top}\delta\bm{\theta}^{\wedge}\bm{p}=\delta\bm{\theta}^{\top}\left(\bm{p}\times\bm{n}\right)$（由混合积 $\bm{n}\cdot(\delta\bm{\theta}\times\bm{p})=\delta\bm{\theta}\cdot(\bm{p}\times\bm{n})$ 得到），于是
+\begin{equation}
+  r_i \approx \underbrace{\bm{n}_i^{\top}\left(\bm{p}_i-\bm{q}_i\right)}_{r_i^{0}}
+  + \left(\bm{p}_i\times\bm{n}_i\right)^{\top}\delta\bm{\theta}+\bm{n}_i^{\top}\bm{t}.
+\end{equation}
+把待求量写成六维 $\delta\bm{x}=[\delta\bm{\theta};\ \bm{t}]\in\mathbb{R}^{6}$，则
+\begin{equation}
+  r_i \approx r_i^{0} + \bm{A}_i\,\delta\bm{x},
+  \qquad
+  \bm{A}_i = \left[\left(\bm{p}_i\times\bm{n}_i\right)^{\top}\ \ \bm{n}_i^{\top}\right]\in\mathbb{R}^{1\times6}.
+  \label{eq:07-p2plane-jac}
+\end{equation}
+最小化 $\sum_i w_i r_i^{2}$（$w_i$ 为权重，可选鲁棒核），令梯度为零：
+\begin{equation}
+  \frac{\partial}{\partial\delta\bm{x}}\sum_i w_i\left(r_i^{0}+\bm{A}_i\delta\bm{x}\right)^{2}
+  = 2\sum_i w_i\bm{A}_i^{\top}\left(r_i^{0}+\bm{A}_i\delta\bm{x}\right)=\bm{0}.
+\end{equation}
+整理成\textbf{正规方程}（normal equation）：
+\begin{equation}
+  \left(\sum_i w_i\bm{A}_i^{\top}\bm{A}_i\right)\delta\bm{x}
+  = -\sum_i w_i\bm{A}_i^{\top}r_i^{0}.
+  \label{eq:07-gn}
+\end{equation}
+左边矩阵 $\bm{H}=\sum_i w_i\bm{A}_i^{\top}\bm{A}_i\in\mathbb{R}^{6\times6}$ 就是\textbf{信息矩阵}（information matrix）的近似，右边是梯度。解出 $\delta\bm{x}$ 后更新 $\bm{R}\leftarrow\exp(\delta\bm{\theta}^{\wedge})\bm{R}$、$\bm{t}\leftarrow\bm{t}+\delta\bm{t}$，再重新找对应、重新线性化——这就是 Gauss-Newton 版的 ICP。实践中常加 Levenberg-Marquardt 阻尼 $\bm{H}+\lambda\bm{I}$ 防止病态。
+
+\begin{figure}[htbp]
+  \centering
+  \begin{tikzpicture}[scale=1.1]
+    \draw[thick, structurecolor] (0,0.6) -- (5.2,-0.9);
+    \node[font=\footnotesize, structurecolor] at (4.2,0.2) {目标平面};
+    \draw[-stealth, thick, red!60!black] (2.6,-0.15) -- (2.6,1.35) node[above, font=\footnotesize] {$\bm{n}_i$};
+    \fill[black] (1.2,1.9) circle (1.8pt) node[above right, font=\footnotesize] {$\bm{p}_i$};
+    \fill[black] (2.15,-0.06) circle (1.8pt) node[below right, font=\footnotesize] {$\bm{q}_i$};
+    \draw[dashed, black!50] (1.2,1.9) -- (2.15,-0.06);
+    \node[font=\footnotesize] at (1.35,0.75) {$r_i$};
+    \draw[dashed, black!30] (1.2,1.9) -- (2.6,0.24);
+  \end{tikzpicture}
+  \caption{点到面残差。点 $\bm{p}_i$ 到目标平面的有符号距离 $r_i=\bm{n}_i^{\top}(\bm{p}_i-\bm{q}_i)$；与点到点距离相比，它只惩罚「离开平面」的方向，对沿平面滑动不敏感，因此对走廊、墙面等结构收敛更好。}
+  \label{fig:07-p2plane}
+\end{figure}
+
+\section{NDT：用高斯分布代替最近邻}\label{sec:07-ndt}
+
+ICP 的每一步都要找最近邻，代价高且对初值敏感。NDT（normal distributions transform）换了个思路：先把目标点云切成体素，每个体素内的点拟合成一个高斯分布；配准时不再找「最近点」，而是看当前帧的点落在目标体素高斯分布里的「概率」有多大。
+
+\begin{definition}[NDT 与体素高斯]
+把目标点云按固定边长划分成体素，第 $j$ 个体素内若有 $N_j$ 个点，定义其均值与协方差
+\begin{equation}
+  \bm{\mu}_j=\frac{1}{N_j}\sum_{i=1}^{N_j}\bm{x}_i,
+  \qquad
+  \bm{\Sigma}_j=\frac{1}{N_j}\sum_{i=1}^{N_j}\left(\bm{x}_i-\bm{\mu}_j\right)\left(\bm{x}_i-\bm{\mu}_j\right)^{\top}.
+  \label{eq:07-ndt-gauss}
+\end{equation}
+当 $N_j$ 太小时该体素不参与配准（或需要正则化 $\bm{\Sigma}_j$）。
+\end{definition}
+
+对当前帧的每个点 $\bm{p}_i$，用变换 $T$ 把它变到目标系得 $\bm{p}_i'=\bm{R}\bm{p}_i+\bm{t}$，找到它所在体素的高斯参数，定义该点的「匹配得分」
+\begin{equation}
+  s_i(T) = \exp\left(-\frac{1}{2}\left(\bm{p}_i'-\bm{\mu}_j\right)^{\top}\bm{\Sigma}_j^{-1}\left(\bm{p}_i'-\bm{\mu}_j\right)\right).
+\end{equation}
+整体目标是最小化负得分（等价于让点尽量落在高斯中心）：
+\begin{equation}
+  \min_{T}\ J(T) = -\sum_{i=1}^{N}\exp\left(-\frac{1}{2}\bm{d}_i^{\top}\bm{\Sigma}_j^{-1}\bm{d}_i\right),
+  \qquad \bm{d}_i=\bm{p}_i'-\bm{\mu}_j.
+  \label{eq:07-ndt-cost}
+\end{equation}
+\textbf{Newton 法求解。}记 $\bm{g}_i=\bm{\Sigma}_j^{-1}\bm{d}_i$，把 $s_i$ 对变换增量 $\delta\bm{x}=[\delta\bm{\theta};\ \delta\bm{t}]$ 求导。先算 $\bm{d}_i$ 的雅可比：$\bm{p}_i'=\bm{R}\bm{p}_i+\bm{t}\approx\bm{p}_i+\delta\bm{\theta}^{\wedge}\bm{p}_i+\bm{t}$，故
+\begin{equation}
+  \frac{\partial\bm{d}_i}{\partial\delta\bm{x}}
+  = \left[-\bm{p}_i^{\wedge}\ \ \bm{I}\right]\in\mathbb{R}^{3\times6},
+  \label{eq:07-ndt-jac}
+\end{equation}
+其中 $-\bm{p}_i^{\wedge}$ 来自 $\delta\bm{\theta}^{\wedge}\bm{p}_i=-\bm{p}_i^{\wedge}\delta\bm{\theta}$。对 $s_i=\exp(-\frac12\bm{d}_i^{\top}\bm{g}_i)$ 求导：
+\begin{equation}
+  \frac{\partial s_i}{\partial\delta\bm{x}}
+  = -\frac{1}{2}s_i\,\frac{\partial\left(\bm{d}_i^{\top}\bm{\Sigma}_j^{-1}\bm{d}_i\right)}{\partial\delta\bm{x}}
+  = -s_i\left(\frac{\partial\bm{d}_i}{\partial\delta\bm{x}}\right)^{\top}\bm{\Sigma}_j^{-1}\bm{d}_i,
+\end{equation}
+最后一步用了 $\partial(\bm{d}^{\top}\bm{\Sigma}^{-1}\bm{d})/\partial\bm{x}=2(\partial\bm{d}/\partial\bm{x})^{\top}\bm{\Sigma}^{-1}\bm{d}$，因子 2 与前面的 $1/2$ 抵消。于是梯度
+\begin{equation}
+  \bm{J}_{\text{NDT}} = \frac{\partial J}{\partial\delta\bm{x}}
+  = \sum_{i=1}^{N}s_i\left(\frac{\partial\bm{d}_i}{\partial\delta\bm{x}}\right)^{\top}\bm{\Sigma}_j^{-1}\bm{d}_i.
+\end{equation}
+Hessian 用 Gauss-Newton 近似 $\bm{H}_{\text{NDT}}\approx\sum_i s_i(\partial\bm{d}_i/\partial\delta\bm{x})^{\top}\bm{\Sigma}_j^{-1}(\partial\bm{d}_i/\partial\delta\bm{x})$，然后迭代
+\begin{equation}
+  \delta\bm{x} = -\bm{H}_{\text{NDT}}^{-1}\bm{J}_{\text{NDT}}.
+\end{equation}
+\textbf{NDT 与 ICP 的对比：}NDT 不需要显式的最近邻一一对应，因此收敛域更大、对初值更宽容；代价是体素化与高斯拟合并不能表达精细结构（体素内的平面/边缘会被「糊」成高斯），精度通常略低于点到面 ICP。两者在现代系统中经常混用，例如 Cartographer 的 2D 前端用相关性搜索，而 FAST-LIO 系列用点到面 ICP。原始论文见 \cite{biber2003ndt}。
+
+\section{相关性搜索与分支定界}\label{sec:07-csm}
+
+2D 激光场景下还有一种简单粗暴但极其鲁棒的方法：\textbf{相关扫描匹配}（correlative scan matching, CSM）。它把位姿空间离散成栅格 $(x_k,y_k,\theta_k)$，对每个候选位姿计算「扫描点落在障碍栅格上的数量」作为得分，取最高分。由于是穷举搜索，它不依赖初值、不会陷入局部极小，但计算量是 $O(N_xN_yN_\theta)$。
+
+工程上用\textbf{分支定界}（branch and bound）加速：把位姿空间组织成树，每个节点保存一个上界（该子树内所有位姿得分的上界），优先搜索上界高的节点，一旦某节点的上界低于当前最优解就整枝剪掉。这样绝大多数分支都不用展开。Cartographer 的 2D 前端正是这个思路（详细推导见第~\ref{ch:15-cartographer}~章与 \cite{hess2016cartographer}）。本章只需要记住：在 2D 场景、初值不可靠时，相关性搜索比 ICP 更稳。
+
+\section{LOAM 框架：特征匹配的激光里程计}\label{sec:07-loam}
+
+LOAM（lidar odometry and mapping）是 3D 激光里程计的里程碑式工作 \cite{zhang2014loam}，后续的 LeGO-LOAM \cite{shan2018lego}、LIO-SAM \cite{shan2020liosam}、KISS-ICP \cite{vizzo2023kissicp} 都受它影响。它的核心是「不再逐点找最近邻，而是先提取线、面特征，再让特征之间匹配」。
+
+\textbf{第一步：特征提取。}对每个点 $\bm{p}_i$，取同一扫描线上前后各若干点组成集合 $\mathcal{S}$（如前后各 5 个点），定义曲率
+\begin{equation}
+  \kappa_i = \frac{1}{\abs{\mathcal{S}}}\sum_{j\in\mathcal{S}}\norm{\bm{p}_j-\bm{p}_i}^{2}.
+  \label{eq:07-curvature}
+\end{equation}
+$\kappa_i$ 大说明该点邻域起伏剧烈，是\textbf{边缘点}（线特征）；$\kappa_i$ 小说明邻域平坦，是\textbf{平面点}（面特征）。按曲率排序后取最大的若干作为边缘点、最小的若干作为平面点，同时剔除可能属于同一物体边缘的邻近点，保证特征在空间中分散。
+
+\textbf{第二步：帧间匹配。}对当前帧的每个边缘点 $\bm{p}_i$，在上一帧的边缘点中找最近的两个点 $\bm{p}_a,\bm{p}_b$（构成一条线），定义\textbf{点到线残差}为点到直线的距离：
+\begin{equation}
+  r_{\text{edge}} = \frac{\norm{\left(\bm{p}_i-\bm{p}_a\right)\times\left(\bm{p}_i-\bm{p}_b\right)}}{\norm{\bm{p}_a-\bm{p}_b}}.
+\end{equation}
+这个公式来自「三角形面积 = 底乘高 / 2 = 叉乘模长 / 2」：分子是平行四边形的面积，除以底边长度就是高，即点到直线的距离。对平面点 $\bm{p}_i$，在上一帧平面点中找最近的三个点 $\bm{p}_a,\bm{p}_b,\bm{p}_c$，用法向
+\begin{equation}
+  \bm{n} = \frac{\left(\bm{p}_a-\bm{p}_b\right)\times\left(\bm{p}_c-\bm{p}_b\right)}{\norm{\left(\bm{p}_a-\bm{p}_b\right)\times\left(\bm{p}_c-\bm{p}_b\right)}}
+\end{equation}
+定义\textbf{点到面残差} $r_{\text{plane}}=\bm{n}^{\top}(\bm{p}_i-\bm{p}_b)$。把两类残差按式~\eqref{eq:07-gn} 组装正规方程，用 LM 迭代求解帧间位姿。
+
+\textbf{第三步：帧间 → 帧到地图。}LOAM 把里程计与建图分开：里程计以 10\,Hz 估计相邻帧位姿 $T_{k-1,k}$，再以更低频率把当前帧配准到已建立的地图（局部地图点云）上，得到全局一致的位姿 $T_{WB}$。位姿合成关系为
+\begin{equation}
+  T_{WB}(k) = T_{WB}(k-1)\,T_{k-1,k},
+  \label{eq:07-pose-compose}
+\end{equation}
+而帧到地图的配准会对 $T_{WB}(k)$ 做一次修正。两阶段的好处是：高频部分只做局部配准（快），低频部分做全局配准（准）。下面的伪代码给出一次迭代的骨架。
+
+\begin{pseudo}{LOAM 单帧处理流程}
+  \item 输入：当前帧点云 $\mathcal{P}_k$、上一帧位姿 $T_{k-1}$、局部地图 $\mathcal{M}$
+  \item 提取曲率 $\kappa_i$，选出边缘点集与平面点集
+  \item 用匀速模型给初值 $T_k\leftarrow T_{k-1}T_{k-2}^{-1}T_{k-1}$
+  \item 重复若干次：
+  \item \quad 把 $\mathcal{P}_k$ 变换到上一帧系，为边缘点找最近线段、为平面点找最近平面
+  \item \quad 组装点到线、点到面残差，解正规方程得增量 $\delta\bm{x}$
+  \item \quad 更新 $T_k\leftarrow\exp(\delta\bm{x}^{\wedge})T_k$，剔除大残差点
+  \item 把 $\mathcal{P}_k$ 按 $T_k$ 加入局部地图 $\mathcal{M}$，输出位姿 $T_k$
+\end{pseudo}
+
+\begin{figure}[htbp]
+  \centering
+  \begin{tikzpicture}[node distance=6mm and 10mm]
+    \node[block] (raw) {原始点云\\$10\,\mathrm{Hz}$};
+    \node[block, right=of raw] (feat) {特征提取\\曲率 $\kappa_i$};
+    \node[block, right=of feat] (scan) {帧间匹配\\点到线 / 点到面};
+    \node[block, below=of scan] (map) {帧到地图\\局部地图配准};
+    \node[block, left=of map] (pose) {位姿输出\\$T_{WB}$};
+    \draw[-stealth, thick] (raw) -- (feat);
+    \draw[-stealth, thick] (feat) -- (scan);
+    \draw[-stealth, thick] (scan) -- node[label, right] {粗位姿} (map);
+    \draw[-stealth, thick] (map) -- (pose);
+    \draw[-stealth, thick, dashed] (pose.north) to[out=90, in=270] (scan.south);
+  \end{tikzpicture}
+  \caption{LOAM 的数据流。高频的帧间匹配给出粗位姿，低频的帧到地图配准把它拉回全局一致；两阶段结构后来被 LeGO-LOAM、LIO-SAM 等继承。}
+  \label{fig:07-loam}
+\end{figure}
+
+\section{退化分析：为什么长廊里会失效}\label{sec:07-degeneracy}
+
+激光里程计的位姿解由正规方程~\eqref{eq:07-gn} 决定，其中 $\bm{H}=\sum_i w_i\bm{A}_i^{\top}\bm{A}_i$ 是 $6\times6$ 信息矩阵。$\bm{H}$ 的特征值刻画了「各个方向上有多少约束」：特征值大说明该方向被点云牢牢约束，特征值小说明该方向几乎无约束。
+
+\begin{definition}[退化]
+若信息矩阵 $\bm{H}$ 的某个特征值接近零（或远小于最大特征值），则对应的特征向量方向称为\textbf{退化方向}（degenerate direction）：在这个方向上，位姿解对残差几乎不敏感，估计结果由噪声决定而不是由数据决定。
+\end{definition}
+
+\textbf{长廊的例子。}一条无限长的走廊，两侧是平行墙面。沿走廊方向平移时，每个点到墙面的距离完全不变，点到面残差不变，因此该方向对应的 $\bm{A}_i$ 列全为零，$\bm{H}$ 的最小特征值趋于零。类似地，空旷场地里围绕竖直轴的旋转、大平面场景里垂直于平面的平移，都可能退化。
+
+\textbf{检测方法。}对 $\bm{H}$ 做特征分解 $\bm{H}=\sum_k\lambda_k\bm{v}_k\bm{v}_k^{\top}$（特征值与特征向量定义见第~\ref{ch:02-math}~章），两种常用判据：
+\begin{itemize}
+  \item 最小特征值阈值：$\lambda_{\min}<\lambda_{\text{th}}$ 判为退化；
+  \item 条件数：$\lambda_{\max}/\lambda_{\min}>\kappa_{\text{th}}$ 判为病态。
+\end{itemize}
+退化方向就是 $\lambda_{\min}$ 对应的特征向量 $\bm{v}_{\min}$；工程上可以把解在这个方向上「冻结」或「用先验填充」：把 $\bm{H}$ 在该方向上的元素替换成一个很大的值（等价于加入极强的先验），使解不再依赖无约束的数据方向。
+
+\begin{keybox}{退化处理的三种手段}
+\begin{enumerate}
+  \item \textbf{换传感器}：加入 IMU 提供姿态与加速度先验，这是 LIO 紧耦合（第~\ref{ch:16-lio-evolution}~章）的核心动机。
+  \item \textbf{换残差}：点到面比点到点约束更强，加入法向、平面、地面约束可以补充缺失方向。
+  \item \textbf{换判据}：实时监控 $\lambda_{\min}$ 与条件数，一旦判为退化就降低该方向权重、拒绝输出不可信位姿，而不是硬算。
+\end{enumerate}
+\end{keybox}
+
+\begin{summary}
+
+\begin{enumerate}
+  \item 激光里程计 = 扫描匹配：给定两帧点云求 $T$ 使对应点距离最小。
+  \item 点到点 ICP 的闭式解：去质心后最大化 $\tr(\bm{R}\bm{W})$，$\bm{W}=\sum\tilde{\bm{p}}_i\tilde{\bm{q}}_i^{\top}$，SVD 得 $\bm{R}=\bm{V}\bm{U}^{\top}$（$\det<0$ 时修正），$\bm{t}=\bar{\bm{q}}-\bm{R}\bar{\bm{p}}$。
+  \item ICP 迭代 = 找最近邻 + 闭式解，初值、外点剔除、收敛判据是三个工程要点；KD 树把最近邻查询降到 $O(\log M)$。
+  \item 点到面残差线性化后得到 $\bm{A}_i=[(\bm{p}_i\times\bm{n}_i)^{\top},\bm{n}_i^{\top}]$，正规方程 $\bm{H}\delta\bm{x}=-\bm{b}$ 就是 Gauss-Newton 的一步。
+  \item NDT 用体素高斯代替最近邻，得分是负指数函数，Newton 法迭代；收敛域更大但精度略低。
+  \item 相关性搜索穷举位姿空间，鲁棒但慢；分支定界把它降到实用，是 Cartographer 的核心。
+  \item LOAM 用曲率提取边缘点与平面点，点到线、点到面残差两阶段（帧间 + 帧到地图）求解，位姿按 $T_{WB}(k)=T_{WB}(k-1)T_{k-1,k}$ 合成。
+  \item 退化由信息矩阵 $\bm{H}$ 的小特征值检测，长廊、空旷、大平面是典型场景；对策是换传感器、换残差、换判据。
+\end{enumerate}
+
+
+\end{summary}
+
+\begin{problemset}
+
+  \item 给两组对应点：$\mathcal{P}=\{(0,0),(1,0),(0,1)\}$、$\mathcal{Q}=\{(0,1),(1,1),(0,2)\}$，手工算出 $\bar{\bm{p}}$、$\bar{\bm{q}}$，验证这是纯平移 $[0,1]^{\top}$，并用式~\eqref{eq:07-icp-t} 反推 $\bm{t}$。
+  \item 推导式~\eqref{eq:07-icp-t}：从 $\partial J/\partial\bm{t}=0$ 出发，写出每一步，并解释为什么平移可以「先分离出去」。
+  \item 设 $\bm{W}=\bm{U}\diag(2,1,0.1)\bm{V}^{\top}$ 且 $\det(\bm{V}\bm{U}^{\top})=-1$，写出正确的 $\bm{R}$ 并说明为什么不能直接用 $\bm{V}\bm{U}^{\top}$。
+  \item 用式~\eqref{eq:07-p2plane-jac} 写出一个点的 $\bm{A}_i$，并说明为什么沿平面方向的位移在残差中不出现。
+  \item 解释 NDT 得分函数式~\eqref{eq:07-ndt-cost} 中协方差逆矩阵的作用：如果某个体素内点云近似一条直线，$\bm{\Sigma}_j^{-1}$ 会把哪个方向的残差放大？
+  \item 走廊场景中，若只用点到面残差，$\bm{H}$ 的哪个特征值会接近零？请给出特征向量的物理含义，并设计一个检测方案。
+\end{problemset}
+
+\begin{reading}
+
+\begin{itemize}
+  \item Besl \& McKay 1992 的 ICP 原始论文（\href{https://ieeexplore.ieee.org/document/121791}{IEEE TPAMI}）：闭式解与收敛性分析。
+  \item Biber \& Strasser 2003 的 NDT 论文：体素高斯与 2D 激光配准。
+  \item Zhang \& Singh 2014 的 LOAM 论文（\href{https://www.ri.cmu.edu/pub_files/2014/7/Ji_LidarMapping_RSS2014_v8.pdf}{RSS}）：特征提取与两阶段框架，建议对照本章的伪代码与图~\ref{fig:07-loam} 阅读。
+\end{itemize}
+
+
+\end{reading}

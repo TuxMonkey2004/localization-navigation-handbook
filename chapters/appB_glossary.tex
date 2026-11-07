@@ -1,0 +1,163 @@
+\chapter{术语中英对照表}
+
+\noindent 本表按主题分组，给出本书出现的主要术语中英文对照及一句话解释，便于阅读英文论文与源码时查阅。
+
+\section*{B.1 数学与估计}
+
+\begin{table}[htbp]
+  \centering
+  \caption{数学与估计基础术语}\label{tab:b-math}
+  \footnotesize
+  \begin{tabular}{llp{6.6cm}}
+    \toprule
+    中文 & 英文 & 说明 \\
+    \midrule
+    位姿 & pose & 位置 + 姿态，$\SE(3)$ 元素 \\
+    姿态 & orientation & 旋转部分，$\SO(3)$ 元素 \\
+    刚体变换 & rigid transformation & 旋转 + 平移 \\
+    齐次坐标 & homogeneous coordinates & 用 4 维向量表示 3 维点，便于矩阵复合 \\
+    旋转矩阵 & rotation matrix & 满足 $R^{\top}R=I$、$\det R=1$ \\
+    四元数 & quaternion & 用 4 个数表示旋转，无奇异 \\
+    欧拉角 & Euler angle & roll/pitch/yaw，直观但有万向锁 \\
+    万向锁 & gimbal lock & pitch 为 $\pm90^\circ$ 时自由度退化 \\
+    李群 & Lie group & 既是群又是流形，如 $\SO(3)$、$\SE(3)$ \\
+    李代数 & Lie algebra & 李群单位元处的切空间，可做加法 \\
+    指数映射 & exponential map & 李代数 $\to$ 李群 \\
+    对数映射 & logarithm map & 李群 $\to$ 李代数 \\
+    雅可比矩阵 & Jacobian & 一阶偏导矩阵 \\
+    海森矩阵 & Hessian & 二阶偏导矩阵 \\
+    泰勒展开 & Taylor expansion & 用多项式局部逼近函数 \\
+    最小二乘 & least squares & 最小化残差平方和 \\
+    正规方程 & normal equation & $A^{\top}Ax=A^{\top}b$ \\
+    高斯--牛顿 & Gauss--Newton & 非线性最小二乘的迭代解法 \\
+    LM & Levenberg--Marquardt & 带阻尼的高斯--牛顿 \\
+    期望 & expectation & 概率加权平均 \\
+    方差 & variance & 偏离期望的平方的期望 \\
+    协方差 & covariance & 两个变量共同变化的程度 \\
+    协方差矩阵 & covariance matrix & 所有两两协方差组成的矩阵 \\
+    高斯分布 & Gaussian distribution & 正态分布 \\
+    贝叶斯公式 & Bayes' formula & 先验 + 似然 $\to$ 后验 \\
+    后验 & posterior & 观测后的状态分布 \\
+    似然 & likelihood & 给定状态下观测的概率 \\
+    卡方分布 & chi-square distribution & 标准正态平方和；用于一致性检验 \\
+    马氏距离 & Mahalanobis distance & 按协方差加权的距离 \\
+    信息矩阵 & information matrix & 协方差矩阵的逆，衡量约束强度 \\
+    特征值 & eigenvalue & $Av=\lambda v$ 中的 $\lambda$ \\
+    奇异值分解 & SVD & $A=U\Sigma V^{\top}$ \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+\section*{B.2 定位、里程计与 SLAM}
+
+\begin{table}[htbp]
+  \centering
+  \caption{定位与 SLAM 术语}\label{tab:b-slam}
+  \footnotesize
+  \begin{tabular}{llp{6.6cm}}
+    \toprule
+    中文 & 英文 & 说明 \\
+    \midrule
+    定位 & localization & 估计机器人在参考系中的位姿 \\
+    绝对定位 & absolute localization & 直接在地图系中定位 \\
+    相对定位 & relative localization & 相对起点递推，会累积误差 \\
+    全局定位 & global localization & 初始位姿未知时的定位 \\
+    重定位 & relocalization & 跟丢后重新找回位姿 \\
+    绑架问题 & kidnapped robot problem & 机器人被瞬间移动后的定位问题 \\
+    里程计 & odometry & 用传感器增量递推位姿 \\
+    航迹推算 & dead reckoning & 基于速度/转向积分推位姿 \\
+    漂移 & drift & 累积误差导致的缓慢偏离 \\
+    前端 & front-end & 数据关联 + 局部位姿估计 \\
+    后端 & back-end & 全局优化、回环、地图修正 \\
+    数据关联 & data association & 确定观测之间的对应关系 \\
+    扫描匹配 & scan matching & 用两帧点云估计相对位姿 \\
+    点云配准 & point cloud registration & 同上，更通用的说法 \\
+    迭代最近点 & ICP & 交替找最近点与求最优变换 \\
+    正态分布变换 & NDT & 用体素内高斯分布建模点云 \\
+    关键帧 & keyframe & 被选入地图的代表帧 \\
+    局部地图 & local map & 当前帧附近的地图子集 \\
+    先验地图 & prior map & 离线建好、定位时加载的地图 \\
+    回环检测 & loop closure detection & 判断是否回到历史地点 \\
+    位姿图 & pose graph & 节点=位姿、边=相对约束的图 \\
+    因子图 & factor graph & 用因子表示观测的图模型 \\
+    光束法平差 & bundle adjustment & 同时优化位姿与路标的非线性最小二乘 \\
+    舒尔补 & Schur complement & 分块消元，BA 的核心技巧 \\
+    边缘化 & marginalization & 消去旧状态但保留其信息 \\
+    鲁棒核 & robust kernel & 降低大残差影响的损失函数 \\
+    后端优化 & back-end optimization & 全局最小二乘求解 \\
+    建图 & mapping & 把观测融合成环境表示 \\
+    占据栅格 & occupancy grid & 每格记录占据概率的 2D 地图 \\
+    八叉树 & octree & 空间递归划分的 3D 地图 \\
+    点云 & point cloud & 3D 点的集合 \\
+    体素 & voxel & 三维栅格单元 \\
+    降采样 & downsampling & 减少点数，常用体素质心法 \\
+    去畸变 & deskewing & 补偿单帧点云内的运动畸变 \\
+    运动畸变 & motion distortion & 扫描期间运动导致的点云变形 \\
+    可观测性 & observability & 某方向能否由观测唯一确定 \\
+    退化 & degeneracy & 观测对某方向没有约束 \\
+    紧耦合 & tightly coupled & 多传感器放进同一估计器 \\
+    松耦合 & loosely coupled & 各传感器独立估计后融合 \\
+    预积分 & preintegration & IMU 在两帧间的积分量与初值解耦 \\
+    零偏 & bias & 传感器零输入时的非零输出 \\
+    随机游走 & random walk & 零偏等量随时间的随机漂移 \\
+    惯性测量单元 & IMU & 陀螺仪 + 加速度计 \\
+    激光惯性里程计 & LIO & LiDAR + IMU 里程计 \\
+    视觉惯性里程计 & VIO & 相机 + IMU 里程计 \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+\section*{B.3 导航、工程与其他}
+
+\begin{table}[htbp]
+  \centering
+  \caption{导航与工程术语}\label{tab:b-nav}
+  \footnotesize
+  \begin{tabular}{llp{6.6cm}}
+    \toprule
+    中文 & 英文 & 说明 \\
+    \midrule
+    导航 & navigation & 定位 + 地图 + 规划 + 控制 \\
+    全局规划 & global planning & 在全局地图上找可行路径 \\
+    局部规划 & local planning & 跟踪全局路径并实时避障 \\
+    代价地图 & costmap & 栅格化的代价表示，供规划查询 \\
+    膨胀层 & inflation layer & 按距离给障碍物周围加代价 \\
+    行为树 & behavior tree & Nav2 的任务编排机制 \\
+    生命周期 & lifecycle & ROS 2 节点的状态管理 \\
+    动态窗口法 & DWA & 在速度空间采样避障 \\
+    时间弹性带 & TEB & 把轨迹表示为带时间戳的图优化 \\
+    模型预测控制 & MPC & 滚动时域优化控制 \\
+    人工势场 & artificial potential field & 引力 + 斥力避障 \\
+    可视图 & visibility graph & 连接可见节点的图，用于全局规划 \\
+    自主探索 & autonomous exploration & 在未知环境中边建图边找目标 \\
+    地形分析 & terrain analysis & 从点云提取坡度、粗糙度、台阶 \\
+    可通行性 & traversability & 某区域能否安全通过 \\
+    探索增益 & exploration gain & 探索某区域能获得的新信息量 \\
+    外参 & extrinsic & 传感器之间的位姿变换 \\
+    内参 & intrinsic & 相机内部成像参数 \\
+    标定 & calibration & 估计内参/外参/时间偏移 \\
+    时间同步 & time synchronization & 统一多传感器时间基准 \\
+    时间戳 & timestamp & 数据采集时刻 \\
+    点频 & point rate & 激光雷达每秒输出点数 \\
+    线数 & number of channels & 激光雷达垂直方向束数 \\
+    角分辨率 & angular resolution & 相邻光束的角度间隔 \\
+    盲区 & blind zone & 雷达无法测距的最近距离 \\
+    视场角 & field of view (FOV) & 传感器可观测的角度范围 \\
+    飞行时间 & time of flight (ToF) & 通过光/声飞行时间测距 \\
+    超宽带 & UWB & 室内无线定位技术 \\
+    全球导航卫星系统 & GNSS & GPS/北斗等的统称 \\
+    实时动态差分 & RTK & GNSS 厘米级定位技术 \\
+    惯性测量单元 & IMU & 陀螺仪 + 加速度计 \\
+    机器人操作系统 & ROS & 机器人软件框架 \\
+    数据分发服务 & DDS & ROS 2 的通信中间件 \\
+    服务质量 & QoS & ROS 2 通信的可靠性等配置 \\
+    坐标变换 & TF & ROS 中的坐标系变换树 \\
+    话题 & topic & 发布/订阅通信 \\
+    服务 & service & 请求/响应通信 \\
+    动作 & action & 带反馈的长任务通信 \\
+    数据包 & rosbag & 传感器数据的录制文件 \\
+    绝对轨迹误差 & ATE & 估计轨迹与真值的整体偏差 \\
+    相对位姿误差 & RPE & 固定间隔内的相对误差 \\
+    \bottomrule
+  \end{tabular}
+\end{table}

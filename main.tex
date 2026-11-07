@@ -1,0 +1,130 @@
+% ============================================================
+%  定位与导航技术文档  ——  主文件（由 Lead 维护，撰稿人请勿修改）
+%  编译：xelatex main -> biber main -> xelatex main -> xelatex main
+% ============================================================
+\documentclass[lang=cn,newtx,10pt,scheme=chinese,color=blue]{elegantbook}
+
+\title{定位与导航技术文档}
+\subtitle{从里程计到 SLAM，从建图到自主导航}
+
+\author{算法组}
+\institute{RoboMaster 算法组}
+\date{2026 年 11 月}
+\version{1.0}
+\bioinfo{适用对象}{算法组新队员 / 进阶队员}
+\extrainfo{配套解析：FAST-LIO2 \textperiodcentered{} Point-LIO \textperiodcentered{} Cartographer \textperiodcentered{} Nav2 \textperiodcentered{} Z-Localization}
+
+% 封面与徽标（由 tools/make_cover.py 生成）
+\logo{figures/logo.png}
+\cover{figures/cover.png}
+
+% 主题配色：深蓝为主色
+\definecolor{structurecolor}{RGB}{22,93,155}
+\definecolor{main}{RGB}{0,110,120}
+\definecolor{second}{RGB}{190,80,20}
+\definecolor{third}{RGB}{0,145,170}
+\colorlet{coverlinecolor}{structurecolor}
+
+\setcounter{tocdepth}{2}
+
+% 允许章节标题中出现数学宏（\bm、\frac 等）并安全写入 PDF 书签
+\pdfstringdefDisableCommands{%
+  \def\bm#1{#1}%
+  \def\boldsymbol#1{#1}%
+  \def\frac#1#2{#1/#2}%
+  \def\mathrm#1{#1}%
+  \def\text#1{#1}%
+}
+
+% 代码块样式：浅色底、细边框、彩色关键字
+\lstset{
+  basicstyle=\ttfamily\small,
+  keywordstyle=\color{structurecolor}\bfseries,
+  commentstyle=\color{green!45!black}\itshape,
+  stringstyle=\color{red!55!black},
+  frame=single,
+  rulecolor=\color{black!18},
+  backgroundcolor=\color{black!2},
+  framexleftmargin=2mm,
+  xleftmargin=2mm,
+  aboveskip=5pt,
+  belowskip=5pt,
+  columns=fullflexible,
+  keepspaces=true
+}
+
+% 图形库
+\usetikzlibrary{arrows.meta, shapes.geometric, shapes.misc, positioning,
+  fit, calc, backgrounds, patterns, decorations.pathreplacing}
+\usepackage{pgfplots}
+\pgfplotsset{compat=1.18}
+
+\input{macros.tex}
+
+\addbibresource{reference.bib}
+
+\begin{document}
+
+\maketitle
+
+% 表格斑马纹（封面之后生效）
+\rowcolors{2}{structurecolor!4}{white}
+
+\frontmatter
+\input{chapters/preface.tex}
+\tableofcontents
+
+\mainmatter
+
+\part{基础篇：先建立正确的地图}
+
+\input{chapters/ch01_overview.tex}
+\input{chapters/ch02_math.tex}
+\input{chapters/ch03_sensors.tex}
+
+\part{里程计篇：机器人如何推算自己的位置}
+
+\input{chapters/ch04_odom_intro.tex}
+\input{chapters/ch05_wheel.tex}
+\input{chapters/ch06_imu.tex}
+\input{chapters/ch07_lidar_odom.tex}
+\input{chapters/ch08_visual_odom.tex}
+\input{chapters/ch09_fusion.tex}
+\input{chapters/ch10_global_loc.tex}
+
+\part{SLAM 篇：前端、后端与建图}
+
+\input{chapters/ch11_slam_framework.tex}
+\input{chapters/ch12_frontend.tex}
+\input{chapters/ch13_backend.tex}
+\input{chapters/ch14_mapping.tex}
+\input{chapters/ch15_cartographer.tex}
+\input{chapters/ch16_lio_evolution.tex}
+\input{chapters/ch17_advanced_lio.tex}
+
+\part{导航篇：从地图到运动}
+
+\input{chapters/ch18_nav_overview.tex}
+\input{chapters/ch19_global_planning.tex}
+\input{chapters/ch20_local_planning.tex}
+\input{chapters/ch21_3d_nav.tex}
+\input{chapters/ch22_nav2_practice.tex}
+\input{chapters/ch23_zlocalization.tex}
+\input{chapters/ch24_frontier.tex}
+
+\part{工程篇：把算法跑起来}
+
+\input{chapters/ch25_ros2.tex}
+\input{chapters/ch26_calibration.tex}
+\input{chapters/ch27_tuning.tex}
+\input{chapters/ch28_evaluation.tex}
+\input{chapters/ch29_rm.tex}
+\input{chapters/ch30_roadmap.tex}
+
+\printbibliography[heading=bibintoc, title=\ebibname]
+
+\appendix
+\input{chapters/appA_formula.tex}
+\input{chapters/appB_glossary.tex}
+
+\end{document}

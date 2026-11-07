@@ -1,0 +1,401 @@
+% 本章使用 TikZ 的 arrows.meta / positioning 库（main.tex 与 tests 均已加载，此行幂等无害）
+\usetikzlibrary{arrows.meta, positioning}
+
+\chapter{地图与建图}\label{ch:14-mapping}
+
+\chapterintro{前两章都在回答``我在哪''，本章回答``世界是什么样''。地图是 SLAM 的输出，也是导航的输入：没有地图，全局规划无从谈起；地图错了，定位与避障都会跟着错。本章沿着``地图给谁用''这条线索，把最常用的五种地图讲清楚：占据栅格（概率化的二维地图）、八叉树（省内存的三维占据地图）、TSDF（能重建光滑表面的截断符号距离场）、ESDF（能给规划提供梯度的距离场）、以及点云地图。重点是两条完整推导：占据栅格的 log-odds 更新如何从贝叶斯公式一步步推出来，以及 TSDF 的加权平均为什么是``最小二乘''的自然结果。}
+
+\section{地图的用途决定地图的形式}\label{sec:14-usage}
+
+新手常问``哪种地图最好''，这个问题没有答案，因为地图是为用途服务的。同一片场地，用来做全局定位的``地图''可能是一张点云，用来做路径规划的``地图''可能是一张二维栅格，用来做局部避障的``地图''可能是占据栅格，用来做轨迹优化的``地图''则是 ESDF。表~\ref{tab:14-map-usage} 给出常见的对应关系。
+
+\begin{table}[htbp]
+  \centering
+  \caption{地图类型与用途的对应关系（$\checkmark$ 表示适合，$\circ$ 表示勉强可用）}\label{tab:14-map-usage}
+  \footnotesize
+  \begin{tabular}{lccccc}
+    \toprule
+    地图类型 & 定位 & 全局规划 & 局部避障 & 表面重建 & 内存 \\
+    \midrule
+    点云地图 & $\checkmark$ & $\circ$ & $\circ$ & $\checkmark$ & 大 \\
+    占据栅格（2D） & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\circ$ & 中 \\
+    八叉树（3D 占据） & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\circ$ & 中 \\
+    TSDF & $\circ$ & $\circ$ & $\circ$ & $\checkmark$ & 大 \\
+    ESDF & $\circ$ & $\checkmark$ & $\checkmark$ & $\circ$ & 大 \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+表~\ref{tab:14-map-usage} 的读法是：\textbf{要定位就选能算似然的}（点云、占据栅格），\textbf{要规划就选能算代价的}（栅格、ESDF），\textbf{要重建就选能算距离的}（TSDF）。实际系统里往往同时维护好几张地图，各司其职。
+
+\begin{keybox}{地图的三条工程准则}
+\begin{enumerate}
+  \item \textbf{分辨率决定一切}：$5\ \mathrm{cm}$ 的栅格与 $20\ \mathrm{cm}$ 的栅格是两种应用，前者能看清桌腿，后者只能看墙。分辨率减半，内存变四倍（2D）或八倍（3D）。
+  \item \textbf{只维护``用得到''的区域}：机器人周围 $20\ \mathrm{m}$ 内的地图需要高频更新，远处的地图只需保存；这是八叉树、体素地图存在的理由。
+  \item \textbf{地图必须能``变旧''}：环境会变（人走了、箱子搬了），地图若永远只增不减，就会把历史当成现实。所有工程地图都要么带时间戳，要么允许权重衰减。
+\end{enumerate}
+\end{keybox}
+
+\section{占据栅格地图与 log-odds 更新}\label{sec:14-occupancy}
+
+\begin{definition}[占据栅格]
+占据栅格（occupancy grid）把空间切成规则的格子（2D 是正方形，3D 是立方体），每个格子 $m_i$ 只取两个状态：被占据（$m_i=1$，有障碍）或空闲（$m_i=0$，可通行）。由于传感器有噪声，我们不存``是/否''，而存``被占据的概率'' $p(m_i=1\mid \bm{z}_{1:t})$。
+\end{definition}
+
+一张 $100\ \mathrm{m}\times100\ \mathrm{m}$、分辨率 $5\ \mathrm{cm}$ 的二维栅格有 $2000\times2000=4\times10^{6}$ 个格子；若用单精度浮点存概率，需要 $16\ \mathrm{MB}$。这还只是一层。所以存储格式的优化从第一天就要考虑——这就是为什么工程上不存概率，而存``概率的对数''（log-odds）。
+
+\subsection{从贝叶斯公式推导 log-odds}
+
+目标：给定从第 $1$ 帧到第 $t$ 帧的全部观测 $\bm{z}_{1:t}$，求每个格子被占据的后验概率 $p(m_i\mid \bm{z}_{1:t})$。为简洁，记 $m=m_i$。由贝叶斯公式（定义见第~\ref{ch:02-math}~章）：
+\begin{equation}
+p(m\mid \bm{z}_{1:t})=\frac{p(\bm{z}_t\mid m,\bm{z}_{1:t-1})\,p(m\mid \bm{z}_{1:t-1})}{p(\bm{z}_t\mid \bm{z}_{1:t-1})}.
+\label{eq:14-bayes1}
+\end{equation}
+\textbf{假设（观测只依赖当前地图状态）：}$p(\bm{z}_t\mid m,\bm{z}_{1:t-1})=p(\bm{z}_t\mid m)$。也就是说，这一帧的观测只和``这个格子现在是什么''有关，与历史无关。于是
+\begin{equation}
+p(m\mid \bm{z}_{1:t})=\frac{p(\bm{z}_t\mid m)\,p(m\mid \bm{z}_{1:t-1})}{p(\bm{z}_t\mid \bm{z}_{1:t-1})}.
+\label{eq:14-bayes2}
+\end{equation}
+对``未占据''事件 $\neg m$（即 $m=0$）写同样的式子：
+\begin{equation}
+p(\neg m\mid \bm{z}_{1:t})=\frac{p(\bm{z}_t\mid \neg m)\,p(\neg m\mid \bm{z}_{1:t-1})}{p(\bm{z}_t\mid \bm{z}_{1:t-1})}.
+\label{eq:14-bayes3}
+\end{equation}
+注意式~\eqref{eq:14-bayes2} 与式~\eqref{eq:14-bayes3} 的分母相同。两式相除，分母消掉：
+\begin{equation}
+\frac{p(m\mid \bm{z}_{1:t})}{p(\neg m\mid \bm{z}_{1:t})}
+=
+\frac{p(\bm{z}_t\mid m)}{p(\bm{z}_t\mid\neg m)}
+\cdot
+\frac{p(m\mid \bm{z}_{1:t-1})}{p(\neg m\mid \bm{z}_{1:t-1})}.
+\label{eq:14-odds}
+\end{equation}
+左边是当前时刻的``占据比''，右边第二项是上一时刻的``占据比''，第一项是这一帧观测带来的``修正因子''。
+
+定义占据比（odds）与对数占据比（log-odds）：
+\begin{equation}
+\mathrm{odds}(p)=\frac{p}{1-p},
+\qquad
+l=\log\frac{p}{1-p}.
+\label{eq:14-logodds-def}
+\end{equation}
+$\mathrm{odds}$ 把概率 $(0,1)$ 映射到 $(0,\infty)$，$\log$ 再把它映射到 $(-\infty,\infty)$——这正是我们想要的：概率接近 $0$ 或 $1$ 时不会``撞墙''，而且乘性更新变成加性更新。对式~\eqref{eq:14-odds} 两边取对数，得到本章的核心递推式：
+\begin{equation}
+l_t=l_{t-1}+\log\frac{p(\bm{z}_t\mid m)}{p(\bm{z}_t\mid\neg m)}.
+\label{eq:14-logodds-recursion}
+\end{equation}
+
+再处理一下修正因子。对式~\eqref{eq:14-bayes1}（把 $t$ 换成单帧）用一次贝叶斯，可得
+\begin{equation}
+\frac{p(m\mid\bm{z}_t)}{p(\neg m\mid\bm{z}_t)}
+=\frac{p(\bm{z}_t\mid m)}{p(\bm{z}_t\mid\neg m)}\cdot\frac{p(m)}{p(\neg m)},
+\end{equation}
+取对数即
+\begin{equation}
+\log\frac{p(\bm{z}_t\mid m)}{p(\bm{z}_t\mid\neg m)}
+=\underbrace{\log\frac{p(m\mid\bm{z}_t)}{1-p(m\mid\bm{z}_t)}}_{l(m\mid\bm{z}_t)}
+-\underbrace{\log\frac{p(m)}{1-p(m)}}_{l(m)}.
+\end{equation}
+把它代入式~\eqref{eq:14-logodds-recursion}，就得到教材里最常见的形式：
+\begin{equation}
+\boxed{\,l_t(m)=l_{t-1}(m)+l(m\mid\bm{z}_t)-l(m)\,}
+\label{eq:14-logodds-update}
+\end{equation}
+其中 $l(m\mid\bm{z}_t)$ 是``只用这一帧的观测算出的占据 log-odds''（称为\textbf{逆观测模型}的值），$l(m)$ 是先验 log-odds。
+
+式~\eqref{eq:14-logodds-update} 的物理含义：\textbf{每来一帧观测，就把``这一帧认为它有多大概率被占据''与``本来认为它有多大概率''之差，加到历史累积值上}。如果先验取 $p(m)=0.5$（即 $l(m)=0$，完全不知道），更新就简化为 $l_t=l_{t-1}+l(m\mid\bm{z}_t)$，即``观测直接累加''。
+
+\subsection{逆观测模型与数值例子}
+
+激光雷达的逆观测模型非常直观：一条射线如果打到了某个格子，该格子就是``命中''（占据）；射线穿过但没打到的格子就是``空闲''；没有被任何射线穿过的格子``未知''，不更新。用两个常数近似：
+\begin{equation}
+p(m\mid\bm{z}_t)=\begin{cases}
+p_{\mathrm{occ}}, & \text{射线终点命中该格},\\
+p_{\mathrm{free}}, & \text{射线穿过该格},\\
+0.5\ (\text{不更新}), & \text{未被观测}.
+\end{cases}
+\end{equation}
+常见取值 $p_{\mathrm{occ}}=0.7$、$p_{\mathrm{free}}=0.3$。
+
+\begin{example}[三帧观测把概率推到多少]
+取先验 $p(m)=0.5$，则 $l(m)=0$，命中增量 $l_{\mathrm{occ}}=\log(0.7/0.3)=0.847$，空闲增量 $l_{\mathrm{free}}=\log(0.3/0.7)=-0.847$。假设同一个格子连续被命中 3 次：
+\begin{equation}
+l_3=0+3\times0.847=2.541
+\;\Longrightarrow\;
+p(m\mid\bm{z}_{1:3})=\frac{1}{1+e^{-2.541}}=0.927 .
+\end{equation}
+若连续命中 10 次，$l_{10}=8.47$，$p=0.99979$。可以看到概率会越来越``自信''，最终逼近 $1$ 但永远不到 $1$——这在数值上是好事（避免除零），但也带来一个工程问题：如果某天这个位置被清空了（搬箱子），要把它``拉回''空闲需要很多帧观测，因为它的 log-odds 已经很大了。所以工程上会把 $l$ 截断在 $[-l_{\max},l_{\max}]$ 之间（常取 $l_{\max}=2\sim4$），让地图保持``可修改''。
+\end{example}
+
+\begin{pseudo}{占据栅格的 log-odds 更新（单帧）}
+  \item 输入：栅格 $l$、当前帧位姿、雷达点云
+  \item 对每条射线：从传感器原点出发，沿射线方向步进
+  \item 沿途经过的格子：$l\gets l+l_{\mathrm{free}}$
+  \item 射线命中的格子：$l\gets l+l_{\mathrm{occ}}$
+  \item 对更新过的每个格子：$l\gets\max(-l_{\max},\min(l_{\max},l))$ 截断
+  \item 需要查询概率时：$p=1/(1+e^{-l})$
+\end{pseudo}
+
+把式~\eqref{eq:14-logodds-update} 落到代码上只有几行——注意工程上还要做截断与概率还原：
+\begin{lstlisting}[language=C++]
+// occupancy grid: log-odds update along a ray
+float l_hit  = std::log(p_occ  / (1.0f - p_occ));   // hit increment
+float l_miss = std::log(p_free / (1.0f - p_free));  // miss increment
+for (auto& cell : cells_along_ray) {
+    cell.log_odds += cell.is_endpoint ? l_hit : l_miss;
+    // clamp so the map stays updatable
+    cell.log_odds = std::clamp(cell.log_odds, -l_max, l_max);
+}
+// convert back to probability for display / planning
+float p = 1.0f / (1.0f + std::exp(-cell.log_odds));
+\end{lstlisting}
+
+\begin{figure}[htbp]
+  \centering
+  \begin{tikzpicture}[scale=0.8]
+    % grid
+    \foreach \i in {0,...,7} \foreach \j in {0,...,5}
+      \draw[black!20] (\i,\j) rectangle ++(1,1);
+    % free cells along three rays
+    \foreach \x in {1,...,6} \fill[structurecolor!16] (\x,0) rectangle ++(1,1);
+    \foreach \i in {1,...,4} \fill[structurecolor!16] (\i,\i) rectangle ++(1,1);
+    \foreach \y in {1,...,4} \fill[structurecolor!16] (0,\y) rectangle ++(1,1);
+    % hit cells
+    \fill[black!70] (7,0) rectangle ++(1,1);
+    \fill[black!70] (5,5) rectangle ++(1,1);
+    \fill[black!70] (0,5) rectangle ++(1,1);
+    % rays
+    \draw[red!60!black, thick] (0.5,0.5) -- (7.0,0.5);
+    \draw[red!60!black, thick] (0.5,0.5) -- (5.0,5.0);
+    \draw[red!60!black, thick] (0.5,0.5) -- (0.5,5.0);
+    % sensor
+    \fill[red!60!black] (0.5,0.5) circle (3pt);
+    \node[label, anchor=north] at (0.9,-0.12) {传感器};
+    % legend
+    \fill[black!70] (0.2,6.15) rectangle ++(0.5,0.5);
+    \node[label, anchor=west] at (0.8,6.4) {命中：占据};
+    \fill[structurecolor!16] (3.7,6.15) rectangle ++(0.5,0.5);
+    \node[label, anchor=west] at (4.3,6.4) {穿过：空闲};
+    \draw[black!25] (7.0,6.15) rectangle ++(0.5,0.5);
+    \node[label, anchor=west] at (7.6,6.4) {未观测：未知};
+  \end{tikzpicture}
+  \caption{一帧二维激光扫描后的占据栅格。三条射线从传感器出发，穿过的格子被更新为``空闲''，命中的格子被更新为``占据''，其余格子保持``未知''。log-odds 让多次观测可以像记账一样累加。}\label{fig:14-occupancy}
+\end{figure}
+
+\section{八叉树地图}\label{sec:14-octree}
+
+占据栅格的内存问题在 3D 下被放大到不可接受：$100\ \mathrm{m}\times100\ \mathrm{m}\times10\ \mathrm{m}$ 的场地、$10\ \mathrm{cm}$ 分辨率，有 $1000\times1000\times100=10^{8}$ 个体素；每个体素一个概率就是几百 MB，而且绝大多数体素是空的、根本不需要存。
+
+八叉树（octree）的基本思想是``\textbf{只存有差异的地方，相同的兄弟节点合并成一个父节点}''。把整个空间看成一个立方体（根节点），递归地切成 8 个小立方体（8 个孩子），直到达到目标分辨率。每个节点存一个占据概率：若 8 个孩子都一样（都空、都占据或都未知），就\textbf{剪枝}——只保留父节点，删掉孩子。
+
+\begin{definition}[八叉树]
+八叉树（octree）是一种每个内部节点恰好有 8 个子节点的树结构，用于对三维空间做递归八分。叶节点对应分辨率最高的体素，内部节点代表其覆盖区域的整体状态。若一个节点的所有子节点状态相同，则用该节点替代其子树（称为剪枝），从而以远小于稠密体素的内存表示大范围空间。
+\end{definition}
+
+八叉树的深度与分辨率的关系是：若根节点边长 $L$、叶节点边长 $r$，则深度
+\begin{equation}
+d=\left\lceil\log_2\frac{L}{r}\right\rceil .
+\end{equation}
+定位一个空间点的过程就是``每层比较 $x,y,z$ 与中点的大小，走 8 个分支之一''，$O(d)$ 次比较即可。更新一个体素就是沿这条路径走到叶节点、更新其概率，再沿路返回做剪枝判断。OctoMap\cite{hornung2013octomap} 就是用 log-odds 作为节点概率、并带剪枝的经典实现。
+
+\begin{figure}[htbp]
+  \centering
+  \begin{tikzpicture}[font=\footnotesize]
+    \node[block] (root) at (4.5,3.6) {根节点};
+    \foreach \i in {0,...,7}{
+      \node[rectangle, draw=structurecolor, thick, fill=structurecolor!8,
+            minimum size=4mm, inner sep=0pt] (c\i) at (1.2*\i+0.9,2.2) {};
+      \draw[black!55] (root) -- (c\i);
+    }
+    \node[label] at (0.9,1.8) {8 个孩子};
+    % expand the 2nd child into 8 leaves
+    \foreach \i in {0,...,7}{
+      \node[rectangle, draw=structurecolor!60, fill=structurecolor!25,
+            minimum size=2.4mm, inner sep=0pt] (l\i) at (0.62*\i+0.25,0.4) {};
+      \draw[black!40] (c1) -- (l\i);
+    }
+    \node[label] at (7.4,0.4) {继续八分，直到叶节点};
+  \end{tikzpicture}
+  \caption{八叉树的节点结构示意（示意图，实际每个节点对应一个空间立方体）。根节点代表整个空间，每层切成 8 份；当 8 个孩子状态相同时合并回父节点，这就是八叉树省内存的关键。}\label{fig:14-octree}
+\end{figure}
+
+内存对比给出直观量级。同样是 $100\ \mathrm{m}\times100\ \mathrm{m}\times10\ \mathrm{m}$、$10\ \mathrm{cm}$ 分辨率：
+\begin{itemize}
+  \item 稠密体素：$10^{8}$ 个体素，若每个 1 字节也要 $100\ \mathrm{MB}$，若存 float 则 $400\ \mathrm{MB}$，实际还会因为频繁查询而更慢；
+  \item 八叉树：真正需要表示的只有``表面附近''的体素。室内场景的表面积约 $2000\ \mathrm{m}^{2}$，每个 $0.1\ \mathrm{m}$ 体素覆盖 $0.01\ \mathrm{m}^{2}$，约 $2\times10^{5}$ 个叶节点；加上内部节点，总节点数在 $10^{5}\sim10^{6}$ 量级，内存只需几 MB 到几十 MB\cite{hornung2013octomap}。
+\end{itemize}
+两个数量级的差距，就是八叉树成为 3D 占据地图标准做法的原因。
+
+\section{TSDF：截断符号距离场}\label{sec:14-tsdf}
+
+占据栅格只回答``这个体素有没有东西''，不回答``表面在哪、有多远''。要做高质量表面重建（比如 Marching Cubes 出网格、给规划做精细避障），需要一种连续的、带距离信息的地图——截断符号距离场（Truncated Signed Distance Field，TSDF）。
+
+\begin{definition}[TSDF]
+TSDF 是把空间中每个体素 $x$ 映射到一个带符号的距离值 $D(x)$ 的场：$D(x)>0$ 表示 $x$ 在表面前方（自由空间），$D(x)<0$ 表示在表面后方（被物体占据），$|D(x)|$ 是到最近表面的距离。为了控制内存与计算量，只保留 $|D(x)|\le\mu$ 的部分（$\mu$ 称为截断距离），超出部分截断为 $\pm\mu$。
+\end{definition}
+
+为什么必须截断？因为远离表面的距离对建图没有用（我们只关心表面附近那一层薄壳），而``到处都要算到最近表面的精确距离''的计算量极大。截断 $\mu$ 通常取几倍体素分辨率（如 $\mu=4r$）。
+
+\subsection{单帧观测给出的 SDF 值}
+
+设传感器在 $\bm{o}$，某条射线上的深度观测为 $z$（沿射线到表面的距离）。对射线上的一个体素 $x$，它到传感器的距离是 $\|\bm{x}-\bm{o}\|$。若这个体素位于表面之前，则它到表面的距离（沿射线方向）约为
+\begin{equation}
+d(\bm{x})=z-\|\bm{x}-\bm{o}\| ,
+\end{equation}
+即``表面比体素远多少''。$d>0$ 表示体素在表面前方，$d<0$ 表示在后方，正是带符号距离。截断后
+\begin{equation}
+\hat d(\bm{x})=\mathrm{clamp}\big(d(\bm{x}),\,-\mu,\,+\mu\big)
+=\begin{cases}
++\mu, & d>\mu,\\
+d, & -\mu\le d\le\mu,\\
+-\mu, & d<-\mu .
+\end{cases}
+\label{eq:14-tsdf-clamp}
+\end{equation}
+
+\subsection{多帧融合：加权平均就是最小二乘}
+
+一帧观测不够准（噪声、视角）。多帧观测同一个体素时，最自然的做法是加权平均。设第 $t$ 帧给出的截断距离是 $\hat d_t(\bm{x})$，权重 $w_t(\bm{x})\ge0$，则
+\begin{equation}
+D_t(\bm{x})=\frac{W_{t-1}(\bm{x})\,D_{t-1}(\bm{x})+w_t(\bm{x})\,\hat d_t(\bm{x})}
+{W_{t-1}(\bm{x})+w_t(\bm{x})},
+\qquad
+W_t(\bm{x})=W_{t-1}(\bm{x})+w_t(\bm{x}).
+\label{eq:14-tsdf-fusion}
+\end{equation}
+这个式子是``加权平均''的递归写法。它为什么是最优的？因为它是下面最小二乘问题的解：
+\begin{equation}
+D_t(\bm{x})=\argmin_{D}\;\sum_{k=1}^{t}w_k(\bm{x})\big(D-\hat d_k(\bm{x})\big)^{2}.
+\label{eq:14-tsdf-ls}
+\end{equation}
+对 $D$ 求导并令其为零：
+\begin{equation}
+\frac{\partial}{\partial D}\sum_{k=1}^{t}w_k(D-\hat d_k)^{2}
+=2\sum_{k=1}^{t}w_k(D-\hat d_k)=0
+\;\Longrightarrow\;
+D\sum_{k=1}^{t}w_k=\sum_{k=1}^{t}w_k\hat d_k .
+\end{equation}
+所以
+\begin{equation}
+D_t=\frac{\sum_{k=1}^{t}w_k\hat d_k}{\sum_{k=1}^{t}w_k}.
+\label{eq:14-tsdf-closed}
+\end{equation}
+把式~\eqref{eq:14-tsdf-closed} 的分子分母同时拆成``前 $t-1$ 项 $+$ 第 $t$ 项''，并记 $W_{t-1}=\sum_{k=1}^{t-1}w_k$、$W_{t-1}D_{t-1}=\sum_{k=1}^{t-1}w_k\hat d_k$，立刻得到式~\eqref{eq:14-tsdf-fusion}。也就是说，\textbf{TSDF 的递归更新不是``工程上的近似''，而是最小二乘解的等价递推}——每来一帧只需 $O(1)$ 的更新，不需要保存全部历史。
+
+\subsection{权重设计与表面提取}
+
+权重 $w_t$ 怎么选？物理上有两条直觉：\textbf{距离越远越不准}（深度误差随距离平方增长），\textbf{入射角越斜越不准}（斜射时同样的深度误差对应更大的表面位置误差）。所以常用
+\begin{equation}
+w_t(\bm{x})=\frac{\cos\theta}{\|\bm{x}-\bm{o}\|^{2}},
+\end{equation}
+其中 $\theta$ 是射线方向与表面法向的夹角。工程上还会给累计权重设上限 $W\le W_{\max}$，使得``很久以前的观测''权重不再增长，地图才能慢慢忘掉旧东西、适应环境变化。
+
+有了 $D(x)$ 的体素网格，用 Marching Cubes 在每个小立方体的 8 个角上找 $D$ 的零交叉点，插值出表面三角形，就得到网格模型。这就是``重建''。
+
+\begin{figure}[htbp]
+  \centering
+  \begin{tikzpicture}[x=1.1cm,y=1.0cm,font=\footnotesize]
+    % truncation band (drawn first, so the profile stays visible)
+    \fill[structurecolor!12] (1.6,-1.4) rectangle (4.4,1.4);
+    % axes
+    \draw[->, thick] (-0.2,0) -- (6.4,0) node[label, right] {沿射线的距离};
+    \draw[->, thick] (0,-2.0) -- (0,2.0) node[label, above] {$D$};
+    % truncation bounds
+    \draw[dashed, black!45] (0,1.4) -- (6.2,1.4);
+    \draw[dashed, black!45] (0,-1.4) -- (6.2,-1.4);
+    \node[label, anchor=west] at (6.25,1.4) {$+\mu$};
+    \node[label, anchor=west] at (6.25,-1.4) {$-\mu$};
+    % surface
+    \draw[dashed, structurecolor, thick] (3.0,-2.0) -- (3.0,2.0);
+    \node[label, structurecolor, above] at (3.0,2.0) {表面};
+    % tsdf profile (drawn last)
+    \draw[very thick, red!60!black] (0.1,1.4) -- (1.6,1.4) -- (3.0,0) -- (4.4,-1.4) -- (6.2,-1.4);
+    \node[label, align=center] at (2.75,-1.0) {截断区\\$|D|\le\mu$};
+    \node[label, align=center] at (5.35,0.65) {远景\\截断为常数};
+  \end{tikzpicture}
+  \caption{TSDF 沿一条射线的剖面。表面处 $D=0$，表面前方 $D>0$、后方 $D<0$；只有 $|D|\le\mu$ 的薄壳被保留（有色区域），远处一律截断为 $\pm\mu$。多帧观测在薄壳内做加权平均。}\label{fig:14-tsdf}
+\end{figure}
+
+\section{ESDF：欧氏符号距离场}\label{sec:14-esdf}
+
+TSDF 的距离是``沿射线的近似距离''，够用来重建表面，但不够用来做规划——轨迹优化需要的是``空间中每一点到最近障碍的\textbf{欧氏}距离''。这就是 ESDF（Euclidean Signed Distance Field）。
+
+\begin{definition}[ESDF]
+记障碍物点集为 $\mathcal{O}$（通常取 TSDF 的零交叉面或占据体素），ESDF 在每个点 $\bm{x}$ 处的值定义为
+\begin{equation}
+d(\bm{x})=\min_{\bm{y}\in\mathcal{O}}\norm{\bm{x}-\bm{y}}_2 ,
+\end{equation}
+即 $\bm{x}$ 到最近障碍点的欧氏距离；符号约定为障碍外部为正、内部为负（只取外部时称为距离场）。
+\end{definition}
+
+ESDF 最关键的性质是它的\textbf{梯度}。设 $\bm{x}$ 的最近障碍点是 $\bm{y}^{\star}$，则 $d(\bm{x})=\norm{\bm{x}-\bm{y}^{\star}}_2$。直接对 $\bm{x}$ 求导（$\bm{y}^{\star}$ 是使距离最小的点，由包络定理可以当作常数处理）：
+\begin{equation}
+\nabla d(\bm{x})
+=\frac{\bm{x}-\bm{y}^{\star}}{\norm{\bm{x}-\bm{y}^{\star}}_2},
+\label{eq:14-esdf-grad}
+\end{equation}
+这是一个\textbf{单位向量}，方向是``从最近障碍指向 $\bm{x}$''。它有两个直接推论：第一，$\norm{\nabla d}=1$（处处成立，除了障碍边界上的奇点）；第二，沿着 $-\nabla d$ 走就是``最快远离障碍''的方向。
+
+这正是规划器想要的：在轨迹优化（第~\ref{ch:20-local-planning}~章）里，把``离障碍太近''写成惩罚项 $c(\bm{x})=\max(0,\,d_{\mathrm{safe}}-d(\bm{x}))^{2}$，它的梯度可以直接由 ESDF 给出，从而把轨迹``推离''障碍。没有 ESDF，就需要对每个轨迹点做最近邻查询，代价高且不连续。
+
+怎么高效算 ESDF？最直接的做法是对每个体素暴力搜索最近障碍点，复杂度 $O(N\cdot|\mathcal{O}|)$，不可接受。工程上有两类做法：一是\textbf{波前传播}（从障碍体素出发做 BFS，把距离值一层层推出去，即距离变换）；二是 Voxblox\cite{oleynikova2017voxblox} 的增量做法——先建 TSDF，再只在``新观测改变了的区域''重新计算 ESDF，未变化区域沿用旧值。后者让 ESDF 可以在机器人运动时实时维护，是目前 3D 导航系统的常用方案。
+
+\section{点云地图与地图管理}\label{sec:14-pointcloud}
+
+点云地图是最``原始''的地图：把每帧点云按位姿变换到世界系，拼起来即可。它信息最全（保留了全部几何细节），但也最重（一帧 10 万点、1000 帧就是 1 亿点，几十 GB）。所以实际系统必须做管理：
+
+\begin{itemize}
+  \item \textbf{体素降采样}：用第~\ref{ch:12-frontend}~章的体素栅格把点云稀疏化，通常按 $0.1\sim0.2\ \mathrm{m}$ 的体素保留质心，点云规模能降一到两个数量级。
+  \item \textbf{动态点清理}：环境里的行人、车辆会留下``鬼影''。常用做法是记录每个点的``被再次观测次数''，只保留被多帧一致观测到的点；或者用可见性检查（从其他位姿看过去应该看得见，却看不见的点判为动态）。
+  \item \textbf{分块存储}：把地图切成块（如 $10\ \mathrm{m}\times10\ \mathrm{m}$），每块独立保存与加载。这样定位时只加载机器人附近的块，内存可控。
+  \item \textbf{地图格式}：PCD 保存点云（含强度、法向），PLY 保存网格。工程上还要保存位姿图、关键帧索引、地图坐标系原点等元信息——这就是``地图包''（map bundle）的概念，第~\ref{ch:23-zlocalization}~章会讲 Z-Localization 如何用先验地图包做定位。
+\end{itemize}
+
+\section{地图精度评价}\label{sec:14-eval}
+
+建完图，怎么判断``好不好''？单看``好看不好看''不行，要量化。常用的四个指标如下。
+
+\textbf{（1）覆盖率（coverage）。}重建出来的表面占真实表面的比例。做实验时用激光测距仪或全站仪测量若干条已知边长，与地图上量出的长度比较。
+
+\textbf{（2）点到面误差（point-to-plane RMSE）。}把重建点云与真值点云（或 CAD 模型）配准后，计算每个重建点到真值表面的距离，取均方根：
+\begin{equation}
+\mathrm{RMSE}=\sqrt{\frac{1}{N}\sum_{i=1}^{N}\big(\bm{n}_i^{\top}(\bm{p}_i-\bm{q}_i)\big)^{2}},
+\end{equation}
+其中 $\bm{p}_i$ 是重建点，$\bm{q}_i$ 是真值表面上离它最近的点，$\bm{n}_i$ 是该处法向。它衡量``表面准不准''，通常要求与传感器噪声同量级（厘米级）。
+
+\textbf{（3）地图一致性。}机器人绕一圈回到起点时，同一面墙会被观测两次。若两次重建的墙位置重合，地图是一致的；若错开，就会出现``双墙''（double wall）。一个实用的量化方法是测量同一面墙在重复观测处的厚度：理想情况下应等于单帧点云噪声，若明显更厚，说明回环后仍有残差。
+
+\textbf{（4）地图可用性。}最终标准还是``下游任务能不能用''：全局规划能否找到路、局部避障会不会撞、定位重定位能否成功。工程上要拿真实场景跑一遍导航全流程，而不是只看点云好看不好看。
+
+\begin{summary}
+\begin{enumerate}
+  \item 地图的形式由用途决定（表~\ref{tab:14-map-usage}）：定位要似然（点云、栅格），规划要代价（栅格、ESDF），重建要距离（TSDF）。
+  \item 占据栅格存``被占据的概率''；由贝叶斯公式与观测独立性假设，可推出 log-odds 的加性更新 $l_t=l_{t-1}+l(m\mid\bm{z}_t)-l(m)$（式~\eqref{eq:14-logodds-update}），把连乘变成连加，并可用截断保持地图可修改。
+  \item 命中/空闲增量由逆观测模型给出（常用 $p_{\mathrm{occ}}=0.7$、$p_{\mathrm{free}}=0.3$，增量 $\pm0.847$）；3 次命中后概率约 $0.93$，10 次后约 $0.9998$。
+  \item 八叉树用``递归八分 + 同质剪枝''把 3D 占据地图的内存从百 MB 量级降到几 MB 量级，深度 $d=\lceil\log_2(L/r)\rceil$。
+  \item TSDF 存带符号、截断的距离；多帧融合的递归式~\eqref{eq:14-tsdf-fusion} 正是加权最小二乘解~\eqref{eq:14-tsdf-closed} 的等价递推，权重常取 $\cos\theta/\|\bm{x}-\bm{o}\|^{2}$。
+  \item ESDF 是到最近障碍的欧氏距离，梯度 $\nabla d$ 是单位向量、指向远离障碍的方向（式~\eqref{eq:14-esdf-grad}），因此可直接为规划提供``推离障碍''的方向；Voxblox 用增量更新维护它。
+  \item 点云地图要配合降采样、动态点清理、分块存储与地图包管理；地图质量要用覆盖率、点到面 RMSE、一致性与下游可用性来评价。
+\end{enumerate}
+
+
+\end{summary}
+
+\begin{problemset}
+  \item 若把 $p_{\mathrm{occ}}$ 从 $0.7$ 改成 $0.9$，命中一次的 log-odds 增量是多少？同样的 ``3 次命中'' 后概率变成多少？这说明逆观测模型的取值如何影响地图``反应速度''。
+  \item 式~\eqref{eq:14-logodds-update} 中假设了观测独立性。现实中同一面墙在相近位置被连续观测，这个假设成立吗？如果不成立，地图会出现什么偏差？
+  \item 为什么八叉树的剪枝要以``8 个子节点状态相同''为条件？如果只比较其中 7 个会怎样？
+  \item 在式~\eqref{eq:14-tsdf-fusion} 中，若某天开始权重不再增加（$W$ 达到上限），新观测的影响会怎样体现？这与``地图要能变旧''的准则有什么关系？
+  \item 证明 $\nabla d(\bm{x})$ 是单位向量。提示：对 $d^{2}(\bm{x})=\norm{\bm{x}-\bm{y}^{\star}}^{2}$ 求导，并注意 $\bm{y}^{\star}$ 是最小值点。
+  \item 你的机器人在一个 $200\ \mathrm{m}^{2}$ 的场地里建 2D 栅格图，分辨率 $5\ \mathrm{cm}$。估算纯占据概率存储需要多少内存；若改用 log-odds 并限制最大范围为 $120\ \mathrm{m}\times120\ \mathrm{m}$，又是多少？
+\end{problemset}
+
+\begin{reading}
+\begin{enumerate}
+  \item Thrun, Burgard, Fox，《Probabilistic Robotics》第 9 章\cite{thrun2005probabilistic}：占据栅格与 log-odds 更新的标准参考，本章的推导与它一致。
+  \item Hornung 等，OctoMap\cite{hornung2013octomap}：八叉树的工程实现，重点看节点概率模型与剪枝策略。
+  \item Curless \& Levoy\cite{curless1996tsdf}：TSDF 的原始论文，加权融合与表面提取的经典做法。
+  \item Oleynikova 等，Voxblox\cite{oleynikova2017voxblox}：从 TSDF 增量构建 ESDF，是第~\ref{ch:20-local-planning}~章轨迹优化常用的地图。
+\end{enumerate}
+
+\end{reading}

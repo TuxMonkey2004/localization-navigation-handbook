@@ -1,0 +1,390 @@
+\chapter{3D 激光惯性里程计：从 LOAM 到 LIO}\label{ch:16-lio-evolution}
+
+\usetikzlibrary{arrows.meta, positioning, calc, shapes.geometric}
+
+\chapterintro{第~\ref{ch:15-cartographer}~章的 Cartographer 只处理机器人在平面内运动的情形（状态只有 $x,y,\theta$ 三个自由度）。可一旦机器人加上云台、上下坡、被撞飞，或者换成无人机、机械臂，运动就是 6 自由度的。本章把问题升到三维，回答三个问题：为什么 3D 激光必须要和 IMU 一起用？一帧点云内部的运动畸变到底有多严重、怎么消掉？从 2014 年的 LOAM 到 2023 年的 Point-LIO，这十年里每个算法究竟解决了前一个算法的什么毛病？读完本章，你应该能看懂任意一个 LIO 开源包的数据流，并能判断"我这个场景该选哪一个"。本章只讲演化脉络与共性原理，FAST-LIO2 和 Point-LIO 的逐行数学推导放在第~\ref{ch:17-advanced-lio}~章。}
+
+\section{为什么需要激光惯性里程计}\label{sec:16-why}
+
+\subsection{2D 激光 SLAM 的三条隐含假设}
+
+Cartographer~\cite{hess2016cartographer} 之所以能把计算量压到嵌入式平台可接受的水平，靠的是三条假设：机器人只在水平面内运动、激光只有一个扫描平面、地图用一个二维栅格就能表达。这三条在 RoboMaster 的场地上其实已经摇摇欲坠：
+
+\begin{enumerate}
+  \item 哨兵和步兵会过坡道、飞坡、被撞得整个车身翻滚，云台的 pitch 角也可能连续变化，此时"$z$ 坐标恒定、roll/pitch 恒为零"直接失效；
+  \item 单线激光只切出场景的一个水平薄片，两块高度不同的挡板在 2D 地图上完全一样，机器人无法区分"前面是 20\,cm 高的坎"还是"前面是三米高的墙"；
+  \item 换成 3D 激光后，一帧点云动辄 $10^4\sim10^5$ 个点，比 2D 单线激光多两个数量级，Cartographer 那套"子图 + 分支定界"的暴力搜索代价立刻变得不可接受。
+\end{enumerate}
+
+所以 3D 场景需要 6 自由度的位姿 $(R,\bm{p})\in\SE(3)$（李群的定义见第~\ref{ch:02-math}~章），计算量又要求我们不能对全部点做穷举搜索。这两条约束一起，把 3D 激光里程计推向了"用 IMU 提供运动先验、用点云提供几何约束"的路子。
+
+\subsection{纯激光里程计的三种失效模式}
+
+回忆第~\ref{ch:07-lidar-odom}~章的扫描匹配：给定两帧点云，通过最小化点到点或点到面残差求相对位姿。它的信息矩阵是 $\bm{H}^{\top}\bm{H}$（$\bm{H}$ 是残差对位姿的雅可比堆叠），当这个矩阵在某个方向上接近奇异时，那个方向上的位姿就解不准，这叫\textbf{几何退化}（degeneracy）。具体有三种典型情形：
+
+\begin{itemize}
+  \item \textbf{长走廊、隧道、平行墙}：沿走廊轴线方向平移，点云外观几乎不变，$\bm{H}^{\top}\bm{H}$ 沿该方向的特征值接近零，机器人会以为"自己没动"，位置估计沿轴线无界漂移；
+  \item \textbf{开阔场地或单一平面}：所有点几乎落在一个平面上，只能约束垂直于平面的平移和两个转角，沿平面内的两个平移和绕平面法向的转角都约束不足；
+  \item \textbf{剧烈运动与稀疏场景}：相邻两帧重叠区域太小，或者机器人转得太快导致两帧几乎没有共视点，匹配的初值差，ICP 类算法会收敛到错误的局部极小。
+\end{itemize}
+
+第二种失效其实不是几何问题，而是时间问题：3D 激光的"一帧"并不是一个瞬间，而是几十到一百毫秒的连续采集，帧内机器人在动，点云自己就被"拉花"了。这就是下一节要讲的去畸变。
+
+\subsection{IMU 补上了什么}
+
+IMU 的特点是频率高（$100\sim1000$\,Hz）、短时间内的角速度和比力测量准，但积分会漂移。这两个特点和激光恰好互补，见表~\ref{tab:16-complement}。
+
+\begin{table}[htbp]
+  \centering
+  \caption{激光与 IMU 的互补性}\label{tab:16-complement}
+  \small
+  \begin{tabular}{lll}
+    \toprule
+    特性 & 3D 激光 & IMU \\
+    \midrule
+    输出频率 & $10$\,Hz（一帧 $100$\,ms） & $100\sim1000$\,Hz \\
+    擅长的时间尺度 & $>0.1$\,s 的绝对几何 & $<0.1$\,s 的高动态运动 \\
+    提供的量 & 场景几何（绝对约束） & 角速度、比力（增量约束） \\
+    随时间的误差 & 缓慢漂移、可回环消除 & 二重积分，秒级发散 \\
+    典型失效 & 几何退化、帧内畸变、快速旋转 & 饱和、冲击、温度漂移 \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+用两个数字感受一下 IMU 靠不住的程度：一块常见 MEMS 陀螺的零偏若为 $0.01$\,rad/s（约 $0.57^{\circ}$/s），纯积分 $10$\,s 就会产生 $0.01\times10\times180/\pi\approx5.7^{\circ}$ 的姿态误差；加速度计零偏若为 $0.02\,\mathrm{m/s^2}$，同样的 $10$\,s 内位置误差为 $\frac{1}{2}\times0.02\times10^2=1$\,m。反过来，激光在 $100$\,ms 内几乎不可能漂移，所以把两者放进同一个估计器，正好让 IMU 负责"帧内"、激光负责"帧间"。
+
+\begin{definition}[激光惯性里程计 LIO]
+以 3D 激光点云和 IMU 测量为输入，在一个估计器中联合估计载体位姿 $T_{WB}$（以及速度、IMU 零偏等辅助状态）并增量维护地图的算法，称为\textbf{激光惯性里程计}（LiDAR-Inertial Odometry，LIO）。若激光与 IMU 的原始测量被送进同一个估计器的同一次状态更新中，称为\textbf{紧耦合}；若先由激光独立的扫描匹配算出位姿，再把这个位姿当作观测去修正 IMU 的递推结果，则称为\textbf{松耦合}。两者的数学差别在 \S\ref{sec:16-tight} 展开。
+\end{definition}
+
+\begin{keybox}{一句话记住 LIO 的价值}
+纯激光里程计在几何退化处"不知道自己错了"，纯 IMU 在几秒后"必然错"。LIO 把 IMU 的高频运动先验和激光的绝对几何约束放进同一个概率模型，使二者互相纠错：退化方向上靠 IMU 撑住，IMU 漂移靠激光拉回。
+\end{keybox}
+
+\section{去畸变：把一帧点云对齐到同一时刻}\label{sec:16-deskew}
+
+\subsection{问题有多严重}
+
+以常见的机械式 16 线激光为例：转速 $10$\,Hz，即一帧 $100$\,ms；一帧内每线约 $1800$ 个点，相邻点间隔约 $55\,\mu$s。也就是说，一帧点云里第一个点和最后一个点的采集时刻相差 $100$\,ms。若机器人此时角速度为 $90^{\circ}$/s，这 $100$\,ms 内姿态变化 $9^{\circ}$；若点距离 $r=5$\,m，则帧首帧尾的点在空间上会被错开约 $r\sin9^{\circ}\approx0.78$\,m。如果机器人同时以 $2$\,m/s 前进，平移误差再叠加 $0.2$\,m。而地图体素分辨率通常只有 $0.1\sim0.2$\,m，这样的畸变会让整个配准直接崩溃。
+
+\begin{definition}[运动畸变与去畸变]
+激光雷达一帧点云中的每个点都带有自己的采集时刻 $t_i$（相对扫描起始时刻的偏移）。由于载体在帧内运动，若把整帧点云当作同一时刻 $t_{\mathrm{ref}}$ 的刚体扫描来处理，就会引入系统性形变，称为\textbf{运动畸变}。按每个点自己的时刻把它的坐标变换到同一参考时刻 $t_{\mathrm{ref}}$ 的过程，称为\textbf{去畸变}（deskewing / motion compensation）。
+\end{definition}
+
+\subsection{去畸变公式}
+
+设 $t_i$ 时刻点 $i$ 在雷达系中的坐标为 $\bm{p}_i^{L}$，该时刻雷达到世界系的位姿为 $T_{WL}(t_i)=(R(t_i),\bm{p}(t_i))$。那么该点在世界上真正的位置是
+\begin{equation}\label{eq:16-world-point}
+  \bm{p}_i^{W}=R(t_i)\,\bm{p}_i^{L}+\bm{p}(t_i).
+\end{equation}
+去畸变就是把同一批世界点重新表达在参考时刻的雷达系中。把式~\eqref{eq:16-world-point} 反解，得到
+\begin{equation}\label{eq:16-deskew}
+  \bm{p}_i^{L_{\mathrm{ref}}}=T_{WL}(t_{\mathrm{ref}})^{-1}\bm{p}_i^{W}
+  =R(t_{\mathrm{ref}})^{\top}\Bigl(R(t_i)\bm{p}_i^{L}+\bm{p}(t_i)-\bm{p}(t_{\mathrm{ref}})\Bigr).
+\end{equation}
+式~\eqref{eq:16-deskew} 的几何含义很直白：先把点搬回世界系，再用参考时刻的位姿搬进参考帧。若帧内没有运动（$R(t_i)=R(t_{\mathrm{ref}})$，$\bm{p}(t_i)=\bm{p}(t_{\mathrm{ref}})$），它就退化成恒等变换，说明去畸变只在"帧内动"的情况下才需要。
+
+\subsection{匀速模型与 IMU 辅助模型}
+
+式~\eqref{eq:16-deskew} 需要帧内任意时刻的位姿 $T_{WL}(t)$，而我们只在一个帧边界上知道它。最简单的近似是\textbf{匀速模型}：假设帧内线速度和角速度恒定，用前后两帧的位姿插值：
+\begin{equation}\label{eq:16-constant-velocity}
+  R(t)=R(t_0)\exp\!\Bigl(s\,\bigl[\mathrm{Log}(R(t_0)^{\top}R(t_1))\bigr]_\times\Bigr),\qquad
+  \bm{p}(t)=(1-s)\bm{p}(t_0)+s\,\bm{p}(t_1),\quad s=\frac{t-t_0}{t_1-t_0},
+\end{equation}
+其中 $\mathrm{Log}(\cdot)$ 是 $\SO(3)$ 到旋转向量的对数映射（见第~\ref{ch:02-math}~章），$s$ 是归一化时间。式~\eqref{eq:16-constant-velocity} 就是 $\SE(3)$ 上的线性插值：平移线性、旋转走测地线（SLERP）。
+
+匀速模型在加速度不大时够用。它的误差量级可以估出来：帧内加速度 $a=5\,\mathrm{m/s^2}$、时间 $0.1$\,s 时，位置上的二阶误差约 $\frac12 a \Delta t^2=2.5$\,cm，可以接受；但角加速度大或者有撞击时就不行了。
+
+更可靠的做法是用 IMU 把 $T_{WL}(t)$ 真正积分出来。对 IMU 相邻两个采样时刻 $t_\alpha,t_\beta$ 之间的测量做积分（积分公式在第~\ref{ch:06-imu}~章与第~\ref{ch:17-advanced-lio}~章给出），得到一串离散位姿 $\{T_{WL}(t_\alpha)\}$；对落在 $[t_\alpha,t_\beta]$ 内的点，再按式~\eqref{eq:16-constant-velocity} 在相邻两个 IMU 位姿之间插值即可。至于更精细的连续时间表示（例如把整条轨迹参数化为 B 样条再做三次插值），DLIO 等工作专门讨论了这一点~\cite{chen2023dlio}。实际工程中按"分段线性"处理已经能覆盖绝大多数场景。
+
+\begin{note}
+去畸变只需要帧内\textbf{相对}运动，不需要绝对位姿。IMU 零偏在 $100$\,ms 内造成的姿态漂移通常远小于 $0.1^{\circ}$，所以去畸变对零偏不敏感；这也是为什么即使零偏还没收敛，FAST-LIO2 一类算法也能先把点云去畸变。
+\end{note}
+
+\begin{figure}[htbp]
+  \centering
+  \begin{tikzpicture}[font=\footnotesize]
+    % 上半部分：真实场景，雷达从 A 移动到 B
+    \draw[thick, black!70] (0,0) -- (8,0) node[right]{实际墙面};
+    \fill[structurecolor] (2.0,2.2) circle (2pt) node[above right] {$A$（$t_0$ 时刻）};
+    \fill[structurecolor!55] (3.2,2.2) circle (2pt) node[above right] {$B$（$t_1$ 时刻）};
+    \draw[arrow] (2.0,2.2) -- (3.2,2.2);
+    \foreach \x in {0.6,1.5,2.4,3.3,4.2,5.1} {
+      \draw[black!35, thin] (2.0,2.2) -- (\x,0);
+    }
+    \node[label] at (0.4,-0.6) {(a) 雷达在帧内从 $A$ 平移到 $B$，同一堵墙被不同时刻“看到”};
+    % 下半部分：点云
+    \begin{scope}[yshift=-4.6cm]
+      \draw[black!25, dashed] (0.4,0.5) -- (7.6,0.5);
+      \node[label] at (7.9,0.5) {理想};
+      \foreach \x in {1,2,3,4,5,6,7} {
+        \fill[red!60!black] (\x,{0.5+0.10*(\x-4)*(\x-4)}) circle (1.2pt);
+      }
+      \foreach \x in {1,2,3,4,5,6,7} {
+        \fill[structurecolor] (\x,{0.5-0.22}) circle (1.2pt);
+      }
+      \node[label] at (0.4,-0.1) {(b) 红点：整帧被当作同一时刻，沿墙“拉弯”；蓝点：去畸变后回到一条直线};
+    \end{scope}
+  \end{tikzpicture}
+  \caption{帧内运动造成的点云畸变。雷达在采集一帧的过程中从 $A$ 走到 $B$，若不做补偿，同一堵平面墙会在点云中被弯成一条弧线；按每个点的时间戳去畸变后，点重新落到同一平面上。}\label{fig:16-deskew}
+\end{figure}
+
+\section{演化时间线：从 LOAM 到 Point-LIO}\label{sec:16-history}
+
+十年间的路线可以概括成一句话：\textbf{特征越来越少，点用得越来越多，更新越来越频繁}。LOAM 靠人工设计的线/面特征做两阶段匹配；LeGO-LOAM 用地面分割把特征做得更可靠、更省算力；LIO-SAM 把估计框架换成因子图并首次把 IMU 与激光紧耦合地写进因子图；FAST-LIO 把后端换成迭代 EKF，用紧耦合把点面残差直接作用于状态；FAST-LIO2 干脆去掉特征提取，直接对原始点做配准，并配增量式 iKD-Tree 让"每帧都对新点做最近邻"变得便宜；Point-LIO 再进一步，把一个点当成一次更新，彻底摆脱"帧"的束缚。
+
+\begin{figure}[htbp]
+  \centering
+  \begin{tikzpicture}[font=\footnotesize]
+    \draw[-{Stealth[length=2.5mm]}, thick, black!70] (0,0) -- (13.8,0);
+    \foreach \x/\yr/\nm in {
+      0.7/2014/{LOAM}, 2.9/2018/{LeGO-LOAM}, 5.1/2020/{LIO-SAM},
+      7.1/2021/{FAST-LIO}, 9.1/2022/{FAST-LIO2},
+      10.9/2023/{Point-LIO}, 12.7/2024/{LIVO2}}{
+      \draw[thick, structurecolor] (\x,-0.10) -- (\x,0.10);
+      \fill[structurecolor] (\x,0) circle (1.6pt);
+      \node[above=3pt, font=\scriptsize, align=center] at (\x,0) {\nm};
+      \node[below=3pt, font=\scriptsize, text=black!60] at (\x,0) {\yr};
+    }
+    \node[font=\scriptsize, text=black!60, align=left] at (6.8,1.15) {特征法 $\longrightarrow$ 直接法};
+    \node[font=\scriptsize, text=black!60, align=left] at (6.8,-0.95) {滤波 $\longleftrightarrow$ 优化};
+  \end{tikzpicture}
+  \caption{3D 激光惯性里程计的演化主线。VoxelMap（2022）与 Point-LIO（2023）几乎同时探索"地图表示"与"更新粒度"两个方向；2022 年之后视觉信息也被引入，形成 FAST-LIVO、R3LIVE 等 LVI 系统。}\label{fig:16-timeline}
+\end{figure}
+
+\begin{table}[htbp]
+  \centering
+  \caption{代表性 LIO 系统一览}\label{tab:16-milestones}
+  \footnotesize
+  \begin{tabular}{lllll}
+    \toprule
+    方法 & 年份 & 核心贡献 & 后端 & 典型场景 \\
+    \midrule
+    LOAM~\cite{zhang2014loam} & 2014 & 线/面特征 + 帧间帧到图两阶段 & 优化 & 无 IMU 的室外测绘 \\
+    LeGO-LOAM~\cite{shan2018lego} & 2018 & 地面分割 + 聚类 + 两步优化 & 优化 & 嵌入式、起伏地面 \\
+    LIO-SAM~\cite{shan2020liosam} & 2020 & IMU 紧耦合 + 因子图 + 回环/GPS & 因子图 & 有回环需求的室外 \\
+    FAST-LIO~\cite{xu2021fastlio} & 2021 & 紧耦合 IEKF，点面残差 & IEKF & 高动态、室内外通用 \\
+    FAST-LIO2~\cite{xu2022fastlio2} & 2022 & 去特征 + 原始点配准 + iKD-Tree & IEKF & 通用主力方案 \\
+    VoxelMap~\cite{yuan2022voxelmap} & 2022 & 自适应体素 + 概率平面地图 & IEKF & 内存敏感、结构化场景 \\
+    Point-LIO~\cite{he2023pointlio} & 2023 & 逐点更新、抗 IMU 饱和 & 逐点 KF & 超高速旋转、IMU 量程小 \\
+    FAST-LIVO2~\cite{yuan2024fastlivo2} & 2024 & 激光-惯性-视觉直接法紧耦合 & IEKF & 退化场景 + 纹理丰富 \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+\subsection{LOAM（2014）：两阶段、特征法、无 IMU}
+
+LOAM~\cite{zhang2014loam} 是这一支的鼻祖。它先按曲率把每帧点云分成"线特征"（曲率大，如墙角、杆子）和"面特征"（曲率小，如墙面、地面），然后用点到线、点到面两种残差做配准。它的关键设计是\textbf{两阶段分工}：高频（约 $10$\,Hz）的里程计只拿当前帧和上一帧匹配，保证实时；低频（约 $1$\,Hz）的建图模块把当前帧和已经建好的地图匹配，消除累积漂移。两阶段之间用位姿变换把新帧"投"进地图坐标系，避免了地图不断被重写。
+
+LOAM 的局限也很清楚：没有 IMU，帧内运动畸变只能用匀速模型补偿，机器人急转时点云会被拉花；特征提取依赖人工阈值，场景纹理弱或点数稀疏时特征不稳定；两阶段之间的耦合只是"传位姿"，本质仍是松耦合。
+
+\subsection{LeGO-LOAM（2018）：先分割再匹配}
+
+LeGO-LOAM~\cite{shan2018lego} 的出发点是"嵌入式平台算力不够"。它做了三件事：（1）\textbf{地面分割}：用相邻点的俯仰角把地面点分离出来；（2）\textbf{点云聚类}：对非地面点做聚类，去掉小于 30 点的杂簇，抑制噪声；（3）\textbf{两步优化}：先用地面点估计 $(z,\mathrm{roll},\mathrm{pitch})$，再用非地面点估计 $(x,y,\mathrm{yaw})$，把 6 自由度问题拆成两个 3 自由度问题，计算量大幅下降。代价是：强依赖地面假设，机器人在空中或者地面点不足时失效；两步拆分也丢掉了部分耦合信息。
+
+\subsection{LIO-SAM（2020）：紧耦合 + 因子图}
+
+LIO-SAM~\cite{shan2020liosam} 是"滤波 vs 优化"这条分水岭上的代表作。它把 IMU 与激光首次真正紧耦合地放进一个因子图，用 GTSAM 求解。图中共有四类因子（见图~\ref{fig:16-factorgraph}）：IMU 预积分因子、激光里程计因子（点到面配准得到的相对位姿）、GPS 因子、回环因子。整个问题写成最大后验估计：
+\begin{equation}\label{eq:16-map}
+  \mathcal{X}^{\star}=\argmin_{\mathcal{X}}\;\frac12\sum_{k}\norm{\bm{r}_k(\mathcal{X})}^{2}_{\bm{\Sigma}_k},
+\end{equation}
+其中 $\mathcal{X}=\{T_1,\dots,T_N\}$ 是所有关键帧位姿，$\bm{r}_k$ 是第 $k$ 个因子的残差（例如预积分因子预测的相对位姿与状态中相对位姿之差），$\norm{\bm{r}}^{2}_{\bm{\Sigma}}=\bm{r}^{\top}\bm{\Sigma}^{-1}\bm{r}$ 是马氏距离的平方（定义见第~\ref{ch:02-math}~章）。式~\eqref{eq:16-map} 用高斯-牛顿迭代求解，每次迭代解一个稀疏线性方程组（细节见第~\ref{ch:13-backend}~章）。
+
+因子图相对滤波器的根本优势是：\textbf{线性化点可以反复修正}。滤波器一旦把某一帧线性化掉、边缘化掉，就再也改不了；而因子图保留历史状态，回环时可以把整条轨迹一起拉直。代价是计算量随关键帧数量增长，必须靠滑窗边缘化控制规模。
+
+\begin{figure}[htbp]
+  \centering
+  \begin{tikzpicture}[font=\footnotesize]
+    % 状态节点
+    \foreach \i in {0,...,4} {
+      \node[circle, draw=structurecolor, thick, fill=white, inner sep=1.4pt] (x\i) at (2*\i,0) {$x_{\i}$};
+    }
+    % IMU 预积分因子（上方方块）
+    \foreach \i [evaluate=\i as \j using int(\i+1)] in {0,...,3} {
+      \node[draw=structurecolor!70, fill=structurecolor!10, minimum size=3.2mm, inner sep=0pt] (f\i) at ({2*\i+1},1.2) {};
+      \draw[black!60] (x\i) -- (f\i);
+      \draw[black!60] (x\j) -- (f\i);
+    }
+    \node[label] at (4,1.85) {IMU 预积分因子 $f^{\mathrm{imu}}$};
+    % 激光里程计因子（下方方块）
+    \foreach \i in {1,2,3} {
+      \node[draw=structurecolor!70, fill=structurecolor!10, minimum size=3.2mm, inner sep=0pt] (l\i) at ({2*\i},-1.2) {};
+      \draw[black!60] (x\i) -- (l\i);
+    }
+    \node[label] at (4,-1.85) {激光里程计因子 $f^{\mathrm{lidar}}$};
+    % GPS 因子
+    \node[draw=orange!80!black, fill=orange!80!black!12, minimum size=3.2mm, inner sep=0pt] (g) at (4,2.5) {};
+    \draw[black!60] (x2) -- (g);
+    \node[label] at (5.4,2.5) {GPS 因子（可选）};
+    % 回环因子
+    \node[draw=red!60!black, fill=red!60!black!10, minimum size=3.2mm, inner sep=0pt] (c) at (4,-2.6) {};
+    \draw[black!60, dashed] (x0) to[bend right=28] (c);
+    \draw[black!60, dashed] (x4) to[bend left=28] (c);
+    \node[label] at (5.9,-2.6) {回环因子};
+  \end{tikzpicture}
+  \caption{LIO-SAM 的因子图结构。圆形是待估状态（关键帧位姿），方块是因子（约束）。IMU 预积分因子约束相邻帧之间的相对运动，激光里程计因子给出相邻帧间的相对位姿观测，回环因子把相距很远的帧连起来，GPS 因子提供绝对位置。}\label{fig:16-factorgraph}
+\end{figure}
+
+\subsection{FAST-LIO（2021）与 FAST-LIO2（2022）：把后端换成迭代 EKF}
+
+FAST-LIO~\cite{xu2021fastlio} 的贡献是把"紧耦合"做到极致：状态里不仅有姿态、位置、速度、零偏，还包含重力方向；观测不再是"位姿"，而是每个点与地图平面的点到面残差；求解器是\textbf{迭代扩展卡尔曼滤波}（IEKF），在一次更新里反复线性化、反复重新建立数据关联。为了保证实时，它引入了流形上的迭代公式，让每次迭代的更新量保持在切空间里，避免了四元数归一化之类的数值问题。
+
+FAST-LIO2~\cite{xu2022fastlio2} 做了一个看起来很小、实际上影响深远的决定：\textbf{去掉特征提取}。既然点到面残差已经足够，为什么还要花时间算曲率、挑特征？它直接拿降采样后的原始点云去和地图配准，配合\textbf{增量式 KD 树}（iKD-Tree）——地图点可以动态插入、惰性删除、按包围盒批量操作，不必每帧重建整棵树。这一改动同时带来了三个好处：一是省掉了特征提取的时间，二是弱纹理、非结构化场景也能用，三是原始点携带的信息比几百个特征点丰富得多。
+
+\begin{keybox}{FAST-LIO 系列的设计哲学}
+"不要为了省计算量而丢信息。"在 CPU 上，一个点到面残差的计算只要几十次浮点运算，而丢掉的几何信息可能让配准在退化场景下失败。FAST-LIO2 用更便宜的数据结构（iKD-Tree）换来了"用全部点"的奢侈。
+\end{keybox}
+
+\subsection{Point-LIO（2023）与 VoxelMap（2022）：两个方向的突破}
+
+Point-LIO~\cite{he2023pointlio} 质疑了"帧"这个概念本身：为什么一定要等一帧点云攒齐再更新？它让\textbf{每个点一到就做一次更新}，点的时间戳直接用于状态传播，因此状态更新的频率等于点的频率（可达 $10^5$\,Hz 量级），并且天然免疫 IMU 饱和——当 IMU 读数不可信时，状态靠逐点的激光观测一步一步拉回来。VoxelMap~\cite{yuan2022voxelmap} 走的是地图表示路线：不用点云地图，而用\textbf{自适应体素}——每个体素里的点如果近似共面，就只存一个平面参数和它的协方差；不够平就继续八叉树细分裂开。这样地图又小又快，还能给出平面的不确定性。两者都会在第~\ref{ch:17-advanced-lio}~章展开。
+
+\subsection{视觉-激光-惯性：FAST-LIVO、R3LIVE、LVI-SAM}
+
+激光在几何退化（长走廊、纯平面墙）时无解，而相机恰好能提供纹理约束；相机在弱光、无纹理、快速运动时失效，激光恰好不受影响。于是 2021 年之后出现了一批 LVI 系统：LVI-SAM~\cite{shan2021lvisam} 用两个因子图（视觉-惯性和激光-惯性）互相提供初值；R3LIVE~\cite{lin2022r3live} 同时建几何地图和视觉纹理地图；FAST-LIVO~\cite{yuan2022fastlivo} 与 FAST-LIVO2~\cite{yuan2024fastlivo2} 把点到面残差与光度误差放进同一个 IEKF 中做直接法紧耦合。它们的共性是：状态估计的骨架仍然是 LIO，视觉只是"多一类残差"。本书只在第~\ref{ch:17-advanced-lio}~章用一小节说明其定位，不展开推导。
+
+\section{两条技术路线：特征法与直接法、滤波与优化}\label{sec:16-routes}
+
+把上面这些方法按两个维度切开，就得到表~\ref{tab:16-routes}。这两个维度经常被混为一谈，其实它们回答的是完全不同的两个问题：\textbf{用什么残差}（特征法 vs 直接法）和\textbf{用什么估计框架}（滤波 vs 优化）。
+
+\begin{table}[htbp]
+  \centering
+  \caption{LIO 方法的二维分类}\label{tab:16-routes}
+  \small
+  \begin{tabular}{lll}
+    \toprule
+    & 滤波（递归） & 优化（因子图/批量） \\
+    \midrule
+    特征法 & FAST-LIO（线/面点 + IEKF） & LOAM、LeGO-LOAM、LIO-SAM \\
+    直接法 & FAST-LIO2、Point-LIO、VoxelMap & 较少见（需把配准残差写成因子） \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+\textbf{特征法 vs 直接法}。特征法先挑出少量"好"的点（线点、面点），只对这些点建残差；直接法对全部（降采样后的）点建残差。前者的好处是残差数量少、每次迭代便宜，坏处是特征提取的阈值对场景敏感，且在结构化程度低的场景里挑不出特征；后者好处是信息完整、对场景没有假设，坏处是点数多，必须靠高效的数据结构（iKD-Tree、体素哈希）和降采样来控制计算量。值得注意的是，"直接法"在 LIO 语境里指的是直接使用原始点，而不是视觉里的"直接法"（不提取特征、直接最小化光度误差），两者思想相通但形式不同。
+
+\textbf{滤波 vs 优化}。滤波（EKF/IEKF）只维护当前时刻的状态和协方差，来一帧就"吃掉"一帧，计算量与历史长度无关；优化（因子图）保留全部关键帧，一次性求解所有状态，计算量随规模增长，但可以反复线性化、天然支持回环和全局一致性。第~\ref{ch:09-fusion}~章和第~\ref{ch:13-backend}~章分别讲过两种框架的概率基础，这里只强调一点：\textbf{在里程计这个局部问题上，二者的精度差距远小于在 SLAM 全局问题上的差距}。里程计只需要局部一致，滤波的"不能回头改"并不致命；而一旦要做回环，滤波器就必须额外加一个位姿图模块，否则误差永远补不回来。
+
+\section{紧耦合到底“紧”在哪}\label{sec:16-tight}
+
+\subsection{两种耦合的数学形式}
+
+\paragraph{松耦合（级联）} 的做法是两级估计。第一步，独立的扫描匹配给出位姿观测 $\bm{z}=T_{k}^{L}$ 及其协方差 $\bm{\Sigma}_L$；第二步，把 IMU 递推结果当作先验，把 $\bm{z}$ 当作观测做一次 EKF：
+\begin{equation}\label{eq:16-loose}
+  \begin{aligned}
+    \bar{\bm{x}}_k&=\bm{f}(\bm{x}_{k-1},\bm{u}_k), &\bar{\bm{P}}_k&=\bm{F}\bm{P}_{k-1}\bm{F}^{\top}+\bm{Q},\\
+    \bm{K}&=\bar{\bm{P}}_k\bm{H}^{\top}\bigl(\bm{H}\bar{\bm{P}}_k\bm{H}^{\top}+\bm{\Sigma}_L\bigr)^{-1}, & \bm{H}&=\begin{bmatrix}\bm{I}_6&\bm{0}_{6\times12}\end{bmatrix}.
+  \end{aligned}
+\end{equation}
+式~\eqref{eq:16-loose} 中 $\bm{H}$ 只把状态里的位姿部分"取出来"和观测比较，观测维度是 6（位姿）。这确实是紧耦合公式的简化版，但信息流是单向的：扫描匹配不知道 IMU 的存在，它算出来的 $\bm{\Sigma}_L$ 也没有考虑 IMU 先验；而 IMU 只知道"激光说我在这个位姿"，不知道这个位姿是靠哪几个点、在哪个方向上算出来的。
+
+\paragraph{紧耦合（联合）} 的做法是只保留一个估计器，观测不是 6 维位姿，而是 $m$ 个点的点面残差：
+\begin{equation}\label{eq:16-tight}
+  \bm{K}=\bar{\bm{P}}_k\bm{H}^{\top}\bigl(\bm{H}\bar{\bm{P}}_k\bm{H}^{\top}+\bm{R}_m\bigr)^{-1},\qquad
+  \bm{H}=\frac{\partial\bm{r}}{\partial\delta\bm{x}}\in\R^{m\times18},
+\end{equation}
+其中 $\bm{r}=[r_1,\dots,r_m]^{\top}$，$r_i=\bm{n}_i^{\top}(\bm{R}\bm{p}_i+\bm{p}-\bm{q}_i)$ 是第 $i$ 个点的点到面残差（$\bm{n}_i$ 是从地图拟合出的平面法向，$\bm{q}_i$ 是平面上一点），$\bm{R}_m$ 是各点观测噪声拼成的对角阵。式~\eqref{eq:16-tight} 和式~\eqref{eq:16-loose} 的代数形式完全一样，差别全在 $\bm{H}$ 和观测的含义上：前者是 6 行的"位姿投影"，后者是 $m$ 行的"几何残差"，$m$ 通常是几百到几千。
+
+\begin{figure}[htbp]
+  \centering
+  \begin{tikzpicture}[font=\small]
+    \node[label, text=structurecolor] at (0,1.15) {\textbf{松耦合：级联估计}};
+    \node[block] (l0) at (0,0) {3D 激光};
+    \node[block] (l1) at (2.4,0) {扫描匹配};
+    \node[block] (i0) at (0,-1.7) {IMU};
+    \node[block] (i1) at (2.4,-1.7) {积分/预积分};
+    \node[block2] (f0) at (5.0,-0.85) {EKF 融合};
+    \node[block] (o0) at (7.6,-0.85) {位姿};
+    \draw[arrow] (l0) -- (l1);
+    \draw[arrow] (i0) -- (i1);
+    \draw[arrow] (l1) -- node[label, above right] {位姿观测 $\bm{z}$} (f0);
+    \draw[arrow] (i1) -- node[label, below right] {先验 $\bar{\bm{x}},\bar{\bm{P}}$} (f0);
+    \draw[arrow] (f0) -- (o0);
+    % 紧耦合
+    \begin{scope}[yshift=-5.6cm]
+      \node[label, text=structurecolor] at (0,1.15) {\textbf{紧耦合：联合估计}};
+      \node[block] (a0) at (0,0) {3D 激光};
+      \node[block] (a1) at (2.4,0) {点面残差 $\bm{r}$};
+      \node[block] (b0) at (0,-1.7) {IMU};
+      \node[block] (b1) at (2.4,-1.7) {状态传播};
+      \node[block2] (c0) at (5.0,-0.85) {IEKF 联合更新};
+      \node[block] (d0) at (7.6,-0.85) {位姿};
+      \node[block] (m0) at (2.4,-3.0) {iKD-Tree 地图};
+      \draw[arrow] (a0) -- (a1);
+      \draw[arrow] (b0) -- (b1);
+      \draw[arrow] (a1) -- node[label, above right] {$m$ 维残差} (c0);
+      \draw[arrow] (b1) -- node[label, below right] {同一个状态 $\bm{x}$} (c0);
+      \draw[arrow] (c0) -- (d0);
+      \draw[arrow, dashed] (m0) -- node[label, right] {最近邻/平面} (a1);
+      \draw[arrow, dashed] (c0.south) to[bend left=12] (m0.east);
+    \end{scope}
+  \end{tikzpicture}
+  \caption{松耦合与紧耦合的信息流对比。松耦合中扫描匹配是独立模块，只把 6 自由度位姿交给滤波器；紧耦合中点云直接产生残差，与 IMU 传播结果在同一个状态向量、同一个协方差里融合，地图也参与其中。}\label{fig:16-coupling}
+\end{figure}
+
+\subsection{紧耦合为什么更鲁棒}
+
+把两者的差别想成一个很具体的场景：机器人正沿一条长走廊前进，走廊方向几何退化，扫描匹配在轴线方向上算不出位移。松耦合下，扫描匹配只好输出一个"轴线方向几乎没动"的位姿，并且给出一个看起来不大、但实际上错误的 $\bm{\Sigma}_L$；滤波器看到这个观测后会相信它，把 IMU 预积分算出来的正确位移拽回去。紧耦合下，$\bm{H}^{\top}\bm{H}$ 在轴线方向上同样接近奇异，但这个奇异方向上的不确定度由先验协方差 $\bar{\bm{P}}_k$ 提供（IMU 已经算出了位移），贝叶斯融合会自动在"激光没约束"的方向上保留 IMU 的推断，只在激光有约束的方向上修正。换句话说，\textbf{松耦合把退化藏进了 $\bm{\Sigma}_L$，紧耦合让退化在 $\bm{H}$ 里显式暴露出来}，滤波器就能按方向分别处理。
+
+\begin{remark}[一个容易误解的点]
+在 FAST-LIO2 中，点到面残差对零偏的雅可比恰好为零（点的坐标变换不依赖零偏），那零偏是怎么被激光修正的？答案是：通过传播形成的先验互协方差 $\bm{P}_{\theta b_g}$。姿态误差与陀螺零偏在预测步就被耦合在一起，激光残差修正姿态时，$\bm{K}$ 中对应的行会把零偏一起拉动。这仍然是紧耦合——两者共享同一个状态和同一个协方差矩阵；只是耦合路径是"先验相关性"而不是"残差显式依赖"。
+\end{remark}
+
+\section{选型建议}\label{sec:16-select}
+
+\begin{table}[htbp]
+  \centering
+  \caption{LIO 方案选型决策表}\label{tab:16-select}
+  \footnotesize
+  \begin{tabular}{lll}
+    \toprule
+    需求/场景 & 推荐方案 & 理由 \\
+    \midrule
+    纯 2D 平面、算力极低 & Cartographer（第~\ref{ch:15-cartographer}~章） & 3 自由度，代价最小 \\
+    地面机器人、需要回环与 GPS & LIO-SAM~\cite{shan2020liosam} & 因子图可回环、可融合绝对观测 \\
+    通用 3D、稳定优先 & FAST-LIO2~\cite{xu2022fastlio2} & 无特征、直接法、社区成熟 \\
+    剧烈旋转、IMU 量程不足 & Point-LIO~\cite{he2023pointlio} & 逐点更新，帧内不依赖 IMU 可信 \\
+    长走廊/隧道等退化场景 & 视觉 + 激光紧耦合（LVI） & 纹理补几何 \\
+    内存/算力受限、结构化场景 & VoxelMap~\cite{yuan2022voxelmap} & 平面地图，存储与查询都省 \\
+    无 IMU 可用 & LOAM 类纯激光 & 不依赖惯性观测 \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+选型时还要考虑三个工程约束：（1）\textbf{时间同步}：激光与 IMU 的时间戳必须同步到毫秒级，否则去畸变和传播都会错，这是 LIO 现场翻车的第一大原因；（2）\textbf{外参标定}：雷达到 IMU 的旋转和平移要足够准，$1^{\circ}$ 的外参误差在 $10$\,m 处就是 $17$\,cm 的偏差；（3）\textbf{IMU 量程}：RoboMaster 的撞击瞬间角速度很容易超过 $2000^{\circ}$/s，选型时要看陀螺量程和算法对饱和的鲁棒性。
+
+\begin{summary}
+
+\begin{enumerate}
+  \item 3D 场景需要 6 自由度位姿，纯激光里程计在几何退化、帧内畸变、快速运动三种情况下失效；IMU 频率高、短时准，恰好补上帧内运动，激光则把 IMU 的漂移拉回来。
+  \item LIO 的定义是"激光与 IMU 在同一个估计器中联合估计位姿及辅助状态"。紧耦合 = 原始测量进同一次更新；松耦合 = 一个传感器的估计结果当另一个的观测。
+  \item 运动畸变来自"一帧点云是一个 $100$\,ms 的时间窗"，去畸变的本质是把每个点按自己的时间戳变换到参考时刻：$\bm{p}_i^{L_{\mathrm{ref}}}=R(t_{\mathrm{ref}})^{\top}(R(t_i)\bm{p}_i^{L}+\bm{p}(t_i)-\bm{p}(t_{\mathrm{ref}}))$。
+  \item 去畸变只需要帧内相对运动；匀速模型误差约 $\frac12 a\Delta t^2$，IMU 辅助模型用积分轨迹插值，连续时间表示（B 样条）精度更高但更贵。
+  \item 演化主线：LOAM（特征法两阶段）$\to$ LeGO-LOAM（地面分割、轻量化）$\to$ LIO-SAM（紧耦合因子图、可回环）$\to$ FAST-LIO（IEKF + 点面残差）$\to$ FAST-LIO2（去特征 + iKD-Tree）$\to$ Point-LIO（逐点更新、抗饱和）。
+  \item 两个正交的维度：特征法/直接法回答"用什么残差"，滤波/优化回答"用什么估计框架"，不要混为一谈。
+  \item 紧耦合更鲁棒的根本原因：退化方向上的不确定度由先验协方差承担，滤波器可以"按方向"融合，而不是把一个退化的 6 维位姿当成可靠观测。
+\end{enumerate}
+
+
+\end{summary}
+
+\begin{problemset}
+
+  \item 设激光雷达转速 $10$\,Hz，机器人以 $1$\,m/s 平移、同时以 $60^{\circ}$/s 绕竖直轴旋转，点距离 $4$\,m。估算帧首帧尾的点在空间上错开多少（分别给出平移项与旋转项）。
+  \item 用式~\eqref{eq:16-constant-velocity} 推导匀速模型下帧中点（$s=1/2$）的位姿，并说明若真实轨迹在帧内有恒定角加速度 $\alpha$，插值误差的一阶项是多少。
+  \item 证明式~\eqref{eq:16-loose} 与式~\eqref{eq:16-tight} 在 $\bm{H}$ 取 $\begin{bmatrix}\bm{I}_6&\bm{0}\end{bmatrix}$、且扫描匹配的 $\bm{\Sigma}_L$ 恰好等于"把全部点残差边缘化掉"的结果时等价。这个等价条件在实践中为什么几乎不成立？
+  \item 长走廊场景下，$\bm{H}^{\top}\bm{H}$ 为什么会奇异？请写出沿走廊方向的零空间向量，并解释为什么先验协方差可以补上这个方向。
+  \item LIO-SAM 用因子图、FAST-LIO2 用 IEKF，两者都能跑出厘米级轨迹。请各举一个"其中一个明显更优"的场景，并说明原因。
+\end{problemset}
+
+\begin{reading}
+
+\begin{itemize}
+  \item FAST-LIO2 论文~\cite{xu2022fastlio2}：读它之前先读第~\ref{ch:17-advanced-lio}~章，重点看状态定义、IEKF 更新式与 iKD-Tree 的算法描述。
+  \item LIO-SAM 论文~\cite{shan2020liosam} 与 GTSAM 文档：理解因子图如何把 IMU 预积分、激光位姿、回环写进同一个优化问题。
+  \item Point-LIO 论文~\cite{he2023pointlio}：重点看它如何用逐点更新绕开"帧内 IMU 不可信"的问题，以及饱和检测的处理方式。
+  \item VoxelMap 论文~\cite{yuan2022voxelmap}：理解自适应体素与概率平面地图，对比 iKD-Tree 的存储与查询代价。
+\end{itemize}
+
+
+\end{reading}

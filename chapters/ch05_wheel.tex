@@ -1,0 +1,387 @@
+﻿\chapter{轮式里程计：从编码器到航迹推算}\label{ch:05-wheel}
+
+\chapterintro{轮式里程计是所有移动机器人最基础、最廉价、也最常被低估的定位手段：两个编码器加初中数学就能给出 100\,Hz 的位姿。但「便宜」不等于「简单」——轮子会打滑，轮距会标不准，地面不会永远平。本章从编码器的一个脉冲讲起，一路推到差速底盘的圆弧航迹推算、麦轮底盘的逆运动学，以及一套可落地的标定流程。学完本章，你应当能独立写出一个差速里程计节点，并知道它的误差从哪来、该怎么标、协方差该怎么填。}
+
+\section{编码器：把一个脉冲变成一段位移}\label{sec:05-encoder}
+
+车轮的运动最终由编码器变成数字。\textbf{增量式编码器}（incremental encoder）输出 A、B 两路正交方波，转子每转过一个固定角度产生一个脉冲，数脉冲得到「转了多少」，比较 A、B 相位得到「往哪转」；\textbf{绝对式编码器}（absolute encoder）每个角度对应唯一编码，上电即知绝对角度。本书主要用增量式，因为便宜、用定时器正交解码即可读取。
+
+设编码器\textbf{线数}（每转脉冲数，pulses per revolution, PPR）为 $N$，电机与轮之间的\textbf{减速比}为 $i$，车轮半径为 $r$。工程上普遍采用\textbf{四倍频}（quadrature）计数：A、B 两相的上升沿与下降沿都计数，因此电机每转一圈得到 $4N$ 个计数。电机转 $i$ 圈车轮转一圈，于是车轮每转一圈对应
+\begin{equation}
+  C_{\text{rev}} = 4Ni
+  \label{eq:05-counts-rev}
+\end{equation}
+个计数。车轮转一圈走过弧长 $2\pi r$，所以单个计数对应的行进距离是
+\begin{equation}
+  \Delta s = \frac{2\pi r}{4Ni}.
+  \label{eq:05-ds}
+\end{equation}
+式~\eqref{eq:05-ds} 里有三个容易搞错的量：$N$ 是\textbf{电机轴}上的线数而不是轮轴上的；$i$ 是减速比，$i>1$ 表示减速；四倍频的因子 4 只在 A/B 正交解码时成立，若只数单相上升沿则没有这个 4。
+
+\begin{example}[一个计数有多长]
+取 $N=13$、四倍频后电机每转 $52$ 个计数、减速比 $i=30$、轮半径 $r=0.065\,\mathrm{m}$，则
+\begin{equation}
+  \Delta s=\frac{2\pi\times0.065}{4\times13\times30}
+  =\frac{0.4084}{1560}\approx2.62\times10^{-4}\,\mathrm{m},
+\end{equation}
+即每个计数约 $0.26\,\mathrm{mm}$；若车轮以 $1\,\mathrm{m/s}$ 前进，则每秒产生约 $3817$ 个计数。
+\end{example}
+
+单个计数太粗怎么办？用时间换精度：在固定周期 $\Delta t$ 内数计数 $n$，得到平均速度 $\hat{v}=n\Delta s/\Delta t$。但计数本身有 $\pm1$ 的量化误差，因此速度估计的量化噪声为 $\Delta s/\Delta t$；仍用上例，$\Delta t=10\,\mathrm{ms}$ 时噪声约 $2.6\,\mathrm{cm/s}$，对 $1\,\mathrm{m/s}$ 的车是 $2.6\,\%$。这解释了为什么低速时编码器测速很差。
+
+\begin{keybox}{编码器分辨率的三个坑}
+\begin{enumerate}
+  \item \textbf{线数不等于计数}：$N$ 线四倍频后是 $4N$ 计数；某些厂商标的是「每转计数」。
+  \item \textbf{减速比方向}：$i=30$ 表示电机转 30 圈车轮转 1 圈；若把 $i$ 当成增速比，结果会差 $i^{2}$ 倍。
+  \item \textbf{分辨率不等于精度}：$0.26\,\mathrm{mm}$ 只是量化步长，真实精度还取决于轮半径误差、打滑与安装偏心。
+\end{enumerate}
+\end{keybox}
+
+\section{两轮差速运动学}\label{sec:05-diff}
+
+\subsection{从轮速到车体速度}
+
+考虑两轮差速底盘：左右两个驱动轮位于车体两侧，轮心连线过车体中心，轮距为 $L$。记左、右轮的线速度（轮缘相对地面的速度）为 $v_L$、$v_R$，车体中心的速度为 $v$、角速度为 $\omega$。刚体上任意一点的速度等于「中心速度 + 角速度叉乘该点相对中心的位置」。右轮相对中心的位置是 $(0,-L/2)$（机体系 $x$ 向前、$y$ 向左），而 $\bm{\omega}=[0,0,\omega]^{\top}$，于是右轮接地点的速度为
+\begin{equation}
+  \bm{v}_{R} = \bm{v} + \bm{\omega}\times\bm{r}_{R}
+  = \begin{bmatrix}v\\0\\0\end{bmatrix}
+  + \begin{bmatrix}0\\0\\\omega\end{bmatrix}\times\begin{bmatrix}0\\-L/2\\0\end{bmatrix}
+  = \begin{bmatrix}v+\dfrac{\omega L}{2}\\[2mm] 0\\0\end{bmatrix}.
+  \label{eq:05-wheel-point}
+\end{equation}
+轮子不打滑时，轮缘速度沿前进方向的分量就是 $v_R$，横向分量被地面约束为零。左轮同理，于是
+\begin{equation}
+  v_R = v + \frac{\omega L}{2},
+  \qquad
+  v_L = v - \frac{\omega L}{2}.
+  \label{eq:05-wheel-v}
+\end{equation}
+把两式相加、相减，解出车体速度：
+\begin{equation}
+  v = \frac{v_R+v_L}{2},
+  \qquad
+  \omega = \frac{v_R-v_L}{L}.
+  \label{eq:05-v-omega}
+\end{equation}
+式~\eqref{eq:05-v-omega} 的物理含义很直白：$v$ 是两轮速度的平均（决定直线快慢），$\omega$ 是两轮速度之差除以轮距（决定转向快慢）。当 $v_R=v_L$ 时 $\omega=0$，车走直线；当 $v_R=-v_L$ 时 $v=0$，车原地转。
+
+\subsection{非完整约束}
+
+车体在世界系中的位姿是三维的 $(x,y,\theta)$，但上式只有两个独立输入 $(v,\omega)$。把车体速度投影到世界系：
+\begin{equation}
+  \dot{x}=v\cos\theta,\qquad \dot{y}=v\sin\theta,\qquad \dot{\theta}=\omega.
+  \label{eq:05-kinematics}
+\end{equation}
+消去 $v$ 得到
+\begin{equation}
+  \dot{x}\sin\theta-\dot{y}\cos\theta = 0.
+  \label{eq:05-nonholonomic}
+\end{equation}
+这是一个不能积分成「位置约束」的微分约束，叫\textbf{非完整约束}（nonholonomic constraint）：普通轮式车不能侧向平移，必须先转再走。它决定了轮式车不能像全向底盘那样直接横移，也决定了路径规划必须考虑曲率（见第~\ref{ch:19-global-planning}~章）。
+
+\begin{figure}[htbp]
+  \centering
+  \begin{tikzpicture}[scale=0.82]
+    \draw[thick, fill=structurecolor!8, rounded corners=3pt] (-1.15,-0.7) rectangle (1.35,0.7);
+    \draw[thick, fill=black!18] (-0.55,0.7) rectangle (0.55,0.95);
+    \draw[thick, fill=black!18] (-0.55,-0.95) rectangle (0.55,-0.7);
+    \draw[<->, thin] (1.05,0.825) -- (1.05,-0.825) node[midway, right, font=\footnotesize] {轮距 $L$};
+    \draw[-stealth, very thick, structurecolor] (0,0) -- (1.15,0) node[above right, font=\footnotesize] {$v$};
+    \draw[-stealth, thin] (0,0) -- (0,1.35) node[above, font=\footnotesize] {$y_B$};
+    \draw[-stealth, thin] (0,0) -- (-1.55,0) node[left, font=\footnotesize] {$x_B$};
+    \draw[-stealth, thick, red!60!black] (0.35,0.35) arc (45:200:0.5);
+    \node[font=\footnotesize, red!60!black] at (0.12,-0.5) {$\omega$};
+    \draw[-stealth, thick] (-1.0,0.825) -- (-0.25,0.825) node[pos=0.5, above, font=\footnotesize] {$v_L$};
+    \draw[-stealth, thick] (-1.0,-0.825) -- (-0.25,-0.825) node[pos=0.5, below, font=\footnotesize] {$v_R$};
+    \draw[dashed, black!40] (-1.15,0) -- (1.35,0);
+    \node[font=\footnotesize] at (1.95,0.45) {车体};
+  \end{tikzpicture}
+  \caption{两轮差速底盘的俯视图（机体系 $x_B$ 向前、$y_B$ 向左）。车体中心速度 $v$ 是两轮速度的平均，角速度 $\omega$ 由两轮速度差除以轮距决定；轮距 $L$ 的标定误差会直接变成角速度的比例误差。}
+  \label{fig:05-diff}
+\end{figure}
+
+\section{离散航迹推算：圆弧模型与直线近似}\label{sec:05-dead-reckoning}
+
+里程计在每个采样周期执行一次「已知上一时刻位姿与本周期的 $v,\omega$，求新位姿」。这就是\textbf{航迹推算}（dead reckoning，航位推算），它的概率版本（把轮速误差建模成噪声）见 \cite{thrun2005probabilistic}。关键在于：一个周期内 $v$、$\omega$ 怎么变化？最常用的是\textbf{常值假设}：周期内 $v$、$\omega$ 不变。
+
+\subsection{圆弧模型}
+
+在常值假设且 $\omega\ne0$ 时，车体走一段圆弧。由式~\eqref{eq:05-kinematics}，第 $k$ 个周期初始位姿为 $(x_k,y_k,\theta_k)$，则时刻 $t\in[0,\Delta t]$ 的朝向为 $\theta(t)=\theta_k+\omega t$，而 $\dot{x}=v\cos\theta$ 从 $0$ 到 $\Delta t$ 的积分为 $x_{k+1}-x_k=\int_{0}^{\Delta t}v\cos(\theta_k+\omega t)\diff t$。做换元 $u=\theta_k+\omega t$，则 $\diff u=\omega\,\diff t$，$\diff t=\diff u/\omega$，积分限从 $t=0,\Delta t$ 变为 $u=\theta_k,\ \theta_k+\omega\Delta t$：
+\begin{equation}
+  x_{k+1}-x_k
+  = \frac{v}{\omega}\int_{\theta_k}^{\theta_k+\omega\Delta t}\cos u\,\diff u
+  = \frac{v}{\omega}\left[\sin\left(\theta_k+\omega\Delta t\right)-\sin\theta_k\right].
+  \label{eq:05-arc-x}
+\end{equation}
+同理对 $\dot{y}=v\sin\theta$ 做同样的换元（$\int\sin u\,\diff u=-\cos u$），得 $y_{k+1}-y_k=-\frac{v}{\omega}[\cos(\theta_k+\omega\Delta t)-\cos\theta_k]$。再加上朝向更新 $\theta_{k+1}=\theta_k+\omega\Delta t$，就得到完整的\textbf{圆弧模型}：
+\begin{equation}
+  \begin{aligned}
+    x_{k+1} &= x_k + \frac{v}{\omega}\left[\sin\left(\theta_k+\omega\Delta t\right)-\sin\theta_k\right],\\
+    y_{k+1} &= y_k - \frac{v}{\omega}\left[\cos\left(\theta_k+\omega\Delta t\right)-\cos\theta_k\right],\\
+    \theta_{k+1} &= \theta_k+\omega\Delta t.
+  \end{aligned}
+  \label{eq:05-arc}
+\end{equation}
+
+\textbf{圆弧模型的几何解释。}记转角 $\Delta\theta=\omega\Delta t$、转弯半径 $R=v/\omega$。用和差化积公式 $\sin a-\sin b=2\cos\frac{a+b}{2}\sin\frac{a-b}{2}$，取 $a=\theta_k+\Delta\theta$、$b=\theta_k$，式~\eqref{eq:05-arc-x} 变为
+\begin{equation}
+  x_{k+1}-x_k
+  = \frac{v}{\omega}\cdot2\cos\left(\theta_k+\frac{\Delta\theta}{2}\right)\sin\frac{\Delta\theta}{2}
+  = \underbrace{2R\sin\frac{\Delta\theta}{2}}_{\text{弦长 }d}
+  \cos\left(\theta_k+\frac{\Delta\theta}{2}\right).
+\end{equation}
+对 $y$ 分量做同样的换元积分，再使用和差化积公式 $\cos a-\cos b=-2\sin\frac{a+b}{2}\sin\frac{a-b}{2}$（取 $a=\theta_k+\Delta\theta$、$b=\theta_k$），得到
+\begin{equation}
+  y_{k+1}-y_k
+  = -\frac{v}{\omega}\left[\cos\left(\theta_k+\Delta\theta\right)-\cos\theta_k\right]
+  = d\sin\left(\theta_k+\frac{\Delta\theta}{2}\right),
+\end{equation}
+其中 $d=2R\sin(\Delta\theta/2)$ 就是同一步的弦长。因此圆弧模型可以统一地理解为：\textbf{一步的位移等于弦长 $d$，方向是中间朝向 $\theta_k+\Delta\theta/2$}。这比硬背公式好记，也直接给出下面的直线极限。
+
+\subsection{直线模型与极限}
+
+当 $\omega\to0$ 时 $v/\omega\to\infty$、$\Delta\theta\to0$，式~\eqref{eq:05-arc} 是 $0/0$ 型极限。对 $x$ 分量做一阶展开：
+\begin{equation}
+  \sin\left(\theta_k+\Delta\theta\right)-\sin\theta_k
+  = \sin\theta_k\cos\Delta\theta+\cos\theta_k\sin\Delta\theta-\sin\theta_k.
+\end{equation}
+当 $\Delta\theta\to0$ 时 $\cos\Delta\theta\to1$、$\sin\Delta\theta\to\Delta\theta+O(\Delta\theta^{3})$，故上式 $=\Delta\theta\cos\theta_k+O(\Delta\theta^{2})$。于是
+\begin{equation}
+  x_{k+1}-x_k = \frac{v}{\omega}\cdot\Delta\theta\cos\theta_k + O(\Delta\theta^{2})
+  = v\Delta t\cos\theta_k + O(\Delta t^{2}),
+\end{equation}
+其中用了 $v\Delta\theta/\omega = v\Delta t$。对 $y$ 分量同理可得 $y_{k+1}-y_k\to v\Delta t\sin\theta_k$。于是 $\omega=0$ 时圆弧模型退化为\textbf{直线模型}：
+\begin{equation}
+  x_{k+1}=x_k+v\Delta t\cos\theta_k,\quad
+  y_{k+1}=y_k+v\Delta t\sin\theta_k,\quad
+  \theta_{k+1}=\theta_k.
+  \label{eq:05-line}
+\end{equation}
+
+\subsection{三种离散化误差对比}
+
+同一个物理运动，用不同离散公式近似，误差量级不同。以式~\eqref{eq:05-kinematics} 的 $x$ 分量为例如下对比。
+
+\textbf{欧拉法}用周期初朝向：$x_{k+1}=x_k+v\Delta t\cos\theta_k$。真实位移为 $\int_0^{\Delta t}v\cos(\theta_k+\omega t)\diff t$，把余弦在 $t=0$ 展开得 $\cos(\theta_k+\omega t)=\cos\theta_k-\omega t\sin\theta_k+O(t^{2})$，逐项积分：
+\begin{equation}
+  \Delta x_{\text{true}} = v\Delta t\cos\theta_k - \frac{1}{2}v\omega\Delta t^{2}\sin\theta_k+O(\Delta t^{3}),
+\end{equation}
+故欧拉法局部误差是 $O(v\omega\Delta t^{2})$，是\textbf{一阶}方法。\textbf{中点法}用中间朝向 $x_{k+1}=x_k+v\Delta t\cos(\theta_k+\omega\Delta t/2)$，把余弦在区间中点展开后奇次项对称抵消，局部误差为 $O(\Delta t^{3})$，是\textbf{二阶}方法。\textbf{圆弧公式}在常值假设下没有离散化误差。所以急转弯时不要图省事用欧拉法；经验上 $\abs{\omega}\Delta t<0.05\,\mathrm{rad}$ 时欧拉法误差可忽略，否则应当升级。
+
+\begin{keybox}{圆弧模型的三条实践结论}
+\begin{enumerate}
+  \item 一步走的是圆弧：位移是弦长 $d=2R\sin(\Delta\theta/2)$，方向是中间朝向；$\omega\to0$ 时 $d\to v\Delta t$，退化为直线。
+  \item 圆弧公式与直线公式可以统一写成「$d$ 沿中间朝向投影」，代码里用一个 \texttt{if} 判断 $\abs{\omega}$ 是否小于阈值即可。
+  \item 当 $v$、$\omega$ 在一个周期内变化剧烈时，任何离散模型都有误差；解决办法是提高采样频率。
+\end{enumerate}
+\end{keybox}
+
+\begin{pseudo}{差速轮式航迹推算（单周期）}
+  \item 读取左、右轮累计计数 $c_L,c_R$，与上一周期作差得 $\Delta c_L,\Delta c_R$
+  \item 换算成轮子行进距离：$\Delta s_{L,R}\leftarrow\Delta c_{L,R}\cdot\Delta s$
+  \item 计算轮速：$v_{L,R}\leftarrow\Delta s_{L,R}/\Delta t$
+  \item 由式~\eqref{eq:05-v-omega} 得 $v\leftarrow(v_R+v_L)/2$，$\omega\leftarrow(v_R-v_L)/L$
+  \item 若 $\abs{\omega}<\epsilon$（$\epsilon$ 取 $10^{-3}\,\mathrm{rad/s}$）：
+  \item \quad $x\leftarrow x+v\Delta t\cos\theta$， $y\leftarrow y+v\Delta t\sin\theta$
+  \item 否则：
+  \item \quad $x\leftarrow x+\frac{v}{\omega}[\sin(\theta+\omega\Delta t)-\sin\theta]$
+  \item \quad $y\leftarrow y-\frac{v}{\omega}[\cos(\theta+\omega\Delta t)-\cos\theta]$
+  \item 更新 $\theta\leftarrow\theta+\omega\Delta t$，发布位姿与协方差
+\end{pseudo}
+
+\section{麦轮与全向底盘}\label{sec:05-mecanum}
+
+差速底盘只能前进和转向，横向移动要靠多次转向完成。麦轮（Mecanum wheel）解决了这个问题：每个轮子的轮缘上装有一圈与轮轴成 $45\degree$ 的辊子，轮子既能沿自身滚动方向驱动，又能沿辊子轴向被动滑动；四个轮子配合，底盘就能同时实现前后、左右、自转三个自由度的运动。
+
+\subsection{麦轮逆运动学推导}
+
+采用机体系：$x$ 向前、$y$ 向左、$\omega$ 逆时针为正。四个轮心位置为 $\bm{r}_1=(a,b)$、$\bm{r}_2=(a,-b)$、$\bm{r}_3=(-a,b)$、$\bm{r}_4=(-a,-b)$，其中 $2a$ 为前后轮距、$2b$ 为左右轮距（$a,b>0$）。第 $i$ 个轮子的接地点速度（把该点当作刚体上一点）为
+\begin{equation}
+  \bm{u}_i = \bm{v}+\omega\hat{\bm{z}}\times\bm{r}_i
+  = \begin{bmatrix}v_x-\omega r_{iy}\\ v_y+\omega r_{ix}\end{bmatrix},
+  \label{eq:05-contact-vel}
+\end{equation}
+其中 $\bm{v}=[v_x,v_y]^{\top}$ 是底盘中心速度。麦轮的约束是：接地点速度沿「轮子约束方向」的分量必须等于轮子线速度 $s_i$，而垂直方向的分量由辊子自由滑动吸收。记第 $i$ 个轮子的约束方向单位向量为 $\bm{e}_i$，则
+\begin{equation}
+  s_i = \bm{u}_i\cdot\bm{e}_i.
+  \label{eq:05-mecanum-proj}
+\end{equation}
+由于辊子与轮轴成 $45\degree$，四个轮子的约束方向与坐标轴也成 $45\degree$。取 $\bm{e}_1=\frac{1}{\sqrt2}[1,-1]^{\top}$、$\bm{e}_2=\frac{1}{\sqrt2}[1,1]^{\top}$、$\bm{e}_3=\frac{1}{\sqrt2}[1,1]^{\top}$、$\bm{e}_4=\frac{1}{\sqrt2}[1,-1]^{\top}$，逐轮代入式~\eqref{eq:05-contact-vel} 与式~\eqref{eq:05-mecanum-proj}。以轮 1 为例，$\bm{r}_1=(a,b)$，由式~\eqref{eq:05-contact-vel} 得 $\bm{u}_1=[v_x-\omega b,\ v_y+\omega a]^{\top}$，于是
+\begin{equation}
+  s_1=\frac{1}{\sqrt{2}}\left[(v_x-\omega b)-(v_y+\omega a)\right]
+  =\frac{1}{\sqrt{2}}\left[v_x-v_y-(a+b)\omega\right].
+\end{equation}
+其余三轮同样计算，得到麦轮的\textbf{逆运动学}（由底盘速度求四个轮速）：
+\begin{equation}
+  \begin{aligned}
+    s_1 &= \tfrac{1}{\sqrt{2}}\left[v_x-v_y-(a+b)\omega\right],\\
+    s_2 &= \tfrac{1}{\sqrt{2}}\left[v_x+v_y+(a+b)\omega\right],\\
+    s_3 &= \tfrac{1}{\sqrt{2}}\left[v_x+v_y-(a+b)\omega\right],\\
+    s_4 &= \tfrac{1}{\sqrt{2}}\left[v_x-v_y+(a+b)\omega\right].
+  \end{aligned}
+  \label{eq:05-mecanum-inv}
+\end{equation}
+
+\subsection{正运动学：从轮速回到速度}
+
+里程计需要的是反方向：已知四个轮速，求底盘速度。把式~\eqref{eq:05-mecanum-inv} 的四式做三种线性组合：四式相加时含 $v_y$ 与 $\omega$ 的项成对抵消，只剩 $4v_x$；取 $s_2+s_3-s_1-s_4$ 时含 $v_x$ 与 $\omega$ 的项抵消，只剩 $4v_y$；取 $s_2+s_4-s_1-s_3$ 时只剩 $4(a+b)\omega$。整理得
+\begin{equation}
+  \begin{aligned}
+    v_x &= \frac{\sqrt{2}}{4}\left(s_1+s_2+s_3+s_4\right),\\
+    v_y &= \frac{\sqrt{2}}{4}\left(s_2+s_3-s_1-s_4\right),\\
+    \omega &= \frac{\sqrt{2}}{4(a+b)}\left(s_2+s_4-s_1-s_3\right),
+  \end{aligned}
+  \qquad\Longleftrightarrow\qquad
+  \begin{bmatrix}v_x\\v_y\\\omega\end{bmatrix}
+  = \frac{\sqrt{2}}{4}\begin{bmatrix}
+    1 & 1 & 1 & 1\\
+    -1 & 1 & 1 & -1\\
+    -\frac{1}{a+b} & \frac{1}{a+b} & -\frac{1}{a+b} & \frac{1}{a+b}
+  \end{bmatrix}
+  \begin{bmatrix}s_1\\s_2\\s_3\\s_4\end{bmatrix}.
+  \label{eq:05-mecanum-fwd}
+\end{equation}
+积分 $(v_x,v_y,\omega)$ 即可得到位姿；工程上把轮子角速度乘以轮半径得到 $s_i$ 后直接代入。这张矩阵就是麦轮里程计的全部「物理模型」，剩下的事情都是噪声与打滑。
+
+\subsection{为什么麦轮里程计更容易漂}
+
+式~\eqref{eq:05-mecanum-fwd} 是在「辊子与地面纯滚动、无侧向滑移」假设下推出来的，而现实中这个假设很差：辊子只在与地面接触的瞬间近似纯滚动，其余时刻存在横向滑动，滑移量随负载和速度变化；四个轮子的半径、减速比、编码器分辨率、轮胎磨损很难一致，线性叠加会把差异放大成系统性偏差；麦轮对地面起伏极敏感，一个 1\,mm 的凸起就足以改变接触点速度方向；横移时四个轮子都在侧向滑移，编码器却只测到滚动分量，$v_y$ 的估计必然偏小。因此在 RoboMaster 这类高速对抗场景中，麦轮里程计通常只用来做短时速度反馈，位置估计要靠 IMU、激光或视觉兜底（第~\ref{ch:06-imu}~章与第~\ref{ch:09-fusion}~章）。
+
+\begin{figure}[htbp]
+  \centering
+  \begin{tikzpicture}[scale=0.72]
+    \draw[thick, fill=structurecolor!8, rounded corners=3pt] (-1.6,-1.3) rectangle (1.6,1.3);
+    \draw[thick, fill=black!18] (1.2,0.95) rectangle (1.55,1.25);
+    \draw[thick, fill=black!18] (1.2,-1.25) rectangle (1.55,-0.95);
+    \draw[thick, fill=black!18] (-1.55,0.95) rectangle (-1.2,1.25);
+    \draw[thick, fill=black!18] (-1.55,-1.25) rectangle (-1.2,-0.95);
+    \draw[-stealth, thick, red!60!black] (1.375,1.1) -- ++(0.5,-0.5);
+    \node[font=\scriptsize, red!60!black] at (2.1,0.75) {$\bm{e}_1$};
+    \draw[-stealth, thick, red!60!black] (1.375,-1.1) -- ++(0.5,0.5);
+    \node[font=\scriptsize, red!60!black] at (2.1,-0.75) {$\bm{e}_2$};
+    \draw[-stealth, thick, red!60!black] (-1.375,1.1) -- ++(0.5,0.5);
+    \node[font=\scriptsize, red!60!black] at (-2.1,0.75) {$\bm{e}_3$};
+    \draw[-stealth, thick, red!60!black] (-1.375,-1.1) -- ++(0.5,-0.5);
+    \node[font=\scriptsize, red!60!black] at (-2.1,-0.75) {$\bm{e}_4$};
+    \draw[-stealth, very thick, structurecolor] (0,0) -- (0.9,0.45) node[above, font=\footnotesize] {$\bm{v}$};
+    \draw[-stealth, thick, structurecolor!70] (2.35,0) arc (0:150:0.45);
+    \node[font=\footnotesize, structurecolor] at (2.75,0.35) {$\omega$};
+    \draw[dashed, black!40] (-1.6,-0.75) -- (1.6,-0.75);
+    \draw[dashed, black!40] (0.75,-1.3) -- (0.75,1.3);
+    \node[font=\footnotesize, below] at (0,-1.5) {$2b$（左右轮距）};
+    \node[font=\footnotesize, right] at (1.72,0.2) {$2a$（前后轮距）};
+    \node[font=\scriptsize, black!60] at (0.1,0.15) {辊子 $45\degree$};
+  \end{tikzpicture}
+  \caption{麦轮底盘俯视图。四轮约束方向 $\bm{e}_i$ 与坐标轴成 $45\degree$；每个轮子只能约束接地点速度在 $\bm{e}_i$ 方向的分量，另一个方向靠辊子滑动吸收——这既是全向移动的来源，也是打滑误差的来源。}
+  \label{fig:05-mecanum}
+\end{figure}
+
+\section{误差来源与标定}\label{sec:05-calib}
+
+\subsection{误差从哪里来}
+
+由式~\eqref{eq:05-v-omega} 与式~\eqref{eq:05-ds}，轮式里程计的参数误差可以分成两类。\textbf{轮半径误差}：$r$ 有相对误差 $e_r$ 时，$\Delta s$ 以及 $v$、$\omega$ 都同比放大，整条轨迹被等比例放大而形状不变，这叫\textbf{尺度误差}。\textbf{轮距误差}：$L$ 有相对误差 $e_L$ 时，$\omega$ 同比缩小而 $v$ 不变，转弯半径 $R=v/\omega$ 被放大，轨迹形状被扭曲，且转角越大误差越大。此外还有打滑（轮子转但车没走）、地面沉降（有效半径变小）、轮胎磨损与安装偏心等。前两类是\textbf{系统性}误差，可以通过标定压到很小；打滑是\textbf{随机且时变}的，只能靠外部传感器修正。
+
+\subsection{标定流程：直线定半径、旋转定轮距}
+
+\textbf{第一步：直线标定轮半径。}让机器人沿直线走过一段已知距离 $D$（卷尺测量），记录编码器给出的左右轮累计距离 $\hat{s}_R$、$\hat{s}_L$，并记编码器算出的行驶距离为 $\hat{D}=\frac{1}{2}(\hat{s}_R+\hat{s}_L)$。设标称半径为 $r_{\text{nom}}$，真实半径为 $r$。由 $\Delta s\propto r$ 可知真实距离与编码器距离之比等于半径之比：
+\begin{equation}
+  \frac{D}{\hat{D}} = \frac{r}{r_{\text{nom}}}
+  \ \Longrightarrow\
+  r = r_{\text{nom}}\cdot\frac{D}{\hat{D}}.
+  \label{eq:05-r-calib}
+\end{equation}
+这里 $r$ 是式~\eqref{eq:05-ds} 中唯一的线性因子，其余量（$N$、$i$、$4$）在标定期间固定，所以这个比例关系成立。
+
+\textbf{第二步：旋转标定轮距。}让机器人原地旋转 $n$ 整圈（$n$ 取 10 圈以减小单圈误差），实际转角 $\theta_{\text{true}}=2\pi n$。编码器给出的转角为 $\hat{\theta}=(\hat{s}_R-\hat{s}_L)/L_{\text{nom}}$，其中 $\hat{s}_{R,L}$ 是左右轮累计走过的弧长。真实轮距满足同一关系，由 $\hat{\theta}/\theta_{\text{true}}=L_{\text{true}}/L_{\text{nom}}$ 得
+\begin{equation}
+  L = L_{\text{nom}}\cdot\frac{\theta_{\text{true}}}{\hat{\theta}}.
+  \label{eq:05-L-calib}
+\end{equation}
+注意：原地旋转时左右轮弧长只依赖半径与转角，而两者之差又正比于轮距，所以旋转实验\textbf{只标定 $L$}；半径必须由直线实验单独标定，否则两者会混在一起。
+
+\textbf{第三步：多组实验的最小二乘拟合。}式~\eqref{eq:05-L-calib} 只用了一次实验。更稳的做法是做 $M$ 组不同圈数的旋转实验，最小化
+\begin{equation}
+  J(L)=\sum_{j=1}^{M}\left(\theta_j-\frac{d_j}{L}\right)^{2},
+  \qquad d_j=\hat{s}_{R,j}-\hat{s}_{L,j},
+  \label{eq:05-ls-cost}
+\end{equation}
+其中 $\theta_j$ 是第 $j$ 组实验的真实转角，$d_j$ 是左右轮累计距离之差。对 $L$ 求导并令其为零，由链式法则
+\begin{equation}
+  \frac{\diff J}{\diff L}
+  = \sum_{j=1}^{M}2\left(\theta_j-\frac{d_j}{L}\right)\cdot\frac{d_j}{L^{2}}=0.
+\end{equation}
+两边乘以 $L^{2}/2$（$L\ne0$），再移项得正规方程 $\sum_j\theta_j d_j=\sum_j d_j^{2}/L$，解出
+\begin{equation}
+  \hat{L} = \frac{\sum_{j=1}^{M}d_j^{2}}{\sum_{j=1}^{M}\theta_j d_j}.
+  \label{eq:05-ls-solution}
+\end{equation}
+目标函数对 $1/L$ 是二次的，所以有闭式解。工程上可以把 $r$ 与 $L$ 一起做二维最小二乘，但要注意可辨识性：直线实验只约束 $r$，旋转实验只约束 $L$，两组实验缺一不可。
+
+\begin{keybox}{标定的正确顺序}
+\begin{enumerate}
+  \item 先检查硬件：轮胎磨损、轮子偏心、编码器线数与减速比是否和配置一致；
+  \item 直线标定 $r$：走 10\,m 以上，往返各三次取平均，消除打滑不对称；
+  \item 旋转标定 $L$：原地转 10 圈，正反各一次，用式~\eqref{eq:05-ls-solution} 拟合；
+  \item 回到实际场地验证漂移率：走一个 20\,m 的矩形回路，看位置闭合误差；若仍大，说明打滑是主因，标定救不了。
+\end{enumerate}
+\end{keybox}
+
+\section{工程实现：ROS 2 中的轮式里程计}\label{sec:05-engineering}
+
+在 ROS 2 中，轮式里程计的标准接口是三件事：话题 \texttt{/odom}（类型 \texttt{nav\_msgs/msg/Odometry}，包含位姿、速度及它们的协方差）、TF 变换 \texttt{odom}$\to$\texttt{base\_link}（由里程计节点维护，不跳变），以及约定 \texttt{odom} 的初始位姿为单位阵、之后只由里程计递推。协方差是 $6\times6$ 矩阵按行优先展开的 36 个数，通常只填 $x,y,\theta$ 对应的对角元（索引 0、7、35），数值随累计行程增大。
+
+协方差的量级可以这样估：设单步距离误差标准差为 $\sigma_s$，走 $n$ 步后按独立误差假设有 $\sigma_x^{2}\approx n\sigma_s^{2}$（这里用了第~\ref{ch:04-odom-intro}~章方差相加的结论）。很多团队的 \texttt{odom} 协方差是随手填的常量，这会让下游融合算法（第~\ref{ch:09-fusion}~章）错误地信任里程计，是排错时的常见根源。
+
+差速里程计的核心计算只有十几行，但几个符号一错就全错，下面给出参考实现（注释与字符串为英文）：
+
+\begin{lstlisting}[language=C++, caption={差速里程计核心计算（节选）}, label={lst:05-core}]
+// inputs: wheel distance increments (m) and time step (s)
+double v = 0.5 * (ds_l + ds_r) / dt;
+double w = (ds_r - ds_l) / dt / wheel_separation;
+if (std::fabs(w) < 1e-3) {
+    x += v * dt * std::cos(theta);
+    y += v * dt * std::sin(theta);
+} else {
+    x += v / w * (std::sin(theta + w * dt) - std::sin(theta));
+    y -= v / w * (std::cos(theta + w * dt) - std::cos(theta));
+    theta += w * dt;
+}
+\end{lstlisting}
+
+参数含义：\texttt{wheel\_separation} 就是式~\eqref{eq:05-v-omega} 中的 $L$，\texttt{wheel\_radius} 决定 \texttt{dist\_per\_count}，\texttt{publish\_rate} 决定 $\Delta t$，\texttt{enable\_odom\_tf} 为真时节点自己发布 \texttt{odom}$\to$\texttt{base\_link}，与外部的 TF 广播器二选一。
+
+\begin{summary}
+
+\begin{enumerate}
+  \item 增量式编码器四倍频后电机每转 $4N$ 计数，车轮每转 $4Ni$ 计数，单计数位移 $\Delta s=2\pi r/(4Ni)$。
+  \item 差速底盘由刚体速度关系得 $v_R=v+\omega L/2$、$v_L=v-\omega L/2$，反解得 $v=(v_R+v_L)/2$、$\omega=(v_R-v_L)/L$；轮式底盘满足非完整约束 $\dot{x}\sin\theta-\dot{y}\cos\theta=0$。
+  \item 常值 $v,\omega$ 假设下航迹推算有闭式圆弧解：位移等于弦长 $d=2R\sin(\Delta\theta/2)$，方向为中间朝向；$\omega\to0$ 时退化为直线模型。
+  \item 欧拉法局部误差 $O(\Delta t^{2})$，中点法与圆弧模型更高阶；急转弯时应使用圆弧模型或提高采样频率。
+  \item 麦轮逆运动学由接地点速度在约束方向上的投影推出，正运动学是它的线性反解；麦轮漂移主要来自辊子滑移与四轮不一致。
+  \item 轮半径误差导致轨迹尺度误差，轮距误差导致曲率误差；直线实验标定 $r$，旋转实验用最小二乘标定 $L$。
+  \item 工程上里程计发布 \texttt{/odom} 与 \texttt{odom}$\to$\texttt{base\_link}，协方差应按累计行程传播。
+\end{enumerate}
+
+
+\end{summary}
+
+\begin{problemset}
+
+  \item 编码器 $N=1024$ 线、四倍频、直驱、$r=0.1\,\mathrm{m}$，求单计数位移与 $10\,\mathrm{ms}$ 周期下的速度量化噪声。
+  \item 差速车 $L=0.5\,\mathrm{m}$，左右轮 $0.6$、$0.9\,\mathrm{m/s}$，求 $v$、$\omega$、$R$ 及 1\,s 后的位姿（初始朝向 0）。
+  \item 用式~\eqref{eq:05-arc} 计算 $v=1\,\mathrm{m/s}$、$\omega=2\,\mathrm{rad/s}$、$\Delta t=0.1\,\mathrm{s}$、$\theta_k=0$ 的一步位移，并与欧拉法、中点法比较误差量级。
+  \item 麦轮底盘 $a=0.25\,\mathrm{m}$、$b=0.22\,\mathrm{m}$，四个轮速均为 $1\,\mathrm{m/s}$，求底盘速度；若 $s_4$ 因打滑偏小 $10\,\%$，估算 $\omega$ 的偏差。
+  \item 用式~\eqref{eq:05-ls-solution} 处理 $(d_j,\theta_j)=(1.0,6.28)$、$(2.0,12.57)$、$(3.0,18.85)$，求 $\hat{L}$ 并说明它为何只适用于「原地旋转」。
+\end{problemset}
+
+\begin{reading}
+
+\begin{itemize}
+  \item ROS 2 \texttt{diff\_drive\_controller} 文档（\href{https://control.ros.org/}{control.ros.org}）：参数与协方差语义。
+  \item Thrun 等《Probabilistic Robotics》第 5 章：里程计运动模型的概率表述。
+  \item 麦轮底盘厂家手册：核对轮距、辊子角度与运动学矩阵的符号约定。
+\end{itemize}
+
+
+\end{reading}

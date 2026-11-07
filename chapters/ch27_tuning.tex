@@ -1,0 +1,389 @@
+\chapter{调参与排错手册}\label{ch:27-tuning}
+\usetikzlibrary{arrows.meta}
+
+\chapterintro{同一套 FAST-LIO，别人的车跑得又稳又准，你抄了同一份配置却在原地炸开——这是新手最挫败的场景。原因很少是"参数玄学"，而是\textbf{数据质量问题被误当成参数问题}：时间戳有 100\,ms 偏移、外参差 $2\degree$、点云频率不稳、CPU 没开优化编译。本章先给一套可复现的调参方法论（一次只改一个、固定数据集、记录指标），再按 FAST-LIO/Point-LIO/Cartographer/Nav2 四套系统列出关键参数"调大/调小"的后果，最后给一份 12 行以上的排错速查表，把"症状 $\to$ 原因 $\to$ 排查命令 $\to$ 处理"直接对应起来。本章是全书最应该放在工位上的一章。}
+
+\section{调参方法论}\label{sec:27-method}
+
+调参最忌讳两件事：一是同时改三个参数，然后不知道是谁起的作用；二是每换一次参数就换一段数据，结果不可比。正确的做法是一条死规矩和三个习惯。
+
+\textbf{死规矩：一次只改一个参数，其余全部冻结。}
+
+三个习惯：
+
+\begin{enumerate}
+  \item \textbf{固定数据集}。选定一段有代表性的 bag（包含直行、转弯、急停、回环），所有对比都在它上面做。换 bag 等于换了考卷，分数没有意义。
+  \item \textbf{先定量指标，再看图}。每次实验至少记录：轨迹与真值的 ATE、终点漂移、CPU 占用、平均耗时、是否丢失跟踪。只看 RViz"感觉还行"是最容易骗自己的。
+  \item \textbf{先数据质量，后算法参数}。按第~\ref{ch:26-calibration} 章的四条判据检查完标定，再动 \lstinline{filter_size_surf} 这类参数。数据错了，任何参数都调不出来。
+\end{enumerate}
+
+\begin{table}[htbp]
+  \centering
+  \caption{调参记录表模板（强烈建议用表格软件维护）}\label{tab:27-log}
+  \small
+  \begin{tabular}{lllll}
+    \toprule
+    编号 & 改动 & ATE (m) & 平均耗时 (ms) & 现象备注 \\
+    \midrule
+    0  & 基线配置 & 0.42 & 18 & 转弯处有轻微拖影 \\
+    1  & \lstinline{filter_size_surf} 0.5$\to$0.3 & 0.31 & 26 & 更准但更慢 \\
+    2  & 在 1 基础上 \lstinline{max_iteration} 4$\to$3 & 0.39 & 17 & 精度回落，速度变好 \\
+    3  & 回到 0，改外参 $z$ $+2$\,cm & 0.44 & 18 & 无明显变化，排除平移误差 \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+\begin{figure}[htbp]
+  \centering
+  \begin{tikzpicture}[
+      box/.style={rectangle, rounded corners=2pt, draw=structurecolor, thick,
+        fill=structurecolor!8, align=center, font=\footnotesize, minimum height=9mm,
+        text width=36mm},
+      dec/.style={rectangle, rounded corners=2pt, draw=orange!80!black, thick,
+        fill=orange!12, align=center, font=\footnotesize, minimum height=9mm,
+        text width=36mm},
+      arr/.style={-{Stealth[length=2mm]}, thick, draw=black!70}
+    ]
+    \node[box] (a) at (0,0) {1. 录包，离线稳定复现};
+    \node[box] (b) at (0,-1.6) {2. 查数据：频率/QoS/TF/时间戳};
+    \node[dec] (c) at (0,-3.2) {3. 数据与标定是否合格？};
+    \node[box] (d) at (5.4,-3.2) {4. 修数据：同步、标定、编译};
+    \node[box] (e) at (0,-4.8) {5. 查参数表/排错表，只改一个参数};
+    \node[box] (f) at (0,-6.4) {6. 记录指标，回归验证};
+    \draw[arr] (a) -- (b);
+    \draw[arr] (b) -- (c);
+    \draw[arr] (c) -- node[right,font=\footnotesize]{是} (e);
+    \draw[arr] (c) -- node[above,font=\footnotesize]{否} (d);
+    \draw[arr] (e) -- (f);
+    \draw[arr] (d.north) |- (b.east);
+    \draw[arr, dashed] (f.east) -- ++(1.0,0) |- (a.east);
+  \end{tikzpicture}
+  \caption{调参决策流程。核心是第 3 步之前不要碰算法参数；第 6 步之后必须回到第 1 步重新验证，而不是"现场再跑一次看看"。}\label{fig:27-flow}
+\end{figure}
+
+\section{FAST-LIO / FAST-LIO2：关键参数}\label{sec:27-fastlio}
+
+FAST-LIO2 的配置分成 \lstinline{common}、\lstinline{preprocess}、\lstinline{mapping}、\lstinline{publish} 四段\cite{xu2022fastlio2}。下面是能直接跑的骨架，之后逐项解释。
+
+\begin{lstlisting}[language=bash,caption={FAST-LIO2 配置骨架（YAML）},label={lst:27-fastlio}]
+common:
+  lid_topic: "/livox/lidar"
+  imu_topic: "/livox/imu"
+  time_sync_en: false           # true only if driver already syncs stamps
+  time_offset_lidar_to_imu: 0.0 # seconds, positive: lidar lags imu
+
+preprocess:
+  lidar_type: 1                 # 1=Livox, 2=Velodyne, 3=Ouster
+  scan_line: 6
+  blind: 0.5                    # ignore points closer than this (m)
+
+mapping:
+  acc_cov: 0.1                  # continuous-time accel noise
+  gyr_cov: 0.1                  # continuous-time gyro noise
+  b_acc_cov: 0.0001             # accel bias random walk
+  b_gyr_cov: 0.0001             # gyro bias random walk
+  fov_degree: 180
+  det_range: 100.0
+  extrinsic_est_en: false       # online extrinsic estimation
+  extrinsic_T: [0.0, 0.0, 0.0]
+  extrinsic_R: [1.0, 0.0, 0.0,
+                0.0, 1.0, 0.0,
+                0.0, 0.0, 1.0]
+publish:
+  path_en: true
+  scan_publish_en: true
+  dense_publish_en: true
+
+filter_size_surf: 0.5           # surface downsample voxel (m)
+filter_size_map: 0.5            # map voxel size (m)
+cube_side_length: 1000
+point_filter_num: 3
+max_iteration: 4
+\end{lstlisting}
+
+\begin{table}[htbp]
+  \centering
+  \caption{FAST-LIO2 参数调节方向与后果}\label{tab:27-fastlio}
+  \footnotesize
+  \begin{tabular}{p{3.3cm}p{2.6cm}p{3.9cm}p{5.2cm}}
+    \toprule
+    参数 & 建议范围 & 调大的后果 & 什么时候调 \\
+    \midrule
+    \lstinline{extrinsic_T} & 实测 & 整体偏移、点云重影 & 用卷尺+物理检验确定，别猜 \\
+    \lstinline{extrinsic_R} & 实测 & 远处点云旋转错位 & 外参标定，见第~\ref{ch:26-calibration}~章 \\
+    \lstinline{filter_size_surf} & 0.2--0.5\,m & 更快但细节丢失 & 点云太稠导致算不过来时调大 \\
+    \lstinline{filter_size_map} & 0.2--1.0\,m & 内存小、精度低 & 内存吃紧（长走廊）时调大 \\
+    \lstinline{point_filter_num} & 1--5 & 更快、更稀疏 & CPU 打满时调到 3--4 \\
+    \lstinline{max_iteration} & 3--8 & 更准、更慢，易过拟合 & 转弯重影时加到 5--6 \\
+    \lstinline{acc_cov} & $10^{-2}$--$1$ & 更信 IMU & 点云退化（长走廊、隧道）时调大 \\
+    \lstinline{gyr_cov} & $10^{-2}$--$1$ & 更信 IMU 姿态 & 快速旋转时姿态滞后，调大 \\
+    \lstinline{b_acc_cov} & $10^{-5}$--$10^{-3}$ & 零偏更快跟随 & 温漂明显时调大 \\
+    \lstinline{b_gyr_cov} & $10^{-5}$--$10^{-3}$ & 零偏更快跟随 & 长时间漂移时调大 \\
+    \lstinline{cube_side_length} & 500--2000 & 地图更大、内存更高 & 场地大（>100\,m）时调大 \\
+    \lstinline{det_range} & 50--200\,m & 更远处点参与匹配 & 室内场地调小可提速 \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+\begin{keybox}{调 FAST-LIO 的顺序}
+先外参（错了怎么调都没用）$\to$ 再 \lstinline{point_filter_num}/\lstinline{filter_size_surf}（把实时性调够）$\to$ 再 \lstinline{max_iteration}（补精度）$\to$ 最后才动 \lstinline{*_cov}（处理退化场景）。顺序反了会陷入"参数互相打架"。
+\end{keybox}
+
+\section{Point-LIO：差异参数}\label{sec:27-pointlio}
+
+Point-LIO 的卖点是\textbf{逐点更新}：每个点都做一次状态更新，而非等一帧点云凑齐，因此在剧烈运动、低帧率雷达上更稳\cite{he2023pointlio}。它的配置文件结构与 FAST-LIO 相同，差异集中在表~\ref{tab:27-pointlio}。
+
+\begin{table}[htbp]
+  \centering
+  \caption{Point-LIO 相对 FAST-LIO 的关键差异}\label{tab:27-pointlio}
+  \small
+  \begin{tabular}{p{3.4cm}p{2.4cm}p{6.4cm}}
+    \toprule
+    参数 & 典型值 & 说明 \\
+    \midrule
+    \lstinline{use_imu_as_input} & 0 或 1 & 两种更新模式的开关，影响鲁棒性与算力；不同版本默认值不同，以仓库示例配置为准 \\
+    \lstinline{imu_satu_en} & 1 & 打开 IMU 饱和检测。撞击、弹丸命中导致的瞬时超量程不会把状态带飞 \\
+    \lstinline{ivox_grid_resolution} & 0.2--0.5\,m & iVox 体素边长，越小越精细也越慢 \\
+    \lstinline{ivox_nearby_type} & 18 或 26 & 近邻搜索的邻域定义，26 更稳，18 更快 \\
+    \lstinline{point_filter_num} & 1--2 & 逐点更新下通常不用激进降采样 \\
+    \lstinline{max_iteration} & 3--5 & 单帧内部迭代次数，与逐点更新互补 \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+\begin{note}
+\textbf{不要把两套配置混用}。Point-LIO 与 FAST-LIO 虽然参数名大量重叠，但协方差的量纲约定并不完全一致，把 FAST-LIO 的 YAML 直接改名喂给 Point-LIO，常见结果是"能跑但一直缓慢漂移"。正确做法是从各自仓库的示例配置出发，只改外参与话题名。
+\end{note}
+
+\begin{lstlisting}[language=bash,caption={Point-LIO 关键配置（只列与 FAST-LIO 的差异项）},label={lst:27-pointlio}]
+common:
+  lid_topic: "/livox/lidar"
+  imu_topic: "/livox/imu"
+  time_sync_en: false
+
+mapping:
+  use_imu_as_input: 0        # update mode switch, see repo README
+  imu_satu_en: 1             # reject saturated imu samples (hits, impacts)
+  ivox_grid_resolution: 0.3  # voxel edge length of the ivox map (m)
+  ivox_nearby_type: 18       # 18 or 26 neighbours
+  point_filter_num: 1
+  max_iteration: 4
+  extrinsic_T: [0.0, 0.0, 0.0]
+  extrinsic_R: [1.0, 0.0, 0.0,
+                0.0, 1.0, 0.0,
+                0.0, 0.0, 1.0]
+\end{lstlisting}
+
+\section{Cartographer：2D 建图参数}\label{sec:27-carto}
+
+Cartographer 的参数分三层：前端（\lstinline{TRAJECTORY_BUILDER_2D}）、回环（\lstinline{constraint_builder}）、后端优化（\lstinline{optimization_problem}）\cite{hess2016cartographer}。它最常出的问题是\textbf{建图糊、重影、回环失败}，三者对应的参数完全不同（表~\ref{tab:27-carto}）。
+
+\begin{table}[htbp]
+  \centering
+  \caption{Cartographer 2D 关键参数与症状对应}\label{tab:27-carto}
+  \footnotesize
+  \begin{tabular}{p{4.2cm}p{1.9cm}p{7.4cm}}
+    \toprule
+    参数 & 典型值 & 作用与调节方向 \\
+    \midrule
+    \lstinline{submaps.resolution} & 0.05\,m & 子图分辨率。调小更精细但内存涨；建图糊可先查这个 \\
+    \lstinline{submaps.num_range_data} & 60--90 & 每个子图插入的帧数。调大子图更"长"，回环更少但更快 \\
+    \lstinline{TRAJECTORY_BUILDER_2D.voxel_filter_size} & 0.025--0.05\,m & 前端降采样。调大提速，过大丢细节 \\
+    \lstinline{adaptive_voxel_filter.max_length} & 0.3--0.5\,m & 自适应降采样上限。走廊场景调大提速 \\
+    \lstinline{min_range}/\lstinline{max_range} & 0.2/30\,m & 只使用该距离内的点。室内把 \lstinline{max_range} 调小可减少动态干扰 \\
+    \lstinline{missing_data_ray_length} & 5--8\,m & 无回波方向上的自由空间长度，影响建图"通透感" \\
+    \lstinline{constraint_builder.min_score} & 0.55--0.65 & 回环最小匹配分数。调高少回环但更准，调低易误回环 \\
+    \lstinline{constraint_builder.sampling_ratio} & 0.3 & 回环候选采样比例。调大更准更慢 \\
+    \lstinline{optimization_problem.huber_scale} & 1e-2--1e1 & 鲁棒核尺度。误回环导致地图撕裂时调小 \\
+    \lstinline{optimize_every_n_nodes} & 20--90 & 每隔多少节点优化一次。调小更实时，调大更稳 \\
+    \lstinline{use_imu_data} & true & 有 IMU 就打开，否则纯激光在快速旋转时会糊 \\
+    \lstinline{num_accumulated_range_data} & 1--2 & 旧版本参数名，等价于每帧累积的雷达数据数 \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+对应的 Lua 配置片段（Cartographer 用 \lstinline{.lua} 而不是 YAML，参数按表名组织）：
+
+\begin{lstlisting}[language=bash,caption={Cartographer 2D 关键配置（Lua）},label={lst:27-carto}]
+TRAJECTORY_BUILDER_2D = {
+  use_imu_data = true,
+  min_range = 0.2,
+  max_range = 30.,
+  missing_data_ray_length = 5.,
+  voxel_filter_size = 0.025,
+  adaptive_voxel_filter = { max_length = 0.5 },
+  submaps = {
+    num_range_data = 90,
+    grid_options_2d = {
+      grid_type = "PROBABILITY_GRID",
+      resolution = 0.05,
+    },
+  },
+}
+
+POSE_GRAPH.constraint_builder.min_score = 0.6
+POSE_GRAPH.constraint_builder.sampling_ratio = 0.3
+POSE_GRAPH.optimization_problem.huber_scale = 1e1
+POSE_GRAPH.optimize_every_n_nodes = 35
+\end{lstlisting}
+
+三个高频症状的"参数线索"：
+
+\begin{itemize}
+  \item \textbf{建图糊/墙变厚}：先看 \lstinline{use_imu_data} 是否打开、IMU 是否标定；再看 \lstinline{num_range_data} 是否过大（子图太长，前端漂移积累）。
+  \item \textbf{重影（同一堵墙两条）}：典型是回环没闭上。调低 \lstinline{min_score} 到 0.5 试，若出现\textbf{错误}回环（地图撕裂）说明场景太像，应该调高 \lstinline{min_score} 并调小 \lstinline{huber_scale}。
+  \item \textbf{回环失败}：确认机器人回到了历史轨迹附近（雷达看不到历史区域的点就无从回环），并检查 \lstinline{sampling_ratio} 与 \lstinline{num_range_data}。
+\end{itemize}
+
+\section{Nav2：代价地图与控制器参数}\label{sec:27-nav2}
+
+Nav2 的参数按节点分文件：\lstinline{controller_server}、\lstinline{planner_server}、\lstinline{costmap} 等\cite{macenski2020nav2}。最容易调坏的是\textbf{代价地图}与\textbf{控制器限速}，多数"原地打转/贴墙/走不动"的现象都源于此。
+
+\begin{lstlisting}[language=bash,caption={Nav2 参数片段（局部代价地图 + 控制器）},label={lst:27-nav2}]
+local_costmap:
+  local_costmap:
+    ros__parameters:
+      update_frequency: 10.0
+      rolling_window: true
+      width: 6
+      height: 6
+      resolution: 0.05
+      robot_radius: 0.28          # or footprint polygon for non-circular
+      plugins: ["voxel_layer", "inflation_layer"]
+      voxel_layer:
+        plugin: "nav2_costmap_2d::VoxelLayer"
+        max_obstacle_height: 1.5  # ignore ceiling; keep 0.3-1.5 for RM
+        mark_threshold: 0
+        observation_sources: scan3d
+        scan3d:
+          topic: /lidar/points
+          data_type: "PointCloud2"
+          clearing: true
+          marking: true
+          max_obstacle_height: 1.2
+      inflation_layer:
+        plugin: "nav2_costmap_2d::InflationLayer"
+        inflation_radius: 0.55    # >= robot_radius + safety margin
+        cost_scaling_factor: 3.0  # smaller -> wider high-cost band
+
+controller_server:
+  ros__parameters:
+    controller_frequency: 20.0
+    FollowPath:
+      plugin: "dwb_core::DWBLocalPlanner"
+      max_vel_x: 2.5
+      max_vel_theta: 3.0
+      acc_lim_x: 2.0
+      acc_lim_theta: 4.0
+      decel_lim_x: -2.0
+      xy_goal_tolerance: 0.10
+      yaw_goal_tolerance: 0.10
+      transform_tolerance: 0.2
+      vx_samples: 20
+      vtheta_samples: 40
+\end{lstlisting}
+
+\begin{table}[htbp]
+  \centering
+  \caption{Nav2 关键参数与故障方向}\label{tab:27-nav2}
+  \footnotesize
+  \begin{tabular}{p{4.2cm}p{2.4cm}p{6.8cm}}
+    \toprule
+    参数 & 典型值 & 偏差带来的现象 \\
+    \midrule
+    \lstinline{robot_radius}/\lstinline{footprint} & 实测 & 偏小会贴墙蹭、偏大到不了窄通道 \\
+    \lstinline{inflation_radius} & 半径$+0.2$--$0.4$\,m & 偏小常撞、偏大"到处不可通行" \\
+    \lstinline{cost_scaling_factor} & 2--5 & 偏小代价带更宽、更保守；偏大贴着障碍走 \\
+    \lstinline{max_vel_x} & 1.5--4 & 偏大来不及转、偏小效率低 \\
+    \lstinline{acc_lim_x}/\lstinline{acc_lim_theta} & 实测 & 偏大轨迹抖动、偏小走不动 \\
+    \lstinline{xy_goal_tolerance} & 0.05--0.2\,m & 偏小原地抖、偏大停不准 \\
+    \lstinline{transform_tolerance} & 0.1--0.3\,s & 偏小频繁报 TF 超时、偏大位姿滞后 \\
+    \lstinline{controller_frequency} & 10--30\,Hz & 偏低调速慢、偏高吃 CPU \\
+    \lstinline{max_obstacle_height} & 0.3--1.5\,m & 偏大会把天花板/悬挂物当障碍 \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+\section{排错速查表}\label{sec:27-lookup}
+
+下面这张表是本章的核心，遇到问题先按"现象"找到对应行。所有排查命令都在 ROS 2 下验证过（见第~\ref{ch:25-ros2} 章的工具使用）。
+
+\begin{table}[htbp]
+  \centering
+  \caption{排错速查表：现象 $\to$ 原因 $\to$ 排查命令 $\to$ 处理}\label{tab:27-trouble}
+  \footnotesize
+  \begin{tabular}{p{2.5cm}p{3.0cm}p{4.3cm}p{4.2cm}}
+    \toprule
+    现象 & 可能原因 & 排查命令 & 处理 \\
+    \midrule
+    定位起飞（位姿乱跳） & 外参错、点云与 IMU 时间错、初始姿态错 & \lstinline{ros2 topic hz /lio/odom} & 重标外参；估 $\delta t$；确认初值 \\
+    点云拖影（一帧里点被"拉丝"） & 时间偏移大、去畸变失效 & 静止/旋转对比墙厚 & 按第~\ref{ch:26-calibration}~章估 $\delta t$ \\
+    地图重影（墙变两条） & 回环没闭上、外参差、里程计漂 & 看历史轨迹是否重叠 & 调 \lstinline{min_score}；检查外参 \\
+    回环错误（地图撕裂） & \lstinline{min_score} 太低、场景太像 & 回看约束残差 & 调高 \lstinline{min_score}，调小 \lstinline{huber_scale} \\
+    TF 报 LookupException & 坐标系名拼错/未发布 & \lstinline{tf2_echo map base_link} & 补 static 外参或改 frame\_id \\
+    TF 报 ExtrapolationException & 时间戳乱序、缓冲区不足 & \lstinline{tf2_tools view_frames} & 修同步；\lstinline{use_sim_time} 一致 \\
+    时间戳乱序/回退 & 多驱动时钟不同源 & \lstinline{ros2 topic echo --field header.stamp} & 硬件触发或统一到一台主机 \\
+    CPU 打满、频率掉 & 没开 Release、降采样不足 & \lstinline{top -H}、\lstinline{ros2 topic hz} & 加 \lstinline{-DCMAKE_BUILD_TYPE=Release}；调大 \lstinline{point_filter_num} \\
+    内存持续增长 & 地图/容器无限增长 & \lstinline{top} 看 RSS 曲线 & 限制 cube 数量或体素边长 \\
+    IMU 数据异常（跳变/饱和） & 撞击超量程、驱动错位 & 画 \lstinline{/imu/data} 曲线 & 开饱和检测；换安装位置 \\
+    静止时也在缓慢漂 & 零偏未标、温度漂移 & 静置 60\,s 看积分值 & 重取零偏；调大 \lstinline{b_gyr_cov} \\
+    外参符号错（点云镜像） & 坐标系手性/方向反 & 正前方放箱子看 $x,y,z$ & 按定义改正号 \\
+    UWB 定位跳变 & 多径、遮挡、基站几何差 & 看 UWB 与 LIO 差值序列 & 加抗差（Huber）+ 限幅融合 \\
+    导航原地转圈 & 目标不可达、代价地图全占 & \lstinline{ros2 topic echo /plan} & 查 \lstinline{inflation_radius}；确认 \lstinline{footprint} \\
+    机器人贴墙蹭 & 半径过小、膨胀层不足 & 看局部代价地图热力图 & 调大 \lstinline{inflation_radius} \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+\begin{note}
+\textbf{所有排查的共同前提是"能复现"}。所以第一条纪律永远是先 \lstinline{ros2 bag record -a} 录一段，然后离线用 \lstinline{ros2 bag play --clock} 复现。现场改参数再跑一次，往往只是碰巧好了，问题还在。
+\end{note}
+
+\section{日志与可视化}\label{sec:27-vis}
+
+\begin{itemize}
+  \item \textbf{RViz2 看四样东西}：点云（是否拖影、墙是否重影）、轨迹（是否闭环）、TF（是否断链）、协方差（\lstinline{Odometry} 的 covariance 是否收敛）。这四个显示项能覆盖八成问题。
+  \item \textbf{\lstinline{rqt_plot}} 画 \lstinline{/cmd_vel} 与 \lstinline{/odom} 的速度曲线，看限速/加速度是否被异常裁剪。
+  \item \textbf{evo} 看轨迹：\lstinline{evo_traj bag rm.bag /lio/odom --ref /gt/odom}，一眼看出漂移是"慢慢偏"还是"某处突变"。
+  \item \textbf{Foxglove} 适合看长时间录包的数据：支持 3D 面板与自定义布局，比 RViz2 更适合离线分析。
+  \item \textbf{日志级别}：把"每帧打印"这类调试语句降到 DEBUG，否则 I/O 本身就会让 LIO 掉帧。
+\end{itemize}
+
+\begin{keybox}{一个真实的排错顺序（值得背下来）}
+\textbf{现象}：建图时墙变厚、转弯处炸开。\textbf{顺序}：录包 $\to$ 离线复现 $\to$ 查 \lstinline{ros2 topic hz}（输入频率是否正常）$\to$ 查 \lstinline{tf2_tools view_frames}（有没有断链、频率是否一致）$\to$ 查时间戳差值（点云与 IMU 的时间是否差几十 ms）$\to$ 查外参（正前方箱子）$\to$ 最后才调 \lstinline{max_iteration} 和 \lstinline{filter_size_surf}。按这个顺序，九成问题在前三步就找到了。
+\end{keybox}
+
+\begin{summary}
+
+\begin{enumerate}
+  \item 调参铁律：一次只改一个参数、固定数据集、记录定量指标、先修数据质量再动算法参数。
+  \item FAST-LIO 的调参顺序：外参 $\to$ 实时性（\lstinline{point_filter_num}、\lstinline{filter_size_surf}）$\to$ 精度（\lstinline{max_iteration}）$\to$ 退化处理（\lstinline{*_cov}）。
+  \item Point-LIO 的差异在逐点更新与 IMU 饱和处理（\lstinline{use_imu_as_input}、\lstinline{imu_satu_en}、iVox 参数）；不要混用两套配置。
+  \item Cartographer 的"糊/重影/回环失败"分别对应前端降采样、回环阈值与子图长度，\lstinline{min_score} 与 \lstinline{huber_scale} 是回环的两个关键旋钮。
+  \item Nav2 的三个高危参数是 \lstinline{robot_radius}、\lstinline{inflation_radius}、\lstinline{cost_scaling_factor}，绝大多数"走不动/贴墙/原地转"都源于此。
+  \item 排错第一原则是\textbf{先录包、离线复现}；第二原则是按"频率 $\to$ TF $\to$ 时间戳 $\to$ 外参 $\to$ 参数"的顺序排查。
+\end{enumerate}
+
+
+\end{summary}
+
+\begin{problemset}
+
+  \item 你的 FAST-LIO 在长走廊里严重漂移，但转弯处正常。应该优先调 \lstinline{acc_cov}/\lstinline{gyr_cov} 还是 \lstinline{max_iteration}？说明理由。
+  \item Cartographer 建图出现"墙变成两条平行线"，请给出三种可能原因，并说明每种原因下应该看什么数据来区分。
+  \item Nav2 机器人在离目标 5\,cm 处原地抖动，列出至少三个相关参数并说明调整方向。
+  \item 为什么"一次只改一个参数"在调 LIO 时尤其重要？请结合参数之间的耦合（如降采样与迭代次数）说明。
+  \item 设计一个 30 分钟的排错流程，用于判断"定位偶尔跳 30\,cm"是时间同步问题还是重定位问题。
+\end{problemset}
+
+\begin{reading}
+
+\begin{itemize}
+  \item FAST-LIO2 \cite{xu2022fastlio2} 与 Point-LIO \cite{he2023pointlio} 的原始论文：前者解释 iKD-Tree 与迭代 EKF，后者解释逐点更新为什么能提高带宽，读完再调 \lstinline{max_iteration} 会更有方向。
+  \item Cartographer 论文 \cite{hess2016cartographer} 与官方 tuning 文档：子图、分支定界回环、后端优化的关系讲得最清楚。
+  \item Nav2 官方文档的 \href{https://docs.nav2.org/configuration/index.html}{Configuration Guide}：每个参数的取值范围与单位，配合第~\ref{ch:22-nav2-practice} 章的实战链路使用。
+  \item 第~\ref{ch:17-advanced-lio} 章：FAST-LIO2 与 Point-LIO 的内部实现细节，是理解本章参数含义的前提。
+\end{itemize}
+
+
+\end{reading}

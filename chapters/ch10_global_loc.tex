@@ -1,0 +1,276 @@
+\chapter{全局定位与重定位}\label{ch:10-global-loc}
+
+\chapterintro{里程计回答的是「我相对刚才动了多少」，但它永远回答不了「我现在在地图的哪里」。机器人可能被放到赛场的任意角落开机，可能在比赛中被撞得转了三圈，也可能在长廊里迷失——这些情况都需要\textbf{全局定位}：在一张先验地图中确定自己的绝对位姿。本章讲清楚三件事：为什么里程计无法解决全局定位、粒子滤波为什么是解决它的标准工具（从贝叶斯递归一路推到重采样）、以及 AMCL 这个 ROS 里最常见的实现是怎么做的。学完本章，你应当能解释「绑架问题」为什么难，以及 KLD 采样公式里每个符号的含义。}
+
+\section{局部定位与全局定位}\label{sec:10-local-global}
+
+第~\ref{ch:04-odom-intro}~章已经区分了绝对定位与相对定位。从地图的使用方式看，还有一个更实用的分法：
+
+\begin{itemize}
+  \item \textbf{局部定位}（local localization，也叫位姿跟踪）：已知初始位姿（或初始位姿误差很小），在运动过程中持续修正。它依赖局部地图匹配，初值附近只有一个「吸引域」，一旦偏差超过这个范围就会跟丢。
+  \item \textbf{全局定位}（global localization）：初始位姿未知，需要在地图全局搜索所有可能的位姿，并从中挑出与当前观测一致的解。
+\end{itemize}
+
+里程计只能做局部定位：它提供的位姿是相对初始时刻的，初始时刻在地图里的位置它并不知道；而且里程计的漂移是累积的，时间越长，它离真实位姿越远，最终会超出任何匹配算法的收敛域。所以全局定位必须有「地图先验」和「全局搜索」两样东西。
+
+\textbf{绑架问题}（kidnapped robot problem）是全局定位的极端版本：机器人在正常运行时被突然「瞬移」到地图的另一个位置（现实中可能是被搬起、被撞飞、或开机后被人挪动）。此时它自己的里程计还停留在旧位置，所有基于「上一时刻位姿」的跟踪都会失效，必须能够主动怀疑自己、重新搜索全局。
+
+\section{基于地图的定位方法}\label{sec:10-methods}
+
+按匹配与搜索的方式，基于地图的定位可以分为四类：
+
+\begin{itemize}
+  \item \textbf{栅格匹配}：把激光扫描与占据栅格地图做相关匹配，在位姿空间里搜索得分最高的位置。2D 场景下典型代表是相关性扫描匹配（第~\ref{ch:07-lidar-odom}~章）。
+  \item \textbf{特征匹配}：从地图与当前扫描中提取几何特征（直线、角点、平面），用特征对应关系解算位姿。结构化场景（走廊、房间）效果好，但特征提取本身可能失败。
+  \item \textbf{描述子检索 + 配准}：先用地点的全局描述子在地图数据库中检索候选位置，再做局部配准。Scan Context \cite{kim2018scancontext} 是典型代表：把点云按「环—扇区」划分成二维矩阵，每个元素取该区域最大高度，得到一个对旋转敏感、对平移鲁棒的描述子；检索时按列移位匹配，找到最相似的历史地点。这类方法适合大场景重定位与回环检测。
+  \item \textbf{粒子滤波}：用一组带权样本表示位姿的置信度分布，能同时维护多个假设，天然适合全局定位与绑架恢复。AMCL（adaptive Monte Carlo localization）就是它的工程实现 \cite{fox2003amcl}。
+\end{itemize}
+
+本章重点讲粒子滤波，因为它是唯一能同时处理「多峰分布」与「全局搜索」的通用框架，也是理解 AMCL、Cartographer 定位模式、以及第~\ref{ch:23-zlocalization}~章重定位模块的基础。
+
+\section{贝叶斯滤波递归}\label{sec:10-bayes}
+
+全局定位的本质是「在给定历史观测与运动的情况下，推断当前位姿的后验分布」。记时刻 $t$ 的位姿为 $\bm{x}_t$，控制/里程计输入为 $\bm{u}_t$，观测为 $\bm{z}_t$，历史为 $\bm{z}_{1:t}=\{\bm{z}_1,\dots,\bm{z}_t\}$、$\bm{u}_{1:t}$。定义\textbf{置信度}（belief）
+\begin{equation}
+  \mathrm{bel}(\bm{x}_t) = p\left(\bm{x}_t\mid\bm{z}_{1:t},\bm{u}_{1:t}\right).
+  \label{eq:10-belief}
+\end{equation}
+下面从条件概率与贝叶斯公式把它写成递推形式。由条件概率定义 $p(a\mid b)=p(a,b)/p(b)$，有
+\begin{equation}
+  p\left(\bm{x}_t\mid\bm{z}_{1:t},\bm{u}_{1:t}\right)
+  = \frac{p\left(\bm{z}_t\mid\bm{x}_t,\bm{z}_{1:t-1},\bm{u}_{1:t}\right)
+    p\left(\bm{x}_t\mid\bm{z}_{1:t-1},\bm{u}_{1:t}\right)}
+  {p\left(\bm{z}_t\mid\bm{z}_{1:t-1},\bm{u}_{1:t}\right)}.
+  \label{eq:10-bayes-step1}
+\end{equation}
+分母只与观测有关、与 $\bm{x}_t$ 无关，可以写成一个归一化常数 $\eta$。对第一个因子用\textbf{马尔可夫假设}（观测只依赖当前状态）：$p(\bm{z}_t\mid\bm{x}_t,\bm{z}_{1:t-1},\bm{u}_{1:t})=p(\bm{z}_t\mid\bm{x}_t)$。对第二个因子，把 $\bm{x}_{t-1}$ 作为中间变量引入全概率公式：
+\begin{equation}
+  p\left(\bm{x}_t\mid\bm{z}_{1:t-1},\bm{u}_{1:t}\right)
+  = \int p\left(\bm{x}_t\mid\bm{x}_{t-1},\bm{z}_{1:t-1},\bm{u}_{1:t}\right)
+    p\left(\bm{x}_{t-1}\mid\bm{z}_{1:t-1},\bm{u}_{1:t}\right)\diff\bm{x}_{t-1}.
+\end{equation}
+再用一次马尔可夫假设：$\bm{x}_t$ 只依赖 $\bm{x}_{t-1}$ 与当前输入 $\bm{u}_t$，即 $p(\bm{x}_t\mid\bm{x}_{t-1},\bm{z}_{1:t-1},\bm{u}_{1:t})=p(\bm{x}_t\mid\bm{x}_{t-1},\bm{u}_t)$；且 $\bm{x}_{t-1}$ 不依赖未来的输入 $\bm{u}_t$，故 $p(\bm{x}_{t-1}\mid\bm{z}_{1:t-1},\bm{u}_{1:t})=\mathrm{bel}(\bm{x}_{t-1})$。代回式~\eqref{eq:10-bayes-step1} 得
+\begin{equation}
+  \mathrm{bel}(\bm{x}_t)
+  = \eta\,p\left(\bm{z}_t\mid\bm{x}_t\right)
+  \int p\left(\bm{x}_t\mid\bm{x}_{t-1},\bm{u}_t\right)\mathrm{bel}(\bm{x}_{t-1})\diff\bm{x}_{t-1}.
+  \label{eq:10-bayes-recursion}
+\end{equation}
+式~\eqref{eq:10-bayes-recursion} 就是\textbf{贝叶斯滤波递归}：$\int p(\bm{x}_t\mid\bm{x}_{t-1},\bm{u}_t)\mathrm{bel}(\bm{x}_{t-1})\diff\bm{x}_{t-1}$ 是「预测」，用运动模型把上一时刻的置信度推演到当前时刻；乘以 $p(\bm{z}_t\mid\bm{x}_t)$ 是「更新」，用当前观测给预测加权；$\eta$ 是归一化。卡尔曼滤波、粒子滤波、直方图滤波都是它的不同实现：区别只在「怎么表示 bel」。
+
+\section{粒子滤波}\label{sec:10-pf}
+
+贝叶斯递归里的积分一般没有解析解，粒子滤波的解法是：用 $N$ 个带权样本（粒子）近似置信度：
+\begin{equation}
+  \mathrm{bel}(\bm{x}_t) \approx \sum_{i=1}^{N} w_t^{i}\,\delta\left(\bm{x}_t-\bm{x}_t^{i}\right),
+  \label{eq:10-particles}
+\end{equation}
+其中 $\bm{x}_t^{i}$ 是第 $i$ 个粒子（一个位姿假设），$w_t^{i}$ 是它的归一化权重（$\sum_i w_t^i=1$），$\delta$ 是狄拉克函数。位姿的估计值可以取加权均值，也可以取权重最大的粒子。
+
+\subsection{重要性采样}
+
+直接按 $\mathrm{bel}$ 采样做不到（$\mathrm{bel}$ 本身就是要估计的量）。\textbf{重要性采样}（importance sampling）的思路是：从一个容易采样的\textbf{提议分布}（proposal distribution）$q(\bm{x})$ 采样，再用权重修正它与 $\mathrm{bel}$ 的差异。对任意函数 $f$，其期望为
+\begin{align}
+  \E_{\mathrm{bel}}\left[f(\bm{x})\right]
+  &= \int f(\bm{x})\,\mathrm{bel}(\bm{x})\diff\bm{x} \notag\\
+  &= \int f(\bm{x})\,\frac{\mathrm{bel}(\bm{x})}{q(\bm{x})}\,q(\bm{x})\diff\bm{x} \notag\\
+  &= \E_{q}\left[f(\bm{x})\,w(\bm{x})\right],
+  \qquad
+  w(\bm{x}) = \frac{\mathrm{bel}(\bm{x})}{q(\bm{x})}.
+  \label{eq:10-is}
+\end{align}
+第二个等号是在积分里「乘一个 $q$ 再除一个 $q$」，前提是 $q(\bm{x})>0$ 在所有 $\mathrm{bel}(\bm{x})>0$ 处成立。实践中 $\mathrm{bel}$ 只知道到常数因子（归一化常数未知），因此改用未归一化权重 $\tilde{w}(\bm{x})=\mathrm{bel}(\bm{x})/q(\bm{x})$，再归一化：
+\begin{equation}
+  w^{i} = \frac{\tilde{w}^{i}}{\sum_{j=1}^{N}\tilde{w}^{j}}.
+  \label{eq:10-w-normalize}
+\end{equation}
+
+\subsection{序贯重要性采样}
+
+把重要性采样用到贝叶斯递归上，得到\textbf{序贯重要性采样}（sequential importance sampling, SIS）。关键选择：用「运动模型」作为提议分布，即从 $q(\bm{x}_t\mid\bm{x}_{t-1}^{i},\bm{u}_t)=p(\bm{x}_t\mid\bm{x}_{t-1}^{i},\bm{u}_t)$ 采样当前粒子。此时权重可以递推。由权重定义
+\begin{equation}
+  w_t^{i} = \frac{\mathrm{bel}(\bm{x}_t^{i})}{q(\bm{x}_t^{i}\mid\bm{x}_{t-1}^{i},\bm{u}_t)}.
+\end{equation}
+把式~\eqref{eq:10-bayes-recursion} 的 $\mathrm{bel}(\bm{x}_t^{i})\propto p(\bm{z}_t\mid\bm{x}_t^{i})\int p(\bm{x}_t^{i}\mid\bm{x}_{t-1},\bm{u}_t)\mathrm{bel}(\bm{x}_{t-1})\diff\bm{x}_{t-1}$ 代入，并用粒子近似把积分写成求和：
+\begin{equation}
+  \mathrm{bel}(\bm{x}_t^{i}) \propto p\left(\bm{z}_t\mid\bm{x}_t^{i}\right)
+  \sum_{j=1}^{N}w_{t-1}^{j}\,p\left(\bm{x}_t^{i}\mid\bm{x}_{t-1}^{j},\bm{u}_t\right).
+\end{equation}
+对我们从 $\bm{x}_{t-1}^{i}$ 采样得到的那个粒子，求和里只有 $j=i$ 的项被采样到，其余项在粒子近似下不贡献，于是
+\begin{equation}
+  \mathrm{bel}(\bm{x}_t^{i}) \propto p\left(\bm{z}_t\mid\bm{x}_t^{i}\right)w_{t-1}^{i}\,p\left(\bm{x}_t^{i}\mid\bm{x}_{t-1}^{i},\bm{u}_t\right).
+\end{equation}
+把它代回权重定义，提议分布恰好把这个运动模型因子约掉：
+\begin{equation}
+  w_t^{i} \propto \frac{p\left(\bm{z}_t\mid\bm{x}_t^{i}\right)w_{t-1}^{i}\,p\left(\bm{x}_t^{i}\mid\bm{x}_{t-1}^{i},\bm{u}_t\right)}{p\left(\bm{x}_t^{i}\mid\bm{x}_{t-1}^{i},\bm{u}_t\right)}
+  = w_{t-1}^{i}\,p\left(\bm{z}_t\mid\bm{x}_t^{i}\right).
+  \label{eq:10-weight-recursion}
+\end{equation}
+这就是粒子滤波最常用的权重更新式：\textbf{新权重 = 旧权重 × 观测似然}。它把「运动模型采样」与「观测加权」两件事分得干干净净。归一化后即得式~\eqref{eq:10-w-normalize}。
+
+\begin{keybox}{粒子滤波的三步循环}
+\begin{enumerate}
+  \item \textbf{预测}：对每个粒子，按运动模型 $p(\bm{x}_t\mid\bm{x}_{t-1}^{i},\bm{u}_t)$ 采样一个新位姿（把里程计增量加上噪声）；
+  \item \textbf{加权}：用观测模型算 $p(\bm{z}_t\mid\bm{x}_t^{i})$，乘到旧权重上并归一化；
+  \item \textbf{重采样}：按权重重新抽取 $N$ 个粒子，权重重置为 $1/N$。
+\end{enumerate}
+循环往复，粒子会逐渐聚集到与观测一致的位置。
+\end{keybox}
+
+\subsection{重采样与样本贫化}
+
+只加权不重采样，运行一段时间后会出现\textbf{权重退化}：绝大多数粒子的权重趋近于零，有效粒子数急剧减少，计算资源被浪费在无意义的粒子上。重采样的做法是「按权重的比例复制粒子」：权重大的粒子被多复制，权重小的被淘汰。重采样后所有粒子权重相等，再继续下一轮。
+
+重采样也有代价：它会让粒子多样性下降（同一个高权重粒子被复制多份），长期运行后可能出现\textbf{样本贫化}（sample impoverishment）——粒子全都挤在一个假设附近，丧失探索其他可能位置的能力。缓解手段包括：只在必要时重采样、加入少量随机粒子、使用低方差重采样算法。
+
+\textbf{何时重采样？}用\textbf{有效粒子数}（effective sample size）判断：
+\begin{equation}
+  N_{\text{eff}} = \frac{1}{\sum_{i=1}^{N}\left(w^{i}\right)^{2}}.
+  \label{eq:10-neff}
+\end{equation}
+它的含义是：这组带权粒子「等效于」多少个等权粒子。当所有权重相等（$w^i=1/N$）时，$N_{\text{eff}}=N$；当一个粒子独占权重时，$N_{\text{eff}}=1$。典型做法是 $N_{\text{eff}}<N/2$ 时才重采样。
+
+\textbf{系统重采样}是最常用的低方差重采样算法：把权重累积成区间 $[0,1)$，产生一个在 $[0,1/N)$ 内均匀分布的随机数 $u$，然后依次取 $u,\ u+1/N,\ u+2/N,\dots$，看每个点落在哪个粒子的累积区间里，就复制该粒子。它只用一次随机数，方差比「独立重复抽样」小。
+
+\begin{pseudo}{系统重采样}
+  \item 输入：粒子 $\{\bm{x}^{i}\}_{i=1}^{N}$ 与权重 $\{w^{i}\}$（$\sum_i w^i=1$）
+  \item 计算累积权重：$c_1\leftarrow w^{1}$，$c_i\leftarrow c_{i-1}+w^{i}$
+  \item 采样起点 $u\sim\mathcal{U}\left[0,\ 1/N\right)$，令 $r\leftarrow u$
+  \item 对 $k=1,\dots,N$：
+  \item \quad 找到最小的 $i$ 使 $c_i\ge r$，复制粒子 $\bm{x}^{i}$ 到新集合
+  \item \quad $r\leftarrow r+1/N$
+  \item 输出：新粒子集合，权重全部置为 $1/N$
+\end{pseudo}
+
+\begin{figure}[htbp]
+  \centering
+  \begin{tikzpicture}[scale=0.9]
+    \foreach \dx/\lab in {0/{(a) 预测}, 4.4/{(b) 加权}, 8.8/{(c) 重采样}} {
+      \draw[thick, black!30] (\dx-0.4,-0.3) rectangle (\dx+3.4,3.3);
+      \node[font=\footnotesize] at (\dx+1.5,3.6) {\lab};
+    }
+    \foreach \x/\y/\r in {0.4/2.4/3, 1.2/1.1/3, 2.0/2.6/3, 0.8/0.4/3, 2.6/1.6/3, 2.2/0.6/3} {
+      \draw[structurecolor, fill=structurecolor!25] (\x,\y) circle (\r pt);
+    }
+    \node[font=\footnotesize, structurecolor] at (1.4,-0.7) {粒子按运动模型散开};
+    \foreach \x/\y/\r in {4.8/2.4/10, 5.6/1.1/4, 6.4/2.6/7, 5.2/0.4/2, 7.0/1.6/6, 6.6/0.6/3} {
+      \draw[structurecolor, fill=structurecolor!25] (\x,\y) circle (\r pt);
+    }
+    \node[font=\footnotesize, structurecolor] at (5.8,-0.7) {圆的面积正比于权重};
+    \foreach \x/\y/\r in {9.6/2.4/6, 9.6/2.2/6, 10.4/2.6/6, 9.8/0.9/5, 10.2/1.0/5, 9.9/2.5/6} {
+      \draw[structurecolor, fill=structurecolor!25] (\x,\y) circle (\r pt);
+    }
+    \node[font=\footnotesize, structurecolor] at (10.2,-0.7) {高权重粒子被复制};
+  \end{tikzpicture}
+  \caption{粒子滤波的一轮迭代：预测让粒子按运动模型散开并加入噪声；加权让与观测一致的粒子变大；重采样把高权重粒子复制、低权重粒子淘汰。}
+  \label{fig:10-pf}
+\end{figure}
+
+\section{AMCL：工程化的粒子滤波}\label{sec:10-amcl}
+
+AMCL \cite{fox2003amcl} 是 ROS 中实现 2D 全局定位的标准模块。它的输入是占据栅格地图、激光扫描与里程计，输出是 \texttt{map}$\to$\texttt{odom} 变换（以及位姿协方差）。它把粒子滤波拆成三个具体模型。
+
+\subsection{运动模型：从里程计增量采样}
+
+里程计给出相邻时刻的位姿增量，把它分解成三段：先原地转 $\delta_{\text{rot1}}$，再直行 $\delta_{\text{trans}}$，最后原地转 $\delta_{\text{rot2}}$。真实运动与里程计读数有偏差，AMCL 按如下方式加噪声再执行（$\alpha_1$--$\alpha_4$ 是噪声系数）：
+\begin{align}
+  \hat{\delta}_{\text{rot1}} &= \delta_{\text{rot1}}
+  + \mathrm{noise}\left(\alpha_1\delta_{\text{rot1}}^{2}+\alpha_2\delta_{\text{trans}}^{2}\right), \notag\\
+  \hat{\delta}_{\text{trans}} &= \delta_{\text{trans}}
+  + \mathrm{noise}\left(\alpha_3\delta_{\text{trans}}^{2}+\alpha_4\left(\delta_{\text{rot1}}^{2}+\delta_{\text{rot2}}^{2}\right)\right), \notag\\
+  \hat{\delta}_{\text{rot2}} &= \delta_{\text{rot2}}
+  + \mathrm{noise}\left(\alpha_1\delta_{\text{rot2}}^{2}+\alpha_2\delta_{\text{trans}}^{2}\right),
+  \label{eq:10-motion-model}
+\end{align}
+其中 $\mathrm{noise}(\sigma^{2})$ 表示从零均值高斯分布中采样，方差为 $\sigma^{2}$。这个模型的物理含义是：转得越多、走得越远，误差越大；而且「走」与「转」的误差相互耦合（走的时候会带一点转，转的时候会带一点走）。
+
+\subsection{观测模型：似然场}
+
+给定一个粒子位姿，怎么算「在这个位姿下看到当前激光扫描的概率」？AMCL 用\textbf{似然场}（likelihood field）模型：对每条激光束，取它的末端点在全局地图中的位置，查「该点到最近障碍物的距离」$d$，然后
+\begin{equation}
+  p\left(\bm{z}_t\mid\bm{x}_t^{i}\right) = \prod_{k=1}^{K}\left[
+  z_{\text{hit}}\cdot\exp\left(-\frac{d_k^{2}}{2\sigma_{\text{hit}}^{2}}\right)
+  + \frac{z_{\text{rand}}}{z_{\max}}\right],
+  \label{eq:10-likelihood-field}
+\end{equation}
+其中 $K$ 是激光束数，$d_k$ 是第 $k$ 条束末端到最近障碍的距离，$z_{\text{hit}}$ 是「命中」权重、$z_{\text{rand}}$ 是随机噪声权重，$z_{\max}$ 是最大量程。这个模型的好处是不需要做射线投射（ray casting），只需查一张预先算好的距离场（ESDF 的思想），速度快；缺点是它对「光束穿过墙」不敏感（只看到端点）。
+
+\subsection{KLD 采样：自适应粒子数}
+
+粒子数 $N$ 怎么定？固定值要么太浪费（简单场景），要么不够用（复杂场景）。AMCL 采用 \textbf{KLD 采样}（Kullback-Leibler divergence sampling）：边采样边观察「落到了多少个不同的状态格（bin）」$k$，当 $k$ 不再明显增长时停止。所需粒子数由下式给出：
+\begin{equation}
+  n = \frac{1}{2\varepsilon^{2}}\,\chi^{2}_{k-1,\,1-\delta},
+  \label{eq:10-kld}
+\end{equation}
+其中各符号含义如下：
+\begin{itemize}
+  \item $\varepsilon$：允许的误差尺度。本书按提纲约定，把它对应的 KL 散度上界记作 $\varepsilon^{2}$（有的文献直接把该上界记作 $\varepsilon$，公式就写成 $n=\chi^{2}_{k-1,1-\delta}/(2\varepsilon)$，两者只差一个记号约定）；
+  \item $\delta$：允许的失败概率，即真实分布与样本分布偏离超过上界的概率；
+  \item $k$：当前已经被采样到的不同 bin 的数量，bin 越多样本越分散，需要的粒子越多；
+  \item $\chi^{2}_{k-1,1-\delta}$：自由度为 $k-1$ 的卡方分布的 $1-\delta$ 分位数（卡方分布见第~\ref{ch:02-math}~章）。
+\end{itemize}
+这个公式来自多项分布的统计推断：$k$ 个 bin 上的样本计数服从多项分布，其 Pearson 统计量 $\sum_j(N_j-np_j)^{2}/(np_j)$ 近似服从 $\chi^{2}(k-1)$；要让经验分布与真实分布的 KL 散度以概率 $1-\delta$ 不超过上界，就需要 $n$ 至少取上式。直观上：bin 越多、要求越准、要求越有把握，粒子就越多。
+
+\begin{example}[KLD 采样的粒子数]
+设当前采样到 $k=30$ 个 bin，$\delta=0.01$（要求 $99\,\%$ 的把握），查表得 $\chi^{2}_{29,0.99}\approx49.6$。若取 $\varepsilon=0.2$，则
+\begin{equation}
+  n=\frac{49.6}{2\times0.2^{2}}=\frac{49.6}{0.08}\approx620.
+\end{equation}
+也就是说这个场景下 $600$ 多个粒子就够了。若 $\varepsilon$ 缩小到 $0.1$（精度要求翻倍），粒子数会变成约 $2480$——这说明「精度」与「计算量」是平方关系，调参时要格外小心。
+\end{example}
+
+\section{重定位与绑架恢复}\label{sec:10-relocal}
+
+有了全局定位的框架，重定位的具体策略还需要考虑工程可行性：
+
+\begin{itemize}
+  \item \textbf{初始化}：机器人开机时，把粒子均匀撒在地图的可行区域（或按已知的初始区域撒），第一帧观测后权重会迅速集中在少数假设上。若初始位置已知（如比赛固定起点），可以直接在起点附近撒，收敛更快。
+  \item \textbf{丢失恢复}：持续监控粒子权重与观测似然。如果长时间似然很低、$N_{\text{eff}}$ 很小，说明当前假设与观测不符，可能是跟丢了；此时注入随机粒子（在全局或局部重新撒），让滤波器有机会「重新找到自己」。
+  \item \textbf{多假设}：人在长廊里也会犹豫，粒子滤波天然维护多个假设。不要过早把粒子聚成一个——在对称场景（两条相似的走廊）里，保留多个峰比强行选一个更安全。
+  \item \textbf{开关式重定位}：把「局部跟踪」与「全局重定位」做成两个模式，局部跟踪置信度低时切到全局模式，置信度恢复后切回。这是第~\ref{ch:23-zlocalization}~章 Z-Localization 前后端分离思想的一种体现。
+\end{itemize}
+
+\begin{keybox}{全局定位的四个工程要点}
+\begin{enumerate}
+  \item 粒子数要自适应：用 KLD 采样，别硬编码一个巨大值；
+  \item 观测模型要快：似然场查表比射线投射快一个数量级；
+  \item 重采样要克制：$N_{\text{eff}}$ 低于阈值再重采样，避免样本贫化；
+  \item 要知道自己可能错：永远保留随机粒子与多假设，才能从绑架中恢复。
+\end{enumerate}
+\end{keybox}
+
+\begin{summary}
+
+\begin{enumerate}
+  \item 局部定位是位姿跟踪，全局定位要在整张地图上搜索；里程计只能做局部，因为它不知道初始位姿且会累积漂移。
+  \item 基于地图的定位分栅格匹配、特征匹配、描述子检索 + 配准、粒子滤波四类；Scan Context 是描述子检索的代表。
+  \item 贝叶斯滤波递归：$\mathrm{bel}(\bm{x}_t)=\eta\,p(\bm{z}_t\mid\bm{x}_t)\int p(\bm{x}_t\mid\bm{x}_{t-1},\bm{u}_t)\mathrm{bel}(\bm{x}_{t-1})\diff\bm{x}_{t-1}$，由条件概率、贝叶斯公式与两处马尔可夫假设推出。
+  \item 粒子滤波用带权样本近似置信度；序贯重要性采样的权重递推为 $w_t^{i}\propto w_{t-1}^{i}p(\bm{z}_t\mid\bm{x}_t^{i})$。
+  \item 重采样按权重复制粒子，代价是样本贫化；用 $N_{\text{eff}}=1/\sum(w^{i})^{2}$ 判断是否需要重采样，系统重采样方差最小。
+  \item AMCL 由运动模型采样、似然场观测模型、KLD 自适应粒子数三部分组成；KLD 公式 $n=\chi^{2}_{k-1,1-\delta}/(2\varepsilon^{2})$ 中 $\varepsilon$ 是误差尺度、$\delta$ 是失败概率、$k$ 是 bin 数。
+  \item 绑架问题需要「怀疑自己」的机制：随机粒子注入、多假设、开关式重定位是常用手段。
+\end{enumerate}
+
+
+\end{summary}
+
+\begin{problemset}
+
+  \item 从条件概率定义出发，重推贝叶斯滤波递归式~\eqref{eq:10-bayes-recursion}，并在每一步旁标注用了哪条马尔可夫假设。
+  \item 解释为什么提议分布取运动模型时，权重递推式~\eqref{eq:10-weight-recursion} 里没有运动模型项；如果提议分布改成「带噪声的运动模型」，权重会变成什么形式？
+  \item 设 $N=5$，权重为 $\{0.4,0.3,0.2,0.05,0.05\}$，计算 $N_{\text{eff}}$，并手动执行一次系统重采样（给定 $u=0.03$），写出新粒子集合。
+  \item 用式~\eqref{eq:10-kld} 计算 $k=50$、$\delta=0.05$、$\varepsilon=0.15$ 时的粒子数（$\chi^{2}_{49,0.95}\approx66.3$）。
+  \item 说明似然场模型式~\eqref{eq:10-likelihood-field} 中 $z_{\text{hit}}$、$z_{\text{rand}}$、$z_{\max}$ 各自的物理作用，以及 $d_k$ 是怎么算出来的。
+  \item 设计一个「绑架检测」方案：用哪些量、什么阈值、检出后如何恢复？请结合本章内容说明。
+\end{problemset}
+
+\begin{reading}
+
+\begin{itemize}
+  \item Thrun 等《Probabilistic Robotics》第 8 章：粒子滤波与 Monte Carlo 定位的系统推导。
+  \item Fox 等 2003 年的 AMCL 论文（\href{https://ieeexplore.ieee.org/document/1249223}{IEEE TPAMI}）：似然场模型与 KLD 采样。
+  \item Scan Context 论文与代码（\href{https://github.com/irapkaist/scancontext}{GitHub}）：大场景地点检索的工程实现。
+\end{itemize}
+
+
+\end{reading}

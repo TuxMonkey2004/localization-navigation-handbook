@@ -1,0 +1,308 @@
+% 本章使用 TikZ 的 arrows.meta / positioning 库（main.tex 已加载，此处保证单章自检也能编译）
+\usetikzlibrary{arrows.meta, positioning}
+
+\chapter{SLAM 框架：前端与后端}\label{ch:11-slam-framework}
+
+\chapterintro{从这一章开始进入 SLAM 篇。前面两部分我们先后回答了三个问题：位置、姿态与坐标变换怎么描述（第~\ref{ch:02-math}~章），传感器能测到什么（第~\ref{ch:03-sensors}~章），以及只靠里程计能不能定位（第~\ref{ch:04-odom-intro}~章至第~\ref{ch:10-global-loc}~章）。里程计给出的答案有一个绕不开的宿命：误差随时间累积，而它自己没有任何机制把误差``拉回来''。SLAM 要回答的正是这个问题——在\emph{没有}先验地图的未知环境里，机器人能否一边估计自己的轨迹、一边把地图建出来？本章不写具体算法，而是先把骨架立起来：把 SLAM 写成最大后验（MAP）估计，定义前端与后端，讲清它们各自负责什么、凭什么可以分开，并特别澄清一个新手最容易混淆的点——在 SLAM、定位系统、导航系统三种语境下，``前端/后端''指的并不是同一件事。读完本章，你应该能看懂任何一套 SLAM 系统的框图，并在读源码时迅速判断``这段代码属于哪一层''。}
+
+\section{先有鸡还是先有蛋：SLAM 到底难在哪}\label{sec:11-problem}
+
+先做一个思想实验。假设机器人手里已经有一张精确的地图 $\mathcal{M}$，那么定位就是回答``在当前观测 $\bm{z}$ 下，我在哪''，即求后验 $p(\bm{x}\mid \bm{z},\mathcal{M})$。这正是第~\ref{ch:10-global-loc}~章的粒子滤波定位在做的事：地图是已知的，状态只有一个位姿。
+
+反过来，假设有人告诉机器人它每一时刻的精确位姿 $\bm{x}_0,\bm{x}_1,\dots,\bm{x}_N$，那么建图就是把这些位姿下的观测``贴''到地图上做融合，这正是第~\ref{ch:14-mapping}~章要讲的占据栅格、TSDF 等内容：位姿是已知的，地图是待求量。
+
+SLAM 的处境是两者都没有。机器人既不知道位姿，也没有地图，只能拿着一串观测 $\bm{Z}=\{\bm{z}_1,\dots,\bm{z}_M\}$ 和一串输入 $\bm{U}=\{\bm{u}_1,\dots,\bm{u}_N\}$（轮速、IMU 读数等），指望同时把它们都估出来。这就是著名的``鸡生蛋''困境：定位需要地图，建图需要位姿。
+
+\begin{definition}[SLAM]
+同时定位与建图（Simultaneous Localization and Mapping，SLAM）是指：机器人在未知环境中运动时，仅利用自身携带的传感器观测（可包含里程计等 proprioceptive 输入），\textbf{在线地、同时地}估计自身位姿轨迹并构建环境地图的问题。
+\end{definition}
+
+把它写成联合后验的形式，就是本章所有内容的出发点：
+\begin{equation}
+p\big(X,\mathcal{M}\mid \bm{Z},\bm{U}\big),
+\qquad X=\{\bm{x}_0,\bm{x}_1,\dots,\bm{x}_N\},\quad \mathcal{M}=\text{地图}.
+\label{eq:11-joint}
+\end{equation}
+式~\eqref{eq:11-joint} 中 $X$ 是待估轨迹，$\mathcal{M}$ 是待估地图，条件是全部观测 $\bm{Z}$ 与输入 $\bm{U}$。这个式子看着简单，却藏着两个根本困难。
+
+\textbf{困难一：维度爆炸。}一张 $100\ \mathrm{m}\times 100\ \mathrm{m}$、分辨率 $5\ \mathrm{cm}$ 的二维栅格地图有 $2000\times 2000=4\times 10^{6}$ 个格子，每个格子一个未知量；再乘上上千个位姿，联合状态的维数是百万量级。想直接套用卡尔曼滤波把这么大的协方差矩阵求逆，内存与计算都无法接受。
+
+\textbf{困难二：数据关联。}机器人并不知道``这一帧点云里的第 37 个点''与``上一帧里的哪个点''观测的是同一个物理表面。连''哪一帧和哪一帧到过同一个地方''都不知道。这个''配对''过程一旦出错，就会把一个错误的约束喂给优化器，让整张地图扭曲。因此我们先把这件事定义清楚。
+
+\begin{definition}[数据关联]
+数据关联（data association）是指在两次或多次传感器观测之间，确定``哪些观测量对应同一个物理实体''的过程。激光 SLAM 中它表现为点与点、点与面、帧与子图之间的对应；视觉 SLAM 中它表现为特征点匹配；在整个系统层面，它表现为``当前帧是否回到了历史某处''，即回环检测。
+\end{definition}
+
+数据关联可以分为三个层次，后面各章会依次展开：\textbf{帧间关联}（当前帧与上一帧，见第~\ref{ch:12-frontend}~章）、\textbf{帧到地图关联}（当前帧与局部地图，见第~\ref{ch:12-frontend}~章）、\textbf{全局关联}（当前帧与历史所有子图，即回环检测，见第~\ref{ch:12-frontend}~章与第~\ref{ch:15-cartographer}~章）。
+
+\begin{keybox}{一句话记住 SLAM 的两张皮}
+\textbf{数据关联}把传感器的原始数据变成``谁和谁有关系''；\textbf{状态估计}把这些关系变成``一致的轨迹和地图''。SLAM 系统的一切复杂度，都来自这两件事互相依赖：关联错了，估计就歪；估计歪了，下一帧的关联更容易错。
+\end{keybox}
+
+\section{从最大后验到最小二乘}\label{sec:11-map}
+
+上面说的是``难在哪''，这一节说''怎么写成可计算的式子''。SLAM 的标准做法是把式~\eqref{eq:11-joint} 当成一个最大后验估计问题。
+
+\begin{definition}[最大后验估计]
+最大后验估计（Maximum A Posteriori，MAP）是指：在已知观测 $\bm{z}$ 的条件下，取使后验概率密度最大的状态作为估计值，即 $\hat{\bm{x}}=\argmax_{\bm{x}} p(\bm{x}\mid\bm{z})$。它与最大似然估计（ML，$\argmax p(\bm{z}\mid\bm{x})$）的区别是：MAP 额外乘上了先验 $p(\bm{x})$，因此可以融合``观测之外的已有知识''。
+\end{definition}
+
+由贝叶斯公式（定义见第~\ref{ch:02-math}~章）有
+\begin{align}
+p(X,\mathcal{M}\mid \bm{Z},\bm{U})
+  &= \frac{p(\bm{Z}\mid X,\mathcal{M})\,p(X,\mathcal{M}\mid\bm{U})}{p(\bm{Z}\mid\bm{U})}.
+\label{eq:11-bayes-posterior}
+\end{align}
+分母 $p(\bm{Z}\mid\bm{U})$ 与待估量 $X,\mathcal{M}$ 无关，在对 $X,\mathcal{M}$ 取 $\argmax$ 时可以丢掉，于是
+\begin{equation}
+p(X,\mathcal{M}\mid \bm{Z},\bm{U}) \;\propto\; \underbrace{p(\bm{Z}\mid X,\mathcal{M})}_{\text{似然}}\;\underbrace{p(X,\mathcal{M}\mid\bm{U})}_{\text{先验}}.
+\label{eq:11-propto}
+\end{equation}
+
+接下来对式~\eqref{eq:11-propto} 做两个标准假设，把联合概率拆成一个个小因子——这一步是把``一个巨大的概率''变成``一堆可分别计算的残差''的关键。
+
+\textbf{假设 A（观测条件独立）：}给定位姿与地图后，各次观测互相独立，
+\begin{equation}
+p(\bm{Z}\mid X,\mathcal{M})=\prod_{j=1}^{M}p\big(\bm{z}_j\mid \bm{x}_{i(j)},\mathcal{M}\big),
+\end{equation}
+其中 $\bm{x}_{i(j)}$ 表示第 $j$ 个观测所涉及的那个位姿。直观理解：传感器每一帧的噪声不会``串''到下一帧。
+
+\textbf{假设 B（一阶马尔可夫性）：}位姿轨迹的生成只依赖上一时刻，
+\begin{equation}
+p(X,\mathcal{M}\mid\bm{U})=p(\bm{x}_0)\,p(\mathcal{M})\prod_{i=1}^{N}p\big(\bm{x}_i\mid\bm{x}_{i-1},\bm{u}_i\big).
+\end{equation}
+这相当于说：知道了上一帧位姿和这一帧的里程计读数，这一帧位姿就与更早的历史无关。
+
+把 A、B 代入式~\eqref{eq:11-propto}，得到
+\begin{equation}
+p(X,\mathcal{M}\mid \bm{Z},\bm{U}) \;\propto\;
+p(\bm{x}_0)\,p(\mathcal{M})\prod_{i=1}^{N}p(\bm{x}_i\mid\bm{x}_{i-1},\bm{u}_i)
+\prod_{j=1}^{M}p(\bm{z}_j\mid\bm{x}_{i(j)},\mathcal{M}).
+\label{eq:11-factorized}
+\end{equation}
+
+式~\eqref{eq:11-factorized} 是一个连乘。连乘不好优化，但取对数就变成连加，而 $\log$ 是单调递增函数，不会改变极值点的位置：
+\begin{align}
+X^{\star},\mathcal{M}^{\star}
+  &= \argmax_{X,\mathcal{M}} p(X,\mathcal{M}\mid\bm{Z},\bm{U}) \notag\\
+  &= \argmax_{X,\mathcal{M}} \log p(X,\mathcal{M}\mid\bm{Z},\bm{U}) \notag\\
+  &= \argmax_{X,\mathcal{M}} \Big\{ \log p(\bm{x}_0)+\log p(\mathcal{M})
+     +\sum_{i=1}^{N}\log p(\bm{x}_i\mid\bm{x}_{i-1},\bm{u}_i)
+     +\sum_{j=1}^{M}\log p(\bm{z}_j\mid\bm{x}_{i(j)},\mathcal{M}) \Big\}.
+\label{eq:11-log-posterior}
+\end{align}
+注意 $\argmax f = \argmin(-f)$，把上式整体加负号、再改写成最小化，就得到``负对数后验''。这一步是整个 SLAM 后端（以及所有状态估计）的公共起点。
+
+现在代入高斯假设。若某次测量满足 $\bm{z}=\bm{h}(\bm{x})+\bm{n}$，噪声 $\bm{n}\sim\mathcal{N}(\bm{0},\bm{\Sigma})$（高斯的定义见第~\ref{ch:02-math}~章），则
+\begin{equation}
+p(\bm{z}\mid\bm{x})=\frac{1}{\sqrt{(2\pi)^k\det\bm{\Sigma}}}\exp\!\Big(-\frac12\big(\bm{z}-\bm{h}(\bm{x})\big)^{\top}\bm{\Sigma}^{-1}\big(\bm{z}-\bm{h}(\bm{x})\big)\Big).
+\end{equation}
+两边取负对数，记残差 $\bm{r}(\bm{x})=\bm{z}-\bm{h}(\bm{x})$：
+\begin{align}
+-\log p(\bm{z}\mid\bm{x})
+  &= \frac12\,\bm{r}^{\top}\bm{\Sigma}^{-1}\bm{r}
+   + \frac12\log\det\bm{\Sigma} + \frac{k}{2}\log 2\pi .
+\label{eq:11-neglog}
+\end{align}
+后两项与 $\bm{x}$ 无关，优化时可以扔掉。于是定义\textbf{马氏范数}（Mahalanobis norm，其几何含义见第~\ref{ch:09-fusion}~章）
+\begin{equation}
+\norm{\bm{r}}_{\bm{\Sigma}^{-1}}^{2} \;\triangleq\; \bm{r}^{\top}\bm{\Sigma}^{-1}\bm{r},
+\end{equation}
+它相当于先把残差除以``该方向上的标准差''再做平方和：$\bm{\Sigma}$ 大（这个方向测不准）的方向权重小，$\bm{\Sigma}$ 小（测不准的程度低）的方向权重大。
+
+把式~\eqref{eq:11-neglog} 代回式~\eqref{eq:11-log-posterior}，并记每个因子对应一个残差 $\bm{r}_k$，最终得到 SLAM 的标准形式：
+\begin{equation}
+X^{\star} \;=\; \argmin_{X}\;\sum_{k=1}^{K}\frac12\,\norm{\bm{r}_k(X)}_{\bm{\Sigma}_k^{-1}}^{2}.
+\label{eq:11-ls}
+\end{equation}
+
+式~\eqref{eq:11-ls} 中每一类残差的物理含义如下（$K=N+M+1$ 个因子）：
+\begin{itemize}
+  \item \textbf{先验项} $\norm{\bm{r}_0}_{\bm{\Sigma}_0^{-1}}^2$：$-\log p(\bm{x}_0)$，来自起点先验或边缘化得到的信息；
+  \item \textbf{运动项} $\norm{\bm{r}_i}_{\bm{\Sigma}_i^{-1}}^2$：$-\log p(\bm{x}_i\mid\bm{x}_{i-1},\bm{u}_i)$，即里程计/IMU 预积分约束，量化``相邻两帧应该差多少''；
+  \item \textbf{观测项} $\norm{\bm{r}_j}_{\bm{\Sigma}_j^{-1}}^2$：$-\log p(\bm{z}_j\mid\bm{x}_{i(j)},\mathcal{M})$，即扫描匹配、重投影、点到面等几何约束，量化''当前位姿下，地图上应该看到什么''。
+\end{itemize}
+
+\begin{example}[一维两帧：最小二乘就是加权平均]
+设只有两个位姿 $x_0,x_1$（一维）。先验说 $x_0=0$，标准差 $\sigma_0=0.1$；里程计说 $x_1-x_0=1$，$\sigma_u=0.2$；观测说 $x_1=0.9$，$\sigma_z=0.1$。信息矩阵就是 $1/\sigma^2$，于是
+\begin{equation}
+J(x_0,x_1)=\frac{(x_0-0)^2}{2\times 0.01}+\frac{(x_1-x_0-1)^2}{2\times 0.04}+\frac{(x_1-0.9)^2}{2\times 0.01}.
+\end{equation}
+分别对 $x_0,x_1$ 求偏导并令其为零：
+\begin{align}
+\frac{\partial J}{\partial x_0} &= \frac{x_0}{0.01}-\frac{x_1-x_0-1}{0.04}=0
+  \;\Longrightarrow\; 5x_0-x_1+1=0,\\
+\frac{\partial J}{\partial x_1} &= \frac{x_1-x_0-1}{0.04}+\frac{x_1-0.9}{0.01}=0
+  \;\Longrightarrow\; 5x_1-x_0-4.6=0.
+\end{align}
+联立解得 $x_0=-1/60\approx-0.017$，$x_1=11/12\approx0.917$。可以看到：观测的 $\sigma$ 更小（更可信），所以 $x_1$ 停在 $0.9$ 附近而不是里程计说的 $1.0$；同时 $x_0$ 被微微拉离 $0$，以缓和``里程计说走了 1 米''与``观测说在 0.9 米''的矛盾。这就是最小二乘全部的工作方式——\textbf{在互相矛盾的约束之间按可信度做折中}。
+\end{example}
+
+\begin{keybox}{本部分的地基}
+式~\eqref{eq:11-ls} 说明 SLAM 在数学上就是\textbf{一个大规模稀疏非线性最小二乘问题}。``大规模''来自百万级地图与上千位姿，``稀疏''来自每个因子只涉及极少数变量。第~\ref{ch:13-backend}~章会专门讲怎么高效地解它。但解它之前，得先把残差造出来——造残差靠数据关联，这就是前端。
+\end{keybox}
+
+\section{前端与后端：职责划分}\label{sec:11-fe-be}
+
+既然 SLAM $=$ 数据关联 $+$ 状态估计，一个自然的工程划分就出现了：把``造残差''和``解残差''拆成两个模块。这就是前端与后端。
+
+\begin{definition}[前端（Front-end）]
+前端是 SLAM 系统中直接处理传感器原始数据、完成数据关联与局部位姿估计的部分。它的输出不是最终地图或最终轨迹，而是一组\textbf{相对位姿约束}（以及关键帧、回环候选），供后端使用。
+\end{definition}
+
+\begin{definition}[后端（Back-end）]
+后端是 SLAM 系统中接收前端给出的因子/约束、对整条轨迹（以及地图状态）做全局优化与一致性维护的部分。它的输出是全局一致的位姿轨迹、状态协方差以及更新后的地图，供定位、规划与显示使用。
+\end{definition}
+
+两者为什么必须分开？因为它们的\textbf{目标、节奏和失败模式完全不同}，见表~\ref{tab:11-fe-be}。
+
+\begin{table}[htbp]
+  \centering
+  \caption{SLAM 前端与后端的职责对比}\label{tab:11-fe-be}
+  \small
+  \begin{tabular}{p{0.14\linewidth}p{0.38\linewidth}p{0.38\linewidth}}
+    \toprule
+    维度 & 前端（Front-end） & 后端（Back-end） \\
+    \midrule
+    一句话 & 负责\emph{局部一致} & 负责\emph{全局一致} \\
+    输入 & 传感器原始数据（scan、图像、IMU、轮速） & 前端给出的因子/约束（相对位姿、回环边） \\
+    输出 & 相对位姿、关键帧、回环候选 & 全局位姿、协方差、地图更新量 \\
+    运行频率 & 高（$10\sim100$ Hz，与传感器同量级） & 低（$0.1\sim5$ Hz，或事件触发） \\
+    关键算法 & 预处理、扫描匹配、数据关联、外点剔除 & 因子图/位姿图优化、鲁棒核、边缘化、稀疏求解 \\
+    失败表现 & 漂移、跟踪丢失、关联错乱 & 全局变形、优化不收敛、回环错闭 \\
+    能否替代 & 可整体换掉（LOAM 换 Cartographer 前端） & 相对稳定（g2o/GTSAM/Ceres 通用） \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+表~\ref{tab:11-fe-be} 里最关键的一行是``一句话''。把它展开成一句可背诵的话：\textbf{前端把数据变成约束，后端把约束变成一致的轨迹与地图；前端可以错，但不能慢；后端可以慢，但不能错。}
+
+所谓``全局一致''是什么意思？设想机器人绕一个矩形走廊走了一圈回到起点。由于里程计的累积误差，前端给出的轨迹是一条\emph{不闭合}的螺旋线：最后一帧的位姿和第一帧差了两米。后端通过回环检测发现``这两帧其实是同一个地方''，于是把这个``差两米''的信息作为一条强约束加进去，重新优化全部轨迹，让首尾闭合。优化之后，整条轨迹上的每一帧位姿都会被微调——这就是后端的作用范围：它改的是整条轨迹，而前端只改当前帧。
+
+\section{三种语境下的``前端/后端''（重点）}\label{sec:11-three-contexts}
+
+``前端/后端''这个词在中文技术圈用得极多，但在三种语境下指的东西完全不同。新手最容易犯的错是：看完 SLAM 的前后端划分，转头去看定位系统或导航系统的框图，发现``前端''指的不是同一个东西，于是怀疑自己没学懂。其实不是你错，是术语重载了。本节把三种语境并排摆出来（表~\ref{tab:11-contexts}），并给出判断规则。
+
+\begin{table}[htbp]
+  \centering
+  \caption{三种语境下``前端/后端''的所指}\label{tab:11-contexts}
+  \footnotesize
+  \begin{tabular}{p{0.15\linewidth}p{0.27\linewidth}p{0.27\linewidth}p{0.19\linewidth}}
+    \toprule
+    语境 & ``前端''指什么 & ``后端''指什么 & 本书在哪讲 \\
+    \midrule
+    SLAM（建图） & 里程计 + 数据关联：预处理、帧间/帧到地图匹配、关键帧选取 & 全局优化 + 回环：因子图/位姿图优化、地图更新 & 第~\ref{ch:11-slam-framework}--\ref{ch:15-cartographer}~章 \\
+    定位系统 & 实时状态估计：LIO/VIO、ESKF，输出高频位姿与协方差 & 先验地图配准 + 因子图更新，低频修正漂移并判断可信度 & 第~\ref{ch:23-zlocalization}~章 \\
+    导航系统 & 感知：定位 + 建图 + 障碍检测，回答``我在哪、周围是什么'' & 决策与控制：行为树、规划器、控制器，回答``我该往哪走'' & 第~\ref{ch:18-nav-overview}~章 \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+\textbf{语境一：SLAM 意义下。}这是本章与第~\ref{ch:12-frontend}--\ref{ch:15-cartographer}~章默认使用的划分。前端 $=$ 里程计 $+$ 数据关联，后端 $=$ 优化 $+$ 回环。划分依据是\textbf{数学结构}：前端产出因子，后端求解式~\eqref{eq:11-ls}。
+
+\textbf{语境二：定位系统意义下。}一个定位系统（比如 RoboMaster 赛场上跑的 Z-Localization）并不建图，它面对的是一张\textbf{已有的}先验地图。此时``前端''是保持高频、连续的实时状态估计（LIO 或 ESKF），``后端''是与先验地图做配准、并用因子图把``先验地图约束''和``里程计约束''融合起来的那一层。划分依据是\textbf{信息的来源}：前端只用自己的传感器，后端引入了先验地图这个外部信息源。
+
+\textbf{语境三：导航系统意义下。}在 Nav2 这类导航框架里，``前端/后端''是按\textbf{信息流方向}划分的：定位与建图属于``感知前端''，回答``世界现在是什么样''；规划与控制属于``决策后端''，回答``接下来怎么做''。划分依据是\textbf{抽象层次}：前者输出世界状态，后者输出动作。
+
+\begin{keybox}{判断规则：先问信息链的终点}
+看到``前端/后端''，先别急着套定义，先问一句：\textbf{这条信息链的终点是什么？}终点是``地图与轨迹''，就是语境一；终点是``当前位姿''，就是语境二；终点是``速度指令''，就是语境三。三种语境并不冲突：同一个系统里可以同时存在三对前后端——Z-Localization 内部有语境二的一对，它又把位姿喂给 Nav2，成为语境三中``感知前端''的一部分。
+\end{keybox}
+
+\begin{note}
+本书的默认约定：第~\ref{ch:11-slam-framework}~章到第~\ref{ch:15-cartographer}~章，以及第~\ref{ch:16-lio-evolution}~章、第~\ref{ch:17-advanced-lio}~章，``前端/后端''一律指语境一；第~\ref{ch:23-zlocalization}~章按语境二讲；第~\ref{ch:18-nav-overview}~章按语境三讲。写作与阅读时请以各章开头的一句话声明为准。
+\end{note}
+
+\section{数据流：一帧数据在系统里走过的路}\label{sec:11-dataflow}
+
+把上面的职责划分画成图，就是图~\ref{fig:11-dataflow}。
+
+\begin{figure}[htbp]
+  \centering
+  \begin{tikzpicture}[font=\small]
+    \node[block]  (s)  at (0,0)      {传感器};
+    \node[block2] (fe) at (3.8,0)    {前端\\{\footnotesize 匹配 + 数据关联}};
+    \node[block]  (kf) at (7.6,0)    {关键帧\\{\footnotesize 相对位姿约束}};
+    \node[block2] (be) at (11.4,0)   {后端\\{\footnotesize 全局优化}};
+    \node[block]  (lc) at (7.6,2.1)  {回环检测};
+    \node[block]  (out) at (11.4,-2.1) {全局位姿\\{\footnotesize TF / 地图}};
+    \node[block]  (lm) at (3.8,-2.1) {局部地图};
+    \draw[arrow] (s)  -- node[label,above]{原始数据} (fe);
+    \draw[arrow] (fe) -- node[label,above]{关键帧} (kf);
+    \draw[arrow] (kf) -- node[label,above]{约束} (be);
+    \draw[arrow] (be) -- (out);
+    \draw[arrow] (out) -- node[label,below]{地图更新} (lm);
+    \draw[arrow] (lm) -- node[label,left,align=center]{局部\\地图} (fe);
+    \draw[arrow, dashed] (kf.north) -- (lc.south);
+    \draw[arrow, dashed] (lc.east) -| node[label,above,pos=0.35]{回环约束} (be.north);
+  \end{tikzpicture}
+  \caption{SLAM 系统的总体数据流。实线为在线主通路：传感器 $\rightarrow$ 前端 $\rightarrow$ 关键帧与约束 $\rightarrow$ 后端 $\rightarrow$ 全局位姿与地图；下方是``地图回喂前端''的闭环。虚线为回环检测这条\emph{全局数据关联}支路：它由前端发起、向后端提供回环约束。正是这条支路把``局部一致''升级为``全局一致''。}\label{fig:11-dataflow}
+\end{figure}
+
+沿着图~\ref{fig:11-dataflow} 把各个箭头上流动的数据说清楚，读源码时就能对上号：
+\begin{enumerate}
+  \item \textbf{传感器 $\rightarrow$ 前端}：原始 scan/图像/IMU，带时间戳，通常先做时间同步（第~\ref{ch:03-sensors}~章）。
+  \item \textbf{前端 $\rightarrow$ 关键帧}：每帧的相对位姿估计及其协方差，以及``这一帧够不够格当关键帧''的判断（第~\ref{ch:12-frontend}~章）。
+  \item \textbf{关键帧 $\rightarrow$ 后端}：一条条因子。最典型的是位姿图里的二元边（第~\ref{ch:13-backend}~章）。
+  \item \textbf{后端 $\rightarrow$ 全局位姿}：优化后的轨迹，发布成 TF 变换与地图坐标系（第~\ref{ch:25-ros2}~章会讲 TF 树）。
+  \item \textbf{全局位姿 / 地图 $\rightarrow$ 局部地图 $\rightarrow$ 前端}：前端做帧到地图匹配时需要一块``附近的地图''，这块地图由后端维护的全局地图裁剪而来。
+  \item \textbf{回环检测}：注意它在图里是``从前端出发''的。回环检测本质是\emph{全局范围的数据关联}，属于前端职责；它只负责``找出候选 + 校验''，把约束交给后端去优化。这是第~\ref{ch:12-frontend}~章要专门解释的一个常见误解。
+\end{enumerate}
+
+\section{SLAM 系统的分类}\label{sec:11-taxonomy}
+
+不同文献里的 SLAM 系统五花八门，其实可以从五个维度切开。每一项的取舍都对应着具体的工程权衡。
+
+\begin{enumerate}
+  \item \textbf{滤波 vs 优化。}滤波类（EKF-SLAM、FastSLAM）把状态和协方差一路递推，优点是天然增量、能做在线预测，缺点是协方差矩阵随状态维数平方增长，且线性化点一旦固定就无法回头修正。优化类（因子图、位姿图）把历史状态全部保留，用迭代最小二乘求解，优点是精度高、能全局重线性化，缺点是计算量随规模增长（靠稀疏性与增量求解缓解）。\textbf{现在主流是优化类}，原因见 \S\ref{sec:11-why-opt}。
+  \item \textbf{直接法 vs 特征法。}直接法直接用像素灰度/点云强度构造残差（如 DSO\cite{engel2018dso}），省去特征提取，在弱纹理场景更稳，但对光度变化与初值敏感；特征法先提取点/线/面特征再匹配（如 ORB-SLAM3\cite{campos2021orbslam3}），对光照鲁棒、容易做回环，但弱纹理处会丢特征。激光 SLAM 介于两者之间：``点到面''用的是几何结构而非人工特征。
+  \item \textbf{2D vs 3D。}2D 假设机器人在地面运动、地图是一层栅格，计算量小、结构简单，适合单层场地（第~\ref{ch:15-cartographer}~章）；3D 要恢复完整六自由度与三维地图，计算与内存大一个量级，但能处理坡道、多层、空中（第~\ref{ch:16-lio-evolution}~章与第~\ref{ch:17-advanced-lio}~章）。
+  \item \textbf{单机 vs 多机。}多机 SLAM 要让多个机器人共享地图并保持坐标系一致，核心难点从``估计''变成``通信与一致性''。
+  \item \textbf{离线 vs 在线。}离线（如用 rosbag 建图）可以用全局优化反复迭代，追求最好结果；在线必须满足实时性，只能``够用就好、逐步逼近''。
+\end{enumerate}
+
+\section{为什么现在的主流是``前端 LIO + 后端因子图''}\label{sec:11-why-opt}
+
+把本节前面的内容串起来，就能理解为什么近十年的主流架构几乎都是``前端高频里程计（LIO/VIO）$+$ 后端低频因子图''：LIO-SAM\cite{shan2020liosam}、FAST-LIO2\cite{xu2022fastlio2}、Cartographer\cite{hess2016cartographer} 都是这个骨架。原因有五条。
+
+\begin{enumerate}
+  \item \textbf{符合信息流。}前端能拿到的是``相邻两帧之间的关系''，这天然是相对约束；后端要回答的是``全局怎么摆''，天然是全局优化。把两者硬塞进一个滤波器，等于用递推的方式做全局问题，事倍功半。
+  \item \textbf{计算量可扩展。}式~\eqref{eq:11-ls} 的海森矩阵是稀疏的：每个因子只连接少数变量。1000 个位姿的位姿图，海森矩阵的非零元只占百分之几，稀疏 Cholesky 分解可以做到毫秒级；而同样规模的 EKF 要维护 $6000\times6000$ 的稠密协方差并每次求逆\cite{kummerle2011g2o}，根本跑不动。
+  \item \textbf{精度更高。}优化在后端每轮都重新线性化，而 EKF 只在一步处线性化一次，误差会沿着轨迹累积。因子图的表述方式在数学上等价于``对所有历史观测做联合最大似然''，这正是式~\eqref{eq:11-ls} 想做的事\cite{dellaert2017factorgraphs}。
+  \item \textbf{可恢复性。}前端总会漂移，甚至短时跟丢。只要后端还保存着历史因子，一次成功的回环或重定位就能把整条轨迹``拉正''；滤波器模式下历史状态已经被边缘化掉，想改也改不了。
+  \item \textbf{工程解耦。}前端可以整体替换（今天用 LOAM，明天换 Cartographer，甚至换成视觉），后端则可以一直用现成的图优化库（如 g2o、GTSAM、Ceres\cite{kummerle2011g2o}），基本不用动。这种接口稳定性对多人协作的算法组极其重要。
+\end{enumerate}
+
+代价也要说清楚：后端是滞后的，前端已经漂了几十米，后端才通过回环把误差摊平；如果前端漂移大到连回环都找不到（描述子已经对不上），后端也无能为力。所以``前端准''和``后端稳''是互补的两件事，缺一不可。
+
+\begin{summary}
+\begin{enumerate}
+  \item SLAM 是``定位需要地图、建图需要位姿''的鸡生蛋问题，形式化为联合后验 $p(X,\mathcal{M}\mid\bm{Z},\bm{U})$（式~\eqref{eq:11-joint}）。
+  \item 做两个假设（观测条件独立、一阶马尔可夫）后，联合后验拆成先验、运动、观测三类因子的连乘；取负对数并把噪声建模为高斯，就得到标准最小二乘形式 $\min_X\sum_k\frac12\norm{\bm{r}_k}_{\bm{\Sigma}_k^{-1}}^2$（式~\eqref{eq:11-ls}）。
+  \item 马氏范数 $\norm{\bm{r}}^2_{\bm{\Sigma}^{-1}}=\bm{r}^{\top}\bm{\Sigma}^{-1}\bm{r}$ 的含义是``按各方向可信度加权的平方误差''，信息矩阵 $\bm{\Sigma}^{-1}$ 越大该约束越硬。
+  \item 前端 $=$ 数据关联 $+$ 局部位姿估计，追求实时与鲁棒，负责\emph{局部一致}；后端 $=$ 全局优化 $+$ 回环，追求精度与可恢复，负责\emph{全局一致}（表~\ref{tab:11-fe-be}）。
+  \item ``前端/后端''有三种语境：SLAM 下按数学结构分（造因子/解因子），定位系统下按信息来源分（自身传感器/先验地图），导航系统下按抽象层次分（感知/决策）。判断规则是``先问信息链的终点''（表~\ref{tab:11-contexts}）。
+  \item 回环检测属于前端（全局数据关联），它产出约束，由后端优化；把回环检测归到后端是常见误解。
+  \item 主流架构``前端 LIO $+$ 后端因子图''的五条理由：符合信息流、计算可扩展、精度更高、可恢复、工程解耦；代价是后端滞后。
+\end{enumerate}
+
+
+\end{summary}
+
+\begin{problemset}
+  \item 在式~\eqref{eq:11-factorized} 的两个假设中，如果去掉``观测条件独立''，式子会变成什么样？举一个现实中不独立的例子（提示：同一帧内相邻点的噪声、动态物体）。
+  \item 用本节的加权平均方法重算：若观测标准差改为 $\sigma_z=0.3$（比里程计更不可信），$x_0,x_1$ 会偏向哪边？请给出解析解并与前面的 $0.917$ 对比。
+  \item 为什么说``回环检测属于前端''？如果把它硬放到后端，会在工程上带来什么麻烦？请从运行频率和数据依赖两个角度回答。
+  \item Z-Localization 里``前端''指 LIO、``后端''指先验地图配准 $+$ 因子图。请说明为什么这里的``后端''不需要维护地图，而 SLAM 的后端需要。
+  \item 假设你只有一只 2D 激光雷达和轮式里程计，在一个 $30\ \mathrm{m}\times20\ \mathrm{m}$ 的单层场地里建图，你会选滤波式还是优化式？说明你的取舍依据。
+\end{problemset}
+
+\begin{reading}
+\begin{enumerate}
+  \item Thrun, Burgard, Fox，《Probabilistic Robotics》第 10--11 章\cite{thrun2005probabilistic}：SLAM 的概率表述与 EKF-SLAM 的原点，用来对照``滤波 vs 优化''。
+  \item Dellaert \& Kaess, ``Factor Graphs for Robot Perception''\cite{dellaert2017factorgraphs}：因子图视角下的 SLAM，读完能理解为什么式~\eqref{eq:11-ls} 可以画成一张图。
+  \item Kümmerle 等，g2o 论文\cite{kummerle2011g2o}：把``稀疏最小二乘''落到代码，适合读完后去翻 g2o 的 \lstinline{OptimizableGraph} 与稀疏求解器部分。
+  \item LIO-SAM 论文\cite{shan2020liosam}：``前端里程计 + 后端因子图''的教科书级实现，读完再回看本章图~\ref{fig:11-dataflow} 会非常直观。
+\end{enumerate}
+
+
+\end{reading}

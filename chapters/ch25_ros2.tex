@@ -1,0 +1,410 @@
+\chapter{ROS 2 工程实践}\label{ch:25-ros2}
+\usetikzlibrary{arrows.meta}
+
+\chapterintro{本章解决一个非常具体的问题：把前面各章的算法，从论文里的公式变成能复现、别人能接手、能装到车上跑起来的工程。ROS 2 是 RM 算法组事实上的标准框架，但新手卡住的地方往往不是算法本身，而是编译不过、话题收不到、TF 查不到、参数改了没生效、时间戳对不上。本章按"先跑通最小系统、再理解通信机制、最后建立工程习惯"的顺序，把这些坑逐一填平。读完你应当能独立建一个工作空间、读懂 launch 与参数文件、看懂 TF 树，并用命令行工具定位大部分"数据没来 / 频率不够 / 时间不对"类的问题。本章是第~\ref{ch:26-calibration}~章标定与第~\ref{ch:27-tuning}~章调参的脚手架。}
+
+\section{ROS 2 是什么：从节点到计算图}\label{sec:25-what}
+
+先回答"为什么需要中间件"。一台 RM 机器人上，雷达驱动、IMU 驱动、LIO、代价地图、规划器、串口通信程序往往是\textbf{不同的进程}，甚至由不同人用不同语言写成。如果它们之间用共享内存或自定义 socket 直连，那么每加一个传感器、每换一个算法，就要改一遍所有程序的接口，这是灾难。中间件的作用就是把这些连接抽象成"数据管道"：每个程序只声明"我发布什么"和"我订阅什么"，连接由框架自动建立。
+
+ROS 2 的通信层是 DDS（Data Distribution Service，数据分发服务）\cite{macenski2022ros2}。DDS 有两个关键特性：
+
+\begin{itemize}
+  \item \textbf{以数据为中心}：程序发布的是"名为 \lstinline{/scan} 的数据流"，而不是"发给某个地址的消息"。
+  \item \textbf{去中心化}：没有 ROS 1 里那个必须最先启动的 \lstinline{roscore}（master）。每个节点通过组播/单播自动发现对方，任何节点先启动、后启动都能连上。
+\end{itemize}
+
+一次运行中所有节点与它们之间的连接，构成一张\textbf{计算图}（computation graph）。图上的元素只有五种，先记住这张表，后面所有工程问题都能归到其中一类：
+
+\begin{table}[htbp]
+  \centering
+  \caption{ROS 2 计算图的五种元素}\label{tab:25-graph}
+  \small
+  \begin{tabular}{lp{5.2cm}p{5.2cm}}
+    \toprule
+    元素 & 语义 & 典型例子 \\
+    \midrule
+    节点 node & 一个进程内的计算单元（\lstinline{rclcpp::Node}） & \lstinline{fast_lio}、\lstinline{controller_server} \\
+    话题 topic & 单向、多对多、连续的数据流 & \lstinline{/lidar/points}、\lstinline{/cmd_vel} \\
+    服务 service & 一请求一响应的同步调用 & 清空代价地图、保存地图 \\
+    动作 action & 长任务，带反馈与取消 & "导航到某点"、\lstinline{NavigateToPose} \\
+    参数 parameter & 节点运行时的配置项 & \lstinline{max_vel_x}、\lstinline{filter_size_surf} \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+ROS 2 与 ROS 1 的差异不是"版本升级"，而是通信层换了一整套，这决定了工程写法的不同。表~\ref{tab:25-vs1} 列出最影响写代码的几处。
+
+\begin{table}[htbp]
+  \centering
+  \caption{ROS 1 与 ROS 2 的关键差异}\label{tab:25-vs1}
+  \small
+  \begin{tabular}{lll}
+    \toprule
+    维度 & ROS 1 & ROS 2 \\
+    \midrule
+    通信层 & 自定义 TCPROS/UDPROS & DDS（可换实现：Fast DDS、Cyclone DDS） \\
+    节点发现 & 中心 master & 分布式自发现 \\
+    服务质量 & 无统一 QoS & 每个话题/订阅可配 QoS \\
+    构建系统 & catkin + \lstinline{catkin_make} & ament + \lstinline{colcon} \\
+    进程模型 & 单 master，节点可合进程 & 节点即进程，鼓励多进程与组合 \\
+    实时与安全 & 基本没有 & 支持实时执行器、SROS2 加密 \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+\begin{keybox}{一句话理解}
+ROS 2 把"程序之间怎么连"从代码里搬到了配置里（话题名、QoS、参数、launch）。所以调试 ROS 2 问题时，先怀疑\textbf{连接配置}，再怀疑算法代码。
+\end{keybox}
+
+\section{最小工作空间：colcon 编译流程}\label{sec:25-ws}
+
+ROS 2 的代码组织单位是\textbf{功能包}（package），包的集合叫\textbf{工作空间}（workspace，通常命名为 \lstinline{*_ws}）。标准目录结构是 \lstinline{src/}（放源码）、\lstinline{build/}（中间文件）、\lstinline{install/}（最终产物）、\lstinline{log/}（编译日志）。新手最容易犯的错误是把源码直接丢在 \lstinline{ws} 根目录——\lstinline{colcon} 只在 \lstinline{src/} 下递归找包。
+
+一个可用的最小流程如下（在 Ubuntu 22.04 + ROS 2 Humble 下测试）：
+
+\begin{lstlisting}[language=bash,caption={创建并编译一个最小工作空间},label={lst:25-ws}]
+# 1. create workspace
+mkdir -p ~/rm_ws/src && cd ~/rm_ws/src
+ros2 pkg create --build-type ament_cmake rm_lio \
+    --dependencies rclcpp sensor_msgs nav_msgs
+
+# 2. put your source into rm_ws/src/rm_lio/
+
+# 3. build (symlink-install keeps config/launch editable without rebuild)
+cd ~/rm_ws
+colcon build --symlink-install --cmake-args -DCMAKE_BUILD_TYPE=Release
+# build only one package and show full log when debugging
+colcon build --packages-select rm_lio --event-handlers console_direct+
+
+# 4. every new terminal must source BOTH layers
+source /opt/ros/humble/setup.bash
+source ~/rm_ws/install/setup.bash
+ros2 pkg list | grep rm_lio
+\end{lstlisting}
+
+三点解释：
+
+\begin{enumerate}
+  \item \textbf{source 顺序不能反}。\lstinline{/opt/ros/humble} 是 underlay（系统安装的 ROS），\lstinline{install/} 是 overlay（你自己编译的）。先 underlay 后 overlay，overlay 里的同名包才会覆盖系统包。反过来会出现"改了代码但运行的是旧库"的灵异现象。
+  \item \lstinline{--symlink-install} 让 \lstinline{install/} 里的 launch、YAML、URDF 变成指向 \lstinline{src/} 的符号链接，改配置文件不用重新编译。C++ 源码仍然需要重编，但省掉了大量"改个参数要编译五分钟"的痛苦。
+  \item \lstinline{--cmake-args -DCMAKE_BUILD_TYPE=Release} 非常重要。默认可能是无优化编译，LIO 这类点云算法会慢 2--5 倍，直接表现为"雷达 10 Hz，里程计出不来"。
+\end{enumerate}
+
+\lstinline{package.xml} 与 \lstinline{CMakeLists.txt} 里真正需要改的字段不多，见表~\ref{tab:25-pkg}。
+
+\begin{table}[htbp]
+  \centering
+  \caption{功能包两个清单文件的关键字段}\label{tab:25-pkg}
+  \small
+  \begin{tabular}{llp{6.4cm}}
+    \toprule
+    文件 & 字段 & 作用 \\
+    \midrule
+    \lstinline{package.xml} & \lstinline{<depend>} & 编译+运行都需要的依赖，新手统一写这个即可 \\
+    \lstinline{package.xml} & \lstinline{<exec_depend>} & 只有运行期需要（如 Python 依赖、launch 包） \\
+    \lstinline{CMakeLists.txt} & \lstinline{find_package()} & 找依赖；少一个就会在链接期报 undefined reference \\
+    \lstinline{CMakeLists.txt} & \lstinline{ament_target_dependencies()} & 把依赖的头文件路径与库挂到目标上 \\
+    \lstinline{CMakeLists.txt} & \lstinline{install(TARGETS ...)} & 不写这行，\lstinline{ros2 run} 找不到可执行文件 \\
+    \lstinline{CMakeLists.txt} & \lstinline{install(DIRECTORY ...)} & 不写这行，装好的包缺少 launch 与 yaml \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+\section{话题、服务与动作：什么时候用哪个}\label{sec:25-comm}
+
+三者都是"节点之间的通信"，但语义完全不同。选错的典型后果是：用服务传 10 Hz 点云（每次请求都要等响应，吞吐崩掉），或者用话题做"开始导航"命令（没有反馈、不能取消）。
+
+\begin{table}[htbp]
+  \centering
+  \caption{三种通信机制的选型表}\label{tab:25-comm}
+  \small
+  \begin{tabular}{lp{3.4cm}p{2.6cm}p{3.2cm}}
+    \toprule
+    机制 & 数据流形态 & 阻塞性 & 典型用途 \\
+    \midrule
+    话题 & 单向、多对多、持续 & 不阻塞（异步） & 传感器流、\lstinline{/cmd_vel}、\lstinline{/tf} \\
+    服务 & 一请求一响应 & 调用方等待 & 保存地图、清空代价地图、切换参数 \\
+    动作 & 长任务 + 周期反馈 + 可取消 & 可中断 & \lstinline{NavigateToPose}、机械臂抓取 \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+判断规则可以压缩成三条：
+
+\begin{enumerate}
+  \item 数据是\textbf{连续产生、允许丢帧}的（点云、图像、IMU）$\Rightarrow$ 话题。
+  \item 调用是\textbf{瞬时完成、需要知道成功与否}的（存图、重置）$\Rightarrow$ 服务。
+  \item 任务\textbf{持续若干秒、过程中要看进度、可能要中途放弃}的（导航、探索）$\Rightarrow$ 动作。
+\end{enumerate}
+
+写代码时最容易忽略的是回调线程模型：话题回调运行在执行器（executor）的线程里。如果回调里做了 100 ms 的耗时计算（比如把点云转成另一套坐标系），那么同一执行器里的所有其他回调都会被拖慢，表现为"某个话题频率突然掉了"。第~\ref{sec:25-habit} 节会专门讲这一点。
+
+\section{QoS：ROS 2 最容易踩的坑}\label{sec:25-qos}
+
+QoS（Quality of Service）是 ROS 2 相对 ROS 1 最大的行为变化。它回答三个问题：
+
+\begin{itemize}
+  \item \textbf{可靠性 reliability}：\lstinline{reliable} 表示传输层保证送达（丢包重传）；\lstinline{best_effort} 表示尽力而为，丢了就丢了。
+  \item \textbf{历史 history + 深度 depth}：保存最近多少条消息。\lstinline{keep_last} + \lstinline{depth=1} 表示只留最新一条，\lstinline{depth=10} 表示留 10 条。
+  \item \textbf{持久性 durability}：\lstinline{volatile} 表示只给"现在在线"的订阅者；\lstinline{transient_local} 表示晚加入的订阅者也能拿到最后一条（类似"锁存"）。
+\end{itemize}
+
+为什么传感器数据要用 \lstinline{best_effort}？因为雷达 10 Hz 出点云，单帧几十 MB；如果链路拥塞，\lstinline{reliable} 会重传旧帧，越积越多，最后延迟爆炸。而定位算法只关心\textbf{最新}那帧，旧帧补过来也没用。反过来，控制指令 \lstinline{/cmd_vel} 必须 \lstinline{reliable}——丢一条可能就是撞墙。地图则要用 \lstinline{transient_local}，因为 RViz 或导航节点可能在建图节点之后启动，它仍然需要那张已经发布过的地图。
+
+\begin{table}[htbp]
+  \centering
+  \caption{常见话题的推荐 QoS 配置}\label{tab:25-qos}
+  \small
+  \begin{tabular}{llll}
+    \toprule
+    话题 & reliability & history/depth & durability \\
+    \midrule
+    \lstinline{/lidar/points} & best\_effort & keep\_last / 5 & volatile \\
+    \lstinline{/imu/data} & best\_effort & keep\_last / 100 & volatile \\
+    \lstinline{/odom}、\lstinline{/tf} & best\_effort & keep\_last / 10 & volatile \\
+    \lstinline{/map} & reliable & keep\_last / 1 & transient\_local \\
+    \lstinline{/cmd_vel} & reliable & keep\_last / 1 & volatile \\
+    \lstinline{/initialpose} & reliable & keep\_last / 1 & volatile \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+\textbf{QoS 不匹配是新手最常见、也最容易被忽略的故障}。DDS 的兼容规则是：发布者提供的质量必须\textbf{不弱于}订阅者要求的质量。所以：
+
+\begin{itemize}
+  \item 发布 \lstinline{reliable}、订阅 \lstinline{best_effort} $\Rightarrow$ 兼容，能收到。
+  \item 发布 \lstinline{best_effort}、订阅 \lstinline{reliable} $\Rightarrow$ \textbf{不兼容}，一条也收不到。
+\end{itemize}
+
+此时节点不会崩，只是安静地没有数据。排查的命令是：
+
+\begin{lstlisting}[language=bash,caption={QoS 不匹配的诊断命令},label={lst:25-qosdiag}]
+# check publisher/subscriber QoS of a topic
+ros2 topic info /lidar/points --verbose
+# expected output shows "Reliability: BEST_EFFORT" for both sides
+
+# is data actually flowing?
+ros2 topic hz /lidar/points
+ros2 topic echo /lidar/points --once
+\end{lstlisting}
+
+如果 \lstinline{ros2 topic info --verbose} 显示"发布者 1 个、订阅者 1 个"但 \lstinline{ros2 topic hz} 无输出，绝大多数情况就是 QoS 不匹配或话题名不一致（注意前导斜杠与命名空间）。
+
+\section{参数与 launch：把配置从代码里赶出去}\label{sec:25-param}
+
+\textbf{参数}是节点的运行时配置。C++ 里必须先声明再使用，声明时给出默认值：
+
+\begin{lstlisting}[language=C++,caption={声明与读取参数},label={lst:25-declare}]
+// in constructor or on_configure()
+this->declare_parameter<double>("filter_size_surf", 0.5);
+this->declare_parameter<int>("max_iteration", 4);
+this->declare_parameter<std::string>("lid_topic", "/lidar/points");
+
+this->get_parameter("filter_size_surf", filter_size_surf_);
+this->get_parameter("max_iteration", max_iteration_);
+// dynamic update: register a callback instead of polling
+param_cb_ = this->add_on_set_parameters_callback(
+    [this](const std::vector<rclcpp::Parameter> & params) {
+        // validate before applying; reject invalid values
+        return rcl_interfaces::msg::SetParametersResult{};
+    });
+\end{lstlisting}
+
+参数覆盖的优先级从低到高是：代码默认值 $<$ YAML 参数文件 $<$ launch 文件中的参数 $<$ 命令行 \lstinline{-p name:=value}。所以"改了 YAML 没生效"的第一反应应该是：检查 launch 里是不是又写了一遍参数，或者命令行的 \lstinline{-p} 把它压掉了。
+
+\textbf{launch} 文件统一用 Python 写。一个典型的"一个 launch 起整套定位"如下：
+
+\begin{lstlisting}[language=Python,caption={定位系统的 launch 文件片段},label={lst:25-launch}]
+import os
+from ament_index_python.packages import get_package_share_directory
+from launch import LaunchDescription
+from launch.actions import DeclareLaunchArgument
+from launch.conditions import IfCondition
+from launch.substitutions import LaunchConfiguration
+from launch_ros.actions import Node
+
+
+def generate_launch_description():
+    pkg = get_package_share_directory("rm_lio")
+    use_sim_time = LaunchConfiguration("use_sim_time")
+    rviz = LaunchConfiguration("rviz")
+
+    lio = Node(
+        package="rm_lio", executable="lio_node", name="lio_node",
+        output="screen",
+        parameters=[os.path.join(pkg, "config", "lio.yaml"),
+                    {"use_sim_time": use_sim_time}],
+        remappings=[("points", "/lidar/points")],
+    )
+    rviz_node = Node(
+        package="rviz2", executable="rviz2", condition=IfCondition(rviz),
+        arguments=["-d", os.path.join(pkg, "rviz", "lio.rviz")],
+    )
+    return LaunchDescription([
+        DeclareLaunchArgument("use_sim_time", default_value="false"),
+        DeclareLaunchArgument("rviz", default_value="true"),
+        lio, rviz_node,
+    ])
+\end{lstlisting}
+
+\lstinline{output="screen"} 让节点日志打到终端而不只是写进 \lstinline{~/.ros/log}；\lstinline{remappings} 是"不改源码就换话题名"的利器，跨团队联调时几乎必用。启动后检查参数是否真的生效：
+
+\begin{lstlisting}[language=bash,caption={检查参数实际取值},label={lst:25-paramcheck}]
+ros2 param list /lio_node
+ros2 param get /lio_node filter_size_surf
+ros2 param dump /lio_node > /tmp/effective.yaml   # dump what is really used
+\end{lstlisting}
+
+\lstinline{ros2 param dump} 是排错神器：它输出的是\textbf{生效后}的完整参数，可以直接和你的 YAML 对比。
+
+\section{TF2：坐标系的"宪法"}\label{sec:25-tf}
+
+TF2 维护一棵随时间变化的\textbf{坐标系树}。定位系统的所有输出最终都要落到这棵树上，否则 RViz 里的点云会乱飞、Nav2 会报"代价地图收不到机器人位姿"。
+
+TF 的关系是\textbf{父子}关系，每个变换有两个时间戳（发布时刻与有效时刻），查询时按时间插值。一台 RM 机器人的典型结构如图~\ref{fig:25-tf}。
+
+\begin{figure}[htbp]
+  \centering
+  \begin{tikzpicture}[
+      frame/.style={rectangle, rounded corners=2pt, draw=structurecolor, thick,
+        fill=structurecolor!8, minimum height=7mm, minimum width=20mm, font=\small},
+      lab/.style={font=\footnotesize, inner sep=1.5pt, draw=black!60, rounded corners=1pt,
+        fill=white},
+      arr/.style={-{Stealth[length=2mm]}, thick, draw=black!70}
+    ]
+    \node[frame] (map) at (0,0) {map};
+    \node[frame] (odom) at (3.4,0) {odom};
+    \node[frame] (base) at (6.8,0) {base\_link};
+    \node[frame] (lidar) at (10.4,2.3) {lidar\_link};
+    \node[frame] (imu) at (10.4,0) {imu\_link};
+    \node[frame] (cam) at (10.4,-2.3) {camera\_link};
+    \node[frame] (gimb) at (6.8,-3.2) {gimbal\_link};
+
+    \draw[arr] (map) -- node[above=2pt,lab]{全局定位} (odom);
+    \draw[arr] (odom) -- node[above=2pt,lab]{LIO 里程计} (base);
+    \draw[arr] (base) -- node[lab,pos=0.5,above right=1pt]{静态外参} (lidar);
+    \draw[arr] (base) -- node[above=2pt,lab]{静态外参} (imu);
+    \draw[arr] (base) -- node[lab,pos=0.5,below right=1pt]{静态外参} (cam);
+    \draw[arr] (base) -- node[right=2pt,lab]{云台反馈} (gimb);
+  \end{tikzpicture}
+  \caption{RM 机器人典型 TF 树。\lstinline{map}$\to$\lstinline{odom} 由全局定位修正，\lstinline{odom}$\to$\lstinline{base\_link} 由里程计给出，传感器到机体的变换是常数外参。}\label{fig:25-tf}
+\end{figure}
+
+几个必须记住的约定：
+
+\begin{itemize}
+  \item \lstinline{map} 是全局连续但会跳变的坐标系（重定位时整体平移）；\lstinline{odom} 是局部连续、绝不跳变的坐标系。所以\textbf{只有定位模块能发布 \lstinline{map}$\to$\lstinline{odom}}，且每次只发一个小修正，不能一次修正几米，否则规划器会看到机器人瞬移。
+  \item \lstinline{lookupTransform(target, source, time)} 返回的是"把 \lstinline{source} 系下的向量变到 \lstinline{target} 系"的变换，即 $T_{target,source}$。方向写反是外参错误最常见的来源。
+  \item 传感器到机体的外参用 \lstinline{static_transform_publisher} 发布，它们在标定后就是常数，见第~\ref{ch:26-calibration}~章。
+\end{itemize}
+
+\begin{lstlisting}[language=bash,caption={TF 的发布、查询与诊断},label={lst:25-tfcmd}]
+# static extrinsics: lidar -> base_link, args: x y z yaw pitch roll
+ros2 run tf2_ros static_transform_publisher 0.15 0 0.30 0 0 0 \
+    base_link lidar_link
+
+# single query at a given time (prints translation and quaternion)
+ros2 run tf2_ros tf2_echo map base_link
+
+# draw the whole tree as a pdf and show per-link publish rates
+ros2 run tf2_tools view_frames
+\end{lstlisting}
+
+在 C++ 中查询 TF 时，三种异常必须分别处理，否则要么崩溃，要么拿到错误数据：
+
+\begin{lstlisting}[language=C++,caption={lookupTransform 的三类异常},label={lst:25-tfexc}]
+try {
+    // TimePointZero means "latest available"; do NOT use it on recorded bags
+    auto T = tf_buffer_->lookupTransform("map", "base_link",
+                                         tf2::TimePointZero, tf2::durationFromSec(0.1));
+} catch (const tf2::LookupException & e) {
+    // frame name typo, or the publisher never existed
+} catch (const tf2::ConnectivityException & e) {
+    // both frames exist but no path connects them (missing static extrinsic)
+} catch (const tf2::ExtrapolationException & e) {
+    // requested time outside the buffer, or timestamps are out of order
+}
+\end{lstlisting}
+
+\begin{note}
+\textbf{时间戳乱序}是 LIO 装车后非常常见的故障：点云和 IMU 来自不同驱动，若某一路的时间戳比另一路早了 200 ms，TF 缓冲会不断收到"过去"的数据，表现为 \lstinline{ExtrapolationException} 间歇性爆发、RViz 中位姿抖动。处理办法不是调大缓冲区超时，而是回到第~\ref{ch:26-calibration}~章做时间同步。
+\end{note}
+
+\section{调试工具与工程习惯}\label{sec:25-tool}
+\label{sec:25-habit}
+
+工具用对了，排错效率差一个数量级。表~\ref{tab:25-tools} 是我自己常用的清单。
+
+\begin{table}[htbp]
+  \centering
+  \caption{ROS 2 常用命令行工具}\label{tab:25-tools}
+  \small
+  \begin{tabular}{llp{6.2cm}}
+    \toprule
+    命令 & 回答什么问题 & 备注 \\
+    \midrule
+    \lstinline{ros2 node list} & 有哪些节点活着 & 先确认进程起来了 \\
+    \lstinline{ros2 topic list -t} & 有哪些话题、类型是什么 & 类型不匹配会无法连接 \\
+    \lstinline{ros2 topic hz} & 频率是多少 & 判断驱动/算法是否跟得上 \\
+    \lstinline{ros2 topic echo --once} & 消息内容对不对 & 看 \lstinline{header.stamp} 与 \lstinline{frame_id} \\
+    \lstinline{ros2 topic info -v} & QoS 与连接数 & QoS 不匹配的唯一快速判据 \\
+    \lstinline{ros2 param get/dump} & 参数实际值是多少 & 确认 YAML 有没有被覆盖 \\
+    \lstinline{ros2 bag record -a} & 把现场录下来 & 排错第一原则：先录包 \\
+    \lstinline{ros2 bag play --clock} & 离线复现 + 仿真时间 & 配 \lstinline{use_sim_time:=true} \\
+    \lstinline{tf2_tools view_frames} & TF 树长什么样 & 有没有断链、哪条链路频率低 \\
+    \lstinline{ros2 doctor} & 系统层面有没有异常 & 网络、RMW 实现、环境变量 \\
+    \lstinline{rqt_graph} & 计算图里谁连谁 & 一眼看出没连上的节点 \\
+    \lstinline{rqt_plot} & 数值曲线 & 调 PID、看速度指令 \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+工程习惯比工具更重要，以下五条建议按重要性排序：
+
+\begin{enumerate}
+  \item \textbf{用命名空间隔离多机/多模块}。launch 里加 \lstinline{namespace="sentry"}，所有话题变成 \lstinline{/sentry/odom}，避免与另一台车或另一个模块撞名。多机器人系统尤其要注意 \lstinline{/tf} 与 \lstinline{/tf_static} 必须显式 remap，否则全车 TF 混进一棵树。
+  \item \textbf{仿真时间要一致}。跑 bag 时必须 \lstinline{use_sim_time:=true} 且播放时带 \lstinline{--clock}，所有节点的时间源才会统一为 bag 里的 \lstinline{/clock}。混用会导致 TF 全部超时。
+  \item \textbf{日志分级}。\lstinline{RCLCPP_INFO} 用于状态，\lstinline{RCLCPP_WARN} 用于可恢复异常，\lstinline{RCLCPP_ERROR} 用于必须处理的问题。默认级别 INFO，现场排查时用 \lstinline{--ros-args --log-level debug} 临时打开，不要长期开 DEBUG（I/O 本身就拖慢实时性）。
+  \item \textbf{执行器与回调组}。默认单线程执行器下所有回调串行执行。对于"点云处理 20 ms + 控制 1 ms"这类混合负载，应当用 \lstinline{MultiThreadedExecutor} 配合 \lstinline{MutuallyExclusive} 回调组把控制与感知分开，否则控制频率会被点云拖垮。
+  \item \textbf{实时性}。对硬实时环节用 \lstinline{taskset -c 2,3} 绑定 CPU 核，避免与编译、录包抢核；不要在回调里做内存分配与文件 I/O。
+\end{enumerate}
+
+\begin{keybox}{案例：定位节点频率从 20 Hz 掉到 5 Hz}
+\textbf{现象}：\lstinline{ros2 topic hz /lio/odom} 只有 5 Hz，但雷达 10 Hz 正常。\textbf{排查顺序}：(1) \lstinline{ros2 topic hz /lidar/points} 确认输入频率；(2) \lstinline{top -H} 看进程是否 CPU 打满，若单核 100\% 则多半是编译没开 Release 或多线程配置错误；(3) 若 CPU 不满，看 \lstinline{ros2 topic info -v} 是否有多个订阅者拖慢——\lstinline{reliable} 的慢订阅者会反压发布者；(4) 最后检查是否有人在同一执行器里做 \lstinline{ros2 bag record -a}，录包会把所有大消息序列化一遍。\textbf{结论}：先分清"算不完"还是"收不到"，不要一上来就改算法参数。
+\end{keybox}
+
+\begin{summary}
+
+\begin{enumerate}
+  \item ROS 2 用 DDS 取代 ROS 1 的 master，节点自发现；计算图只有节点、话题、服务、动作、参数五种元素，所有工程问题都能归到这五类。
+  \item 标准编译命令是 \lstinline{colcon build --symlink-install --cmake-args -DCMAKE_BUILD_TYPE=Release}；每个终端必须按 underlay$\to$overlay 顺序 source，否则改的代码不会生效。
+  \item 选通信机制的三条规则：连续数据用话题，瞬时调用用服务，长任务用动作。
+  \item QoS 中最关键的是 reliability 与 durability：传感器用 \lstinline{best_effort}，控制用 \lstinline{reliable}，地图用 \lstinline{transient_local}；发布弱、订阅强会一条都收不到。
+  \item 参数优先级是 代码默认 $<$ YAML $<$ launch $<$ 命令行；用 \lstinline{ros2 param dump} 看实际生效值。
+  \item TF 树中 \lstinline{map}$\to$\lstinline{odom} 由全局定位发布且只能小步修正，\lstinline{odom}$\to$\lstinline{base\_link} 由里程计发布，传感器外参是静态变换。
+  \item 排查问题先录包（\lstinline{ros2 bag record}），再离线用 \lstinline{topic hz}、\lstinline{topic info -v}、\lstinline{tf2_tools}、\lstinline{rqt_graph} 定位。
+\end{enumerate}
+
+
+\end{summary}
+
+\begin{problemset}
+
+  \item 你的雷达节点发布 \lstinline{/lidar/points} 用的是默认 QoS（reliable, depth 10），RViz2 订阅时选了 best\_effort。能收到数据吗？反过来呢？请说明 DDS 的兼容规则。
+  \item 一个节点先于雷达驱动启动，它能在启动瞬间收到最后一帧点云吗？需要把哪个 QoS 项改成什么值？地图话题也存在同样问题，请解释为什么地图用 \lstinline{transient_local}。
+  \item 写出 \lstinline{map}$\to$\lstinline{base\_link} 的完整链式变换，并说明如果 \lstinline{map}$\to$\lstinline{odom} 在某一帧突然跳了 1 m，规划器会出现什么现象、应该怎样限制单次修正量。
+  \item 你在 launch 里给 \lstinline{lio_node} 传了 YAML，但 \lstinline{ros2 param get} 显示还是默认值。列出至少三种可能原因。
+  \item 设计一个实验，证明"点云回调耗时 20 ms"是控制频率下降的原因，并给出两种不修改算法的缓解方案。
+\end{problemset}
+
+\begin{reading}
+
+\begin{itemize}
+  \item Macenski 等人的 ROS 2 综述 \cite{macenski2022ros2}：讲清楚 DDS 选型、实时执行器与 ROS 1 的取舍，读完能理解"为什么 ROS 2 的 QoS 长这样"。
+  \item ROS 2 官方文档的 \href{https://docs.ros.org/en/humble/Concepts/About-Quality-of-Service-Settings.html}{About QoS Settings} 与 \href{https://docs.ros.org/en/humble/Tutorials/Intermediate/Tf2/Tf2-Main.html}{TF2 教程}：QoS 兼容表与 TF 广播/监听的权威说明。
+  \item 第~\ref{ch:22-nav2-practice}~章的 Nav2 工程链路：把本章的 launch、参数、TF 用法放到一个真实导航系统里再走一遍。
+\end{itemize}
+
+
+\end{reading}

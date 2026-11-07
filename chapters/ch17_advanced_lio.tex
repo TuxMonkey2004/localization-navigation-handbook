@@ -1,0 +1,828 @@
+\chapter{FAST-LIO2、Point-LIO 与先进 LIO 深度解析}\label{ch:17-advanced-lio}
+
+\usetikzlibrary{arrows.meta, positioning, calc, shapes.geometric}
+
+\chapterintro{这是全书数学密度最高的一章。前 16 章里我们反复听到两个名字：FAST-LIO2 和 Point-LIO。它们为什么能在普通 CPU 上跑到 $10$\,kHz 的状态输出、能在剧烈撞击下不发散？本章把它们的推导从头拆到底：先在 $\SO(3)\times\R^{15}$ 上定义状态和误差状态，再把 IMU 连续运动方程积分成离散传播，然后一块一块推出 $18\times18$ 的误差状态转移矩阵 $F$，接着用最大后验估计重新导出迭代 EKF（IEKF）的更新式与收敛判据，逐项推导点到面残差对状态的雅可比，最后讲清 iKD-Tree 的增量插入、box-wise 删除与 Point-LIO 的逐点更新。读完本章，你应该能对着论文公式直接找到源码里对应的函数，也能自己改一版滤波器。}
+
+\section{FAST-LIO2 的总体架构}\label{sec:17-arch}
+
+FAST-LIO2~\cite{xu2022fastlio2} 的程序结构可以概括成"一条主线、两个频率"：
+
+\begin{itemize}
+  \item \textbf{主线}：状态 $\bm{x}$ 与协方差 $\bm{P}$ 是唯一被维护的东西。IMU 来了就\textbf{预测}（把 $\bm{x},\bm{P}$ 沿运动方程往前推），激光来了就\textbf{更新}（用点面残差把 $\bm{x},\bm{P}$ 修正）。
+  \item \textbf{两个频率}：IMU 一般 $100\sim200$\,Hz（$\Delta t\approx5\sim10$\,ms），激光 $10$\,Hz（一帧 $100$\,ms）。预测在 IMU 频率上进行，状态输出（odom）也在 IMU 频率上；更新只在每帧点云到达时进行。
+  \item \textbf{地图}：所有去畸变后的点按世界坐标插入\textbf{增量式 KD 树}（iKD-Tree），既作为下一帧最近邻查询的地图，也作为建图的输出。
+\end{itemize}
+
+\begin{figure}[htbp]
+  \centering
+  \begin{tikzpicture}[font=\small]
+    \node[block] (imu) at (0,0) {IMU\\$200$\,Hz};
+    \node[block] (lid) at (0,-2.2) {3D 激光\\$10$\,Hz};
+    \node[block] (pre) at (2.8,0) {IMU 预积分\\（传播）};
+    \node[block] (des) at (2.8,-2.2) {去畸变\\+ 降采样};
+    \node[block] (map) at (2.8,-4.2) {iKD-Tree\\增量地图};
+    \node[block] (res) at (5.6,-2.2) {点面残差\\$\bm{r},\bm{H}$};
+    \node[block2] (ekf) at (8.2,-1.0) {迭代 EKF\\$\bm{x}\leftarrow\bm{x}\boxplus\delta\bm{x}$};
+    \node[block] (out) at (11.0,-1.0) {odom\\去畸变点云};
+    \draw[arrow] (imu) -- (pre);
+    \draw[arrow] (lid) -- (des);
+    \draw[arrow] (pre) -- node[label, above] {先验 $\bar{\bm{x}},\bar{\bm{P}}$} (ekf);
+    \draw[arrow] (des) -- (res);
+    \draw[arrow] (res) -- node[label, above] {$\bm{H},\bm{R}_m$} (ekf);
+    \draw[arrow] (ekf) -- (out);
+    \draw[arrow, dashed] (map) -- node[label, right] {最近邻/平面} (res);
+    \draw[arrow, dashed] (ekf.south east) to[bend left=18] node[label, right] {插入新点} (map.east);
+    \draw[arrow, dashed] (ekf.north east) to[bend right=18] node[label, right] {位姿预测} (des.east);
+  \end{tikzpicture}
+  \caption{FAST-LIO2 的数据流。IMU 以 $200$\,Hz 驱动状态传播并持续输出里程计；激光帧到达后，先用传播位姿把点云去畸变、降采样，再为每个点在 iKD-Tree 中找平面、算点面残差，最后用迭代 EKF 一次性融合全部残差，并把新点插回地图。}\label{fig:17-arch}
+\end{figure}
+
+一句话总结 FAST-LIO2 的三个关键设计：状态里放重力并跟随估计；误差状态定义在流形切空间上，更新量小、线性化准；\textbf{一次更新用上全部点}，不做特征提取，靠 iKD-Tree 把"对每个点找最近邻"的成本压到可接受。
+
+\section{状态定义与流形更新}\label{sec:17-state}
+
+\subsection{主状态}
+
+FAST-LIO2 的主状态取为
+\begin{equation}\label{eq:17-state}
+  \bm{x}=\bigl[\bm{R},\;\bm{p},\;\bm{v},\;\bm{b}_g,\;\bm{b}_a,\;\bm{g}\bigr],
+\end{equation}
+其中 $\bm{R}\in\SO(3)$ 是 IMU 系到世界系的旋转（$T_{WB}$ 的旋转部分），$\bm{p}\in\R^3$ 是 IMU 系原点在世界系中的位置，$\bm{v}\in\R^3$ 是世界系速度，$\bm{b}_g,\bm{b}_a\in\R^3$ 是陀螺与加速度计零偏（定义见第~\ref{ch:03-sensors}~章），$\bm{g}\in\R^3$ 是重力向量，默认 $\bm{g}=[0,0,-9.81]^{\top}$。注意 $\bm{R}$ 不是 $\R^3$ 里的普通向量，而是李群 $\SO(3)$ 上的元素，所以状态空间是流形
+\begin{equation}
+  \mathcal{M}=\SO(3)\times\R^{15},
+\end{equation}
+$\R^{15}$ 来自 $\bm{p},\bm{v},\bm{b}_g,\bm{b}_a$（各 3 维）与 $\bm{g}$（按 3 维写）。严格说重力是单位向量，只有 2 个自由度，实际实现把它参数化在球面 $S^2$ 上，于是误差状态是 17 维；本节为了式子整齐按 3 维 $\delta\bm{g}$ 推导，并对两者的关系给出说明。
+
+\subsection{为什么把重力放进状态}
+
+初学者常问：重力不是常数吗，为什么要估计？原因有三。其一，\textbf{初始姿态未知}：开机时并不知道机器人的 roll/pitch，而静止的加速度计测到的正是 $-R^{\top}\bm{g}$，所以"重力方向"与"初始姿态"是同一件事的两面，把 $\bm{g}$ 放进状态等于让滤波器自己去对齐重力。其二，\textbf{标定残差}：加速度计的零偏与标度因数误差在长时间上表现为一个"等效的重力方向偏差"，在线估 $\bm{g}$ 能吸收一部分。其三，\textbf{一致性}：若把 $\bm{g}$ 写死而初始姿态差 $2^{\circ}$，这个误差会被永久固化在重力方向上，速度持续被一个错误的常值加速度污染，位置随时间二次发散；让 $\bm{g}$ 可估，滤波器就能把"一开始估错了"改过来。
+
+\subsection{误差状态与两个流形运算}
+
+我们不直接在 $\bm{x}$ 上做加法（$\bm{R}+\delta\bm{R}$ 会破坏正交性），而是定义\textbf{误差状态}
+\begin{equation}\label{eq:17-error-state}
+  \delta\bm{x}=\bigl[\delta\bm{\theta},\;\delta\bm{p},\;\delta\bm{v},\;\delta\bm{b}_g,\;\delta\bm{b}_a,\;\delta\bm{g}\bigr]\in\R^{18},
+\end{equation}
+并用两个流形运算把"状态"和"误差"联系起来：
+\begin{equation}\label{eq:17-plus-minus}
+  \bm{x}\boxplus\delta\bm{x}\;\triangleq\;
+  \begin{cases}
+    \bm{R}\leftarrow\bm{R}\exp\bigl([\delta\bm{\theta}]_\times\bigr),\\
+    \bm{p}\leftarrow\bm{p}+\delta\bm{p},\quad \bm{v}\leftarrow\bm{v}+\delta\bm{v},\\
+    \bm{b}_g\leftarrow\bm{b}_g+\delta\bm{b}_g,\quad \bm{b}_a\leftarrow\bm{b}_a+\delta\bm{b}_a,\quad \bm{g}\leftarrow\bm{g}+\delta\bm{g},
+  \end{cases}
+\end{equation}
+\begin{equation}
+  \bm{x}\boxminus\bar{\bm{x}}\;\triangleq\;
+  \bigl[\mathrm{Log}(\bar{\bm{R}}^{\top}\bm{R}),\;\bm{p}-\bar{\bm{p}},\;\bm{v}-\bar{\bm{v}},\;\bm{b}_g-\bar{\bm{b}}_g,\;\bm{b}_a-\bar{\bm{b}}_a,\;\bm{g}-\bar{\bm{g}}\bigr].
+\end{equation}
+式~\eqref{eq:17-plus-minus} 中的旋转部分叫\textbf{右扰动}：新姿态等于旧姿态右乘一个由 $\delta\bm{\theta}$ 生成的小旋转。$\boxminus$ 是它的逆运算，$\bar{\bm{R}}^{\top}\bm{R}$ 表示"从参考姿态到当前姿态还需要转多少"，再取对数变回旋转向量。这两个运算合起来构成切空间上的"加法"，是 ESKF 与流形滤波的标准做法~\cite{sola2017eskf}。
+
+为什么必须用误差状态？因为 $\bm{R}$ 只有 3 个自由度却用 9 个数表示，直接对 9 个数加噪声会破坏 $\bm{R}^{\top}\bm{R}=\bm{I}$；而 $\delta\bm{\theta}$ 是 3 维的小量，可以放心地做线性化、做高斯假设。另一个好处是：误差状态在机器人正常运动时始终接近零，一阶线性化的误差极小，这正是一阶 EKF 能这么准的原因。
+
+这里补充两点代码层面的约定。第一，官方实现把各状态块命名为 \texttt{pos}、\texttt{rot}、\texttt{vel}、\texttt{bg}、\texttt{ba}、\texttt{grav}，并默认把 LiDAR 到 IMU 的外参 $\bm{R}_L,\bm{t}_L$（各 3 维）也放进状态，所以误差状态是 $23$ 维而不是 $17$ 维，多出来的 6 维是外参；外参块的推导与位姿块完全同构，本书为突出主线只推导 $18$ 维。第二，重力按 $S^2$ 的 2 维切空间处理，最后一块是 $3\times2$ 的窄矩阵，读者在代码里看到 \texttt{dim} 为 23 时不要惊讶。
+
+\section{IMU 运动学：从连续方程到离散传播}\label{sec:17-imu}
+
+\subsection{测量模型}
+
+IMU 输出的是角速度 $\tilde{\bm{\omega}}$ 与比力 $\tilde{\bm{a}}$（加速度计测的是"除重力以外的比力"，不是加速度本身）。设真实角速度 $\bm{\omega}$ 与真实加速度 $\bm{a}$，则测量模型为
+\begin{equation}\label{eq:17-meas-model}
+  \tilde{\bm{\omega}}=\bm{\omega}+\bm{b}_g+\bm{n}_g,\qquad
+  \tilde{\bm{a}}=\bm{R}^{\top}\bigl(\bm{a}-\bm{g}\bigr)+\bm{b}_a+\bm{n}_a,
+\end{equation}
+其中 $\bm{n}_g,\bm{n}_a$ 是零均值高斯白噪声，$\bm{b}_g,\bm{b}_a$ 是缓慢变化的零偏（建模为随机游走）。式~\eqref{eq:17-meas-model} 的第二个式子说明：加速度计在机体系里测到的是"世界系加速度 $\bm{a}$ 减去重力 $\bm{g}$"，再转到机体系并加上零偏噪声。静止时 $\bm{a}=0$，读数就是 $\bm{R}^{\top}(-\bm{g})$，这就是为什么静止时可以用加速度计测 roll/pitch。
+
+\subsection{连续运动方程}
+
+对式~\eqref{eq:17-meas-model} 反解出真实量，代入运动学，得到
+\begin{equation}\label{eq:17-continuous}
+  \begin{cases}
+    \dot{\bm{R}}=\bm{R}\,[\bm{\omega}]_\times,\\
+    \dot{\bm{p}}=\bm{v},\\
+    \dot{\bm{v}}=\bm{R}\,\bigl(\tilde{\bm{a}}-\bm{b}_a-\bm{n}_a\bigr)+\bm{g},\\
+    \dot{\bm{b}}_g=\bm{n}_{bg},\qquad \dot{\bm{b}}_a=\bm{n}_{ba},\qquad \dot{\bm{g}}=\bm{0},
+  \end{cases}
+\end{equation}
+其中 $[\bm{\omega}]_\times$ 是由 $\bm{\omega}=[\omega_x,\omega_y,\omega_z]^{\top}$ 生成的反对称矩阵：
+\begin{equation}
+  [\bm{\omega}]_\times=\begin{bmatrix}0&-\omega_z&\omega_y\\ \omega_z&0&-\omega_x\\ -\omega_y&\omega_x&0\end{bmatrix},\qquad
+  [\bm{\omega}]_\times\bm{u}=\bm{\omega}\times\bm{u}.
+\end{equation}
+
+第一条 $\dot{\bm{R}}=\bm{R}[\bm{\omega}]_\times$ 值得单独推一遍。设 $t$ 到 $t+\Delta t$ 内机体系下的角速度恒为 $\bm{\omega}$，这段时间机体系相对世界系转过一个小角度 $\bm{\omega}\Delta t$，于是
+\begin{equation}
+  \bm{R}(t+\Delta t)=\bm{R}(t)\exp\bigl([\bm{\omega}\Delta t]_\times\bigr)
+  \;\approx\;\bm{R}(t)\bigl(\bm{I}+[\bm{\omega}]_\times\Delta t\bigr),
+\end{equation}
+移项、两边除以 $\Delta t$ 并令 $\Delta t\to0$，即得 $\dot{\bm{R}}=\bm{R}[\bm{\omega}]_\times$。注意 $\bm{\omega}$ 是\textbf{机体系}下的角速度，所以要右乘；若用世界系角速度 $\bm{\omega}^{W}$，则应是 $\dot{\bm{R}}=[\bm{\omega}^{W}]_\times\bm{R}$。这两种写法等价，但混用会导致符号错误，本书统一用机体系角速度、右乘。
+
+式~\eqref{eq:17-continuous} 前三条的物理含义：姿态由角速度积分，位置由速度积分，速度由"比力转到世界系再加上重力"积分。后三条说明零偏和重力在\textbf{两次 IMU 采样之间}被视为常量，它们的随机游走只在长时间尺度上起作用。
+
+\subsection{离散传播}
+
+IMU 采样间隔 $\Delta t$ 通常为 $5\sim10$\,ms，远小于激光帧长 $100$\,ms。设第 $k$ 个 IMU 采样时刻为 $t_k$，把式~\eqref{eq:17-continuous} 在 $[t_k,t_k+\Delta t]$ 上积分。假设区间内 $\bm{\omega}$、$\bm{a}$ 恒定（零阶保持），且 $t_k$ 时刻的状态已知，则对任意 $\tau\in[0,\Delta t]$：
+\begin{equation}\label{eq:17-exp-rot}
+  \bm{R}(t_k+\tau)=\bm{R}_k\exp\bigl([\bm{\omega}_k\tau]_\times\bigr),\qquad
+  \bm{\omega}_k\triangleq\tilde{\bm{\omega}}_k-\bm{b}_{g,k}.
+\end{equation}
+速度通过对加速度积分得到：
+\begin{equation}
+  \bm{v}(t_k+\tau)=\bm{v}_k+\int_0^{\tau}\Bigl[\bm{R}_k\exp\bigl([\bm{\omega}_k s]_\times\bigr)\bm{a}_k+\bm{g}\Bigr]\diff s,
+  \qquad \bm{a}_k\triangleq\tilde{\bm{a}}_k-\bm{b}_{a,k}.
+\end{equation}
+把 $\exp([\bm{\omega}_k s]_\times)=\bm{I}+[\bm{\omega}_k]_\times s+O(s^2)$ 代入，只保留到一阶：
+\begin{equation}
+  \bm{v}(t_k+\tau)=\bm{v}_k+\bm{R}_k\bm{a}_k\,\tau+\bm{g}\,\tau+O(\tau^2).
+\end{equation}
+位置再由 $\bm{p}(t_k+\tau)=\bm{p}_k+\int_0^\tau\bm{v}(t_k+s)\diff s$ 积分一次，保留到 $\tau^2$：
+\begin{equation}
+  \bm{p}(t_k+\tau)=\bm{p}_k+\bm{v}_k\tau+\frac12\bigl(\bm{R}_k\bm{a}_k+\bm{g}\bigr)\tau^2+O(\tau^3).
+\end{equation}
+取 $\tau=\Delta t$，再补上零偏的零阶保持，得到工程上最常用的离散传播公式：
+\begin{equation}\label{eq:17-discrete}
+  \boxed{
+  \begin{aligned}
+    \bm{R}_{k+1}&=\bm{R}_k\exp\bigl([\bm{\omega}_k\Delta t]_\times\bigr),\\
+    \bm{v}_{k+1}&=\bm{v}_k+\bigl(\bm{R}_k\bm{a}_k+\bm{g}_k\bigr)\Delta t,\\
+    \bm{p}_{k+1}&=\bm{p}_k+\bm{v}_k\Delta t+\frac12\bigl(\bm{R}_k\bm{a}_k+\bm{g}_k\bigr)\Delta t^2,\\
+    \bm{b}_{g,k+1}&=\bm{b}_{g,k},\qquad \bm{b}_{a,k+1}=\bm{b}_{a,k},\qquad \bm{g}_{k+1}=\bm{g}_k.
+  \end{aligned}}
+\end{equation}
+式~\eqref{eq:17-discrete} 是"用第 $k$ 个采样点的测量把状态推到第 $k+1$ 个采样点"，$100$\,ms 的一帧里要做约 20 次这样的传播，这就是预测步。注意离散化丢掉了 $O(\Delta t^2)$ 的项（旋转对加速度方向的影响、角速度变化的影响等）；由于 $\Delta t$ 只有几毫秒，这些项通常可以忽略。实际实现中，为了进一步减小误差，常见做法是用\textbf{中点积分}（用 $t_k$ 与 $t_{k+1}$ 的测量平均值）或者把 $\bm{R}$ 的旋转放在半步位置上计算，代价是代码复杂一些。
+
+指数映射 $\exp([\bm{\phi}]_\times)$ 用 Rodrigues 公式计算：
+\begin{equation}\label{eq:17-rodrigues}
+  \exp\bigl([\bm{\phi}]_\times\bigr)=\bm{I}+\frac{\sin\theta}{\theta}[\bm{\phi}]_\times+\frac{1-\cos\theta}{\theta^2}[\bm{\phi}]_\times^2,\qquad \theta=\norm{\bm{\phi}}.
+\end{equation}
+当 $\theta$ 很小时用一阶近似 $\exp([\bm{\phi}]_\times)\approx\bm{I}+[\bm{\phi}]_\times$。例如以 $1$\,rad/s 转、$\Delta t=5$\,ms 时 $\bm{\phi}=(0,0,0.005)$、$\theta=0.005$，Rodrigues 公式给出的各项系数为 $0.999996$ 与 $0.4999997$，与一阶近似的差别在 $10^{-6}$ 量级——这就是为什么小角度下两者可以互换。
+
+\section{误差状态传播：$F$ 矩阵逐块推导}\label{sec:17-f}
+
+这一节是全章的核心。我们要回答的问题是：如果 $t_k$ 时刻的状态有一个小误差 $\delta\bm{x}_k$，那么经过一次 IMU 传播后，$t_{k+1}$ 时刻的误差 $\delta\bm{x}_{k+1}$ 是多少？答案写成一阶线性形式
+\begin{equation}\label{eq:17-f-linear}
+  \delta\bm{x}_{k+1}=\bm{F}_k\,\delta\bm{x}_k+\bm{G}_k\,\bm{n}_k,
+\end{equation}
+其中 $\bm{F}_k\in\R^{18\times18}$ 是误差状态转移矩阵，$\bm{G}_k\in\R^{18\times12}$ 把过程噪声 $\bm{n}=[\bm{n}_g^{\top},\bm{n}_a^{\top},\bm{n}_{bg}^{\top},\bm{n}_{ba}^{\top}]^{\top}$ 映射进误差状态。连续时间下，$\dot{\delta\bm{x}}=\bm{F}\delta\bm{x}+\bm{G}\bm{n}$，离散化取 $\bm{F}_k\approx\bm{I}+\bm{F}\Delta t$。
+
+下面逐块推导。\textbf{约定}：真实状态 = 名义状态 $\boxplus$ 误差，即
+\begin{equation}
+  \bm{R}=\hat{\bm{R}}\exp([\delta\bm{\theta}]_\times),\quad
+  \bm{p}=\hat{\bm{p}}+\delta\bm{p},\quad
+  \bm{v}=\hat{\bm{v}}+\delta\bm{v},\quad
+  \bm{b}_g=\hat{\bm{b}}_g+\delta\bm{b}_g,\quad
+  \bm{b}_a=\hat{\bm{b}}_a+\delta\bm{b}_a,\quad
+  \bm{g}=\hat{\bm{g}}+\delta\bm{g},
+\end{equation}
+带帽的量是滤波器当前的名义估计，且所有推导只保留 $\delta$ 的一阶项，忽略 $O(\delta^2)$。
+
+\subsection{姿态误差 $\delta\bm{\theta}$}
+
+对 $\bm{R}=\hat{\bm{R}}\exp([\delta\bm{\theta}]_\times)$ 求导。先算左边：
+\begin{equation}
+  \frac{\diff}{\diff t}\Bigl(\hat{\bm{R}}\exp([\delta\bm{\theta}]_\times)\Bigr)
+  =\dot{\hat{\bm{R}}}\exp([\delta\bm{\theta}]_\times)+\hat{\bm{R}}\frac{\diff}{\diff t}\exp([\delta\bm{\theta}]_\times).
+\end{equation}
+其中 $\dot{\hat{\bm{R}}}=\hat{\bm{R}}[\hat{\bm{\omega}}]_\times$，且由 $\exp([\delta\bm{\theta}(t+\diff t)]_\times)\approx\exp([\delta\bm{\theta}]_\times)\exp([\dot{\delta\bm{\theta}}\diff t]_\times)$ 可得 $\frac{\diff}{\diff t}\exp([\delta\bm{\theta}]_\times)=\exp([\delta\bm{\theta}]_\times)[\dot{\delta\bm{\theta}}]_\times$。于是左边为
+\begin{equation}
+  \hat{\bm{R}}[\hat{\bm{\omega}}]_\times\exp([\delta\bm{\theta}]_\times)+\hat{\bm{R}}\exp([\delta\bm{\theta}]_\times)[\dot{\delta\bm{\theta}}]_\times.
+\end{equation}
+右边由真实运动方程 $\dot{\bm{R}}=\bm{R}[\bm{\omega}]_\times$ 给出，其中 $\bm{\omega}=\tilde{\bm{\omega}}-\bm{b}_g-\bm{n}_g=\hat{\bm{\omega}}-\delta\bm{b}_g-\bm{n}_g$，所以
+\begin{equation}
+  \dot{\bm{R}}=\hat{\bm{R}}\exp([\delta\bm{\theta}]_\times)[\hat{\bm{\omega}}-\delta\bm{b}_g-\bm{n}_g]_\times.
+\end{equation}
+令左右相等，并在两边左乘 $\hat{\bm{R}}^{\top}$：
+\begin{equation}
+  [\hat{\bm{\omega}}]_\times\exp([\delta\bm{\theta}]_\times)+\exp([\delta\bm{\theta}]_\times)[\dot{\delta\bm{\theta}}]_\times
+  =\exp([\delta\bm{\theta}]_\times)[\hat{\bm{\omega}}-\delta\bm{b}_g-\bm{n}_g]_\times.
+\end{equation}
+用一阶近似 $\exp([\delta\bm{\theta}]_\times)\approx\bm{I}+[\delta\bm{\theta}]_\times$ 展开两边，保留一阶项：
+\begin{align}
+  \text{左}&=[\hat{\bm{\omega}}]_\times+[\hat{\bm{\omega}}]_\times[\delta\bm{\theta}]_\times+[\dot{\delta\bm{\theta}}]_\times,\\
+  \text{右}&=[\hat{\bm{\omega}}]_\times-[\delta\bm{b}_g]_\times-[\bm{n}_g]_\times+[\delta\bm{\theta}]_\times[\hat{\bm{\omega}}]_\times.
+\end{align}
+移项，利用反对称矩阵的交换子恒等式 $[\bm{a}]_\times[\bm{b}]_\times-[\bm{b}]_\times[\bm{a}]_\times=[\bm{a}\times\bm{b}]_\times$：
+\begin{equation}
+  [\dot{\delta\bm{\theta}}]_\times=[\delta\bm{\theta}]_\times[\hat{\bm{\omega}}]_\times-[\hat{\bm{\omega}}]_\times[\delta\bm{\theta}]_\times-[\delta\bm{b}_g]_\times-[\bm{n}_g]_\times
+  =[\delta\bm{\theta}\times\hat{\bm{\omega}}-\delta\bm{b}_g-\bm{n}_g]_\times.
+\end{equation}
+去掉两边的 $[\cdot]_\times$，并注意 $\delta\bm{\theta}\times\hat{\bm{\omega}}=-\hat{\bm{\omega}}\times\delta\bm{\theta}=-[\hat{\bm{\omega}}]_\times\delta\bm{\theta}$，得到
+\begin{equation}\label{eq:17-dtheta}
+  \dot{\delta\bm{\theta}}=-[\hat{\bm{\omega}}]_\times\,\delta\bm{\theta}-\delta\bm{b}_g-\bm{n}_g.
+\end{equation}
+式~\eqref{eq:17-dtheta} 三项各有物理含义：$-\delta\bm{b}_g$ 是"零偏估错多少，姿态就以多快速度偏多少"；$-\bm{n}_g$ 是陀螺噪声直接积分成角度误差；$-[\hat{\bm{\omega}}]_\times\delta\bm{\theta}$ 是因为误差 $\delta\bm{\theta}$ 表达在机体系里，而机体系自己在转，所以这个误差向量要"跟着坐标系转"，其变化率为 $-\bm{\omega}\times\delta\bm{\theta}$。第三项是初学者最容易漏掉的耦合项。
+
+\subsection{位置误差 $\delta\bm{p}$}
+
+由 $\dot{\bm{p}}=\bm{v}$ 直接得
+\begin{equation}\label{eq:17-dp}
+  \dot{\delta\bm{p}}=\delta\bm{v}.
+\end{equation}
+物理含义：位置误差的变化率就是速度误差，这是纯运动学关系，没有任何近似。
+
+\subsection{速度误差 $\delta\bm{v}$}
+
+真实加速度为 $\bm{a}=\bm{R}(\tilde{\bm{a}}-\bm{b}_a-\bm{n}_a)+\bm{g}$，名义加速度为 $\hat{\bm{a}}=\hat{\bm{R}}(\tilde{\bm{a}}-\hat{\bm{b}}_a)+\hat{\bm{g}}$。相减：
+\begin{align}
+  \delta\dot{\bm{v}}&=\bm{R}\bigl(\tilde{\bm{a}}-\bm{b}_a-\bm{n}_a\bigr)+\bm{g}-\Bigl[\hat{\bm{R}}\bigl(\tilde{\bm{a}}-\hat{\bm{b}}_a\bigr)+\hat{\bm{g}}\Bigr]\nonumber\\
+  &\approx\hat{\bm{R}}\bigl(\bm{I}+[\delta\bm{\theta}]_\times\bigr)\bigl(\tilde{\bm{a}}-\hat{\bm{b}}_a-\delta\bm{b}_a-\bm{n}_a\bigr)-\hat{\bm{R}}\bigl(\tilde{\bm{a}}-\hat{\bm{b}}_a\bigr)+\delta\bm{g}.
+\end{align}
+记 $\bm{a}\triangleq\tilde{\bm{a}}-\hat{\bm{b}}_a$，展开并只保留一阶项：
+\begin{align}
+  \delta\dot{\bm{v}}&=\hat{\bm{R}}\bm{a}+\hat{\bm{R}}[\delta\bm{\theta}]_\times\bm{a}-\hat{\bm{R}}\delta\bm{b}_a-\hat{\bm{R}}\bm{n}_a-\hat{\bm{R}}\bm{a}+\delta\bm{g}+O(\delta^2)\nonumber\\
+  &=\hat{\bm{R}}[\delta\bm{\theta}]_\times\bm{a}-\hat{\bm{R}}\delta\bm{b}_a-\hat{\bm{R}}\bm{n}_a+\delta\bm{g}.
+\end{align}
+再用 $[\delta\bm{\theta}]_\times\bm{a}=\delta\bm{\theta}\times\bm{a}=-[\bm{a}]_\times\delta\bm{\theta}$，得
+\begin{equation}\label{eq:17-dv}
+  \dot{\delta\bm{v}}=-\hat{\bm{R}}[\tilde{\bm{a}}-\hat{\bm{b}}_a]_\times\,\delta\bm{\theta}-\hat{\bm{R}}\,\delta\bm{b}_a-\hat{\bm{R}}\,\bm{n}_a+\delta\bm{g}.
+\end{equation}
+式~\eqref{eq:17-dv} 的四项：姿态误差让比力的方向偏了，于是产生加速度误差 $-\hat{\bm{R}}[\bm{a}]_\times\delta\bm{\theta}$；加速度计零偏误差直接产生 $\hat{\bm{R}}\delta\bm{b}_a$ 的加速度偏差；噪声 $\bm{n}_a$ 同理；重力估计误差 $\delta\bm{g}$ 原封不动地进入加速度误差。做个数量级估计：姿态差 $1^{\circ}=0.017$\,rad，比力 $10\,\mathrm{m/s^2}$，则加速度误差约 $0.17\,\mathrm{m/s^2}$，$1$\,s 就积累出 $0.17$\,m/s 的速度误差、$8.5$\,cm 的位置误差——所以姿态和速度是强耦合的，不能分开估。
+
+\subsection{零偏与重力}
+
+零偏建模为随机游走，其连续时间导数是白噪声：
+\begin{equation}\label{eq:17-dbias}
+  \dot{\delta\bm{b}}_g=\bm{n}_{bg},\qquad \dot{\delta\bm{b}}_a=\bm{n}_{ba}.
+\end{equation}
+重力在世界系中是常量（忽略地球曲率与自转），名义估计的导数为零，所以
+\begin{equation}\label{eq:17-dg}
+  \dot{\delta\bm{g}}=\bm{0}.
+\end{equation}
+式~\eqref{eq:17-dg} 看起来"重力误差不会变"，但它会通过式~\eqref{eq:17-dv} 影响速度；而且在流形参数化下，$\bm{g}$ 的误差被约束在切空间（球面的切平面）里，模长保持不变，这才是"重力是单位向量"的正确表达。
+
+\subsection{组装 $F$ 与 $Q$}
+
+把式~\eqref{eq:17-dtheta}、\eqref{eq:17-dp}、\eqref{eq:17-dv}、\eqref{eq:17-dbias}、\eqref{eq:17-dg} 按 $\delta\bm{x}=[\delta\bm{\theta},\delta\bm{p},\delta\bm{v},\delta\bm{b}_g,\delta\bm{b}_a,\delta\bm{g}]$ 的顺序排成矩阵 $\dot{\delta\bm{x}}=\bm{F}\delta\bm{x}+\bm{G}\bm{n}$，得到
+\begin{equation}\label{eq:17-F}
+  \bm{F}=
+  \begin{bmatrix}
+    -[\hat{\bm{\omega}}]_\times & \bm{0} & \bm{0} & -\bm{I} & \bm{0} & \bm{0}\\
+    \bm{0} & \bm{0} & \bm{I} & \bm{0} & \bm{0} & \bm{0}\\
+    -\hat{\bm{R}}[\tilde{\bm{a}}-\hat{\bm{b}}_a]_\times & \bm{0} & \bm{0} & \bm{0} & -\hat{\bm{R}} & \bm{I}\\
+    \bm{0} & \bm{0} & \bm{0} & \bm{0} & \bm{0} & \bm{0}\\
+    \bm{0} & \bm{0} & \bm{0} & \bm{0} & \bm{0} & \bm{0}\\
+    \bm{0} & \bm{0} & \bm{0} & \bm{0} & \bm{0} & \bm{0}
+  \end{bmatrix},
+  \qquad
+  \bm{G}=
+  \begin{bmatrix}
+    -\bm{I} & \bm{0} & \bm{0} & \bm{0}\\
+    \bm{0} & \bm{0} & \bm{0} & \bm{0}\\
+    \bm{0} & -\hat{\bm{R}} & \bm{0} & \bm{0}\\
+    \bm{0} & \bm{0} & \bm{I} & \bm{0}\\
+    \bm{0} & \bm{0} & \bm{0} & \bm{I}\\
+    \bm{0} & \bm{0} & \bm{0} & \bm{0}
+  \end{bmatrix}.
+\end{equation}
+$\bm{G}$ 的列按 $\bm{n}=[\bm{n}_g,\bm{n}_a,\bm{n}_{bg},\bm{n}_{ba}]$ 排列。$\bm{Q}$ 是过程噪声的功率谱矩阵：
+\begin{equation}\label{eq:17-Q}
+  \bm{Q}=\diag\bigl(\sigma_g^2\bm{I}_3,\;\sigma_a^2\bm{I}_3,\;\sigma_{bg}^2\bm{I}_3,\;\sigma_{ba}^2\bm{I}_3\bigr),
+\end{equation}
+其中 $\sigma_g$ 是陀螺的角度随机游走密度（单位 $\mathrm{rad/s/\sqrt{Hz}}$），$\sigma_a$ 是加速度计的速度随机游走密度（$\mathrm{m/s^2/\sqrt{Hz}}$），$\sigma_{bg},\sigma_{ba}$ 是零偏随机游走密度。这些参数一般从 IMU 数据手册的 Allan 方差曲线读出（见第~\ref{ch:03-sensors}~章）。
+
+\begin{table}[htbp]
+  \centering
+  \caption{$\bm{F}$ 矩阵分块逐块解释（行/列顺序：$\delta\bm{\theta},\delta\bm{p},\delta\bm{v},\delta\bm{b}_g,\delta\bm{b}_a,\delta\bm{g}$）}\label{tab:17-F}
+  \footnotesize
+  \begin{tabular}{llll}
+    \toprule
+    块 & 表达式 & 物理来源 & 是否为零 \\
+    \midrule
+    $(1,1)$ $\partial\dot{\delta\bm{\theta}}/\partial\delta\bm{\theta}$ & $-[\hat{\bm{\omega}}]_\times$ & 误差向量随机体系旋转 & 非线性项 \\
+    $(1,4)$ $\partial\dot{\delta\bm{\theta}}/\partial\delta\bm{b}_g$ & $-\bm{I}$ & 陀螺零偏误差直接积分 & 常数 \\
+    $(2,3)$ $\partial\dot{\delta\bm{p}}/\partial\delta\bm{v}$ & $\bm{I}$ & $\dot{\bm{p}}=\bm{v}$ & 常数 \\
+    $(3,1)$ $\partial\dot{\delta\bm{v}}/\partial\delta\bm{\theta}$ & $-\hat{\bm{R}}[\tilde{\bm{a}}-\hat{\bm{b}}_a]_\times$ & 姿态误差使比力方向偏转 & 关键耦合 \\
+    $(3,5)$ $\partial\dot{\delta\bm{v}}/\partial\delta\bm{b}_a$ & $-\hat{\bm{R}}$ & 加速度计零偏误差 & 常数 \\
+    $(3,6)$ $\partial\dot{\delta\bm{v}}/\partial\delta\bm{g}$ & $\bm{I}$ & 重力误差直接进入加速度 & 常数 \\
+    $(4,4)$,$(5,5)$,$(6,6)$ & $\bm{0}$ & 零偏/重力自身不传播（仅由噪声驱动） & --- \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+\subsection{协方差传播}
+
+连续时间下协方差满足 Lyapunov 微分方程 $\dot{\bm{P}}=\bm{F}\bm{P}+\bm{P}\bm{F}^{\top}+\bm{G}\bm{Q}\bm{G}^{\top}$。工程上做一阶离散化，令 $\bm{F}_k=\bm{I}+\bm{F}\Delta t$，得到
+\begin{equation}\label{eq:17-cov-prop}
+  \bar{\bm{P}}_{k+1}=\bm{F}_k\bar{\bm{P}}_k\bm{F}_k^{\top}+\bm{Q}_k,\qquad
+  \bm{Q}_k\approx\bm{G}\bm{Q}\bm{G}^{\top}\Delta t.
+\end{equation}
+把 $\bm{G}\bm{Q}\bm{G}^{\top}\Delta t$ 展开，得到每个 IMU 步注入的噪声协方差：
+\begin{equation}\label{eq:17-Qd}
+  \bm{Q}_k=\diag\bigl(\sigma_g^2\Delta t\,\bm{I}_3,\;\bm{0},\;\sigma_a^2\Delta t\,\bm{I}_3,\;\sigma_{bg}^2\Delta t\,\bm{I}_3,\;\sigma_{ba}^2\Delta t\,\bm{I}_3\bigr).
+\end{equation}
+注意 $\delta\bm{p}$ 那一块是零：位置没有直接的噪声注入，它的不确定性完全来自速度的积分。这也解释了为什么位置误差随时间按 $\sqrt{t^3}$ 增长（速度误差按 $\sqrt{t}$，积分一次变 $\sqrt{t^3}$），是惯性导航最经典的误差增长规律。
+
+推导过程本身只有矩阵乘除，但含义很重要：$\bm{F}$ 描述"误差如何生长和互相传染"，$\bm{Q}$ 描述"每一步注入多少新误差"。$\bm{P}$ 就是这两者的累积结果。$\bm{P}$ 中非对角块（如 $\bm{P}_{\theta b_g}$）记录了"姿态误差和零偏误差有多相关"，第~\ref{sec:17-tight-remark}~节会看到它正是零偏被激光间接修正的通道。
+
+一阶形式与 FAST-LIO2 论文附录中"对旋转块做精确指数处理"的版本在 $\Delta t\to0$ 时一致；$\Delta t=5$\,ms、转速 $1000^{\circ}$/s 时两者相差约 $10^{-4}$ 量级。本书按一阶形式推导是为了让"每一项从哪来"看得清楚，读代码时若看到形如 $\bm{A}(\bm{\omega}\Delta t)$ 的矩阵，那就是论文里精确处理的版本。
+
+\section{迭代扩展卡尔曼滤波（IEKF）}\label{sec:17-iekf}
+
+\subsection{标准 EKF 更新回顾}
+
+高斯假设下，预测步给出先验 $\bm{x}\sim\mathcal{N}(\bar{\bm{x}},\bar{\bm{P}})$，观测为 $\bm{z}=\bm{h}(\bm{x})+\bm{v}$，$\bm{v}\sim\mathcal{N}(\bm{0},\bm{R})$。EKF 在 $\bar{\bm{x}}$ 处线性化 $\bm{h}$，得到
+\begin{equation}\label{eq:17-ekf}
+  \bm{K}=\bar{\bm{P}}\bm{H}^{\top}\bigl(\bm{H}\bar{\bm{P}}\bm{H}^{\top}+\bm{R}\bigr)^{-1},\qquad
+  \bm{x}=\bar{\bm{x}}\boxplus\bm{K}\bigl(\bm{z}-\bm{h}(\bar{\bm{x}})\bigr),\qquad
+  \bm{P}=(\bm{I}-\bm{K}\bm{H})\bar{\bm{P}}.
+\end{equation}
+EKF 只线性化一次。问题在于：在 LIO 里 $\bm{h}$ 是通过"找最近平面"定义的，而"最近"这件事本身依赖于当前位姿估计——位姿差一点，找到的平面就可能不同。只线性化一次，等于把"找平面"和"估位姿"割裂开，初值差时容易收敛到错误的对应关系。
+
+\subsection{从最大后验估计推导迭代更新}
+
+IEKF 的想法是：把更新步看成一个最大后验（MAP）问题，用高斯-牛顿反复求解，每次迭代都在新的估计点上重新线性化、重新找平面。要求解的是
+\begin{equation}\label{eq:17-map}
+  \bm{x}^{\star}=\argmin_{\bm{x}}\;\frac12\norm{\bm{x}\boxminus\bar{\bm{x}}}^{2}_{\bar{\bm{P}}}
+  +\frac12\norm{\bm{z}-\bm{h}(\bm{x})}^{2}_{\bm{R}},
+\end{equation}
+其中第一项是"别离先验太远"，第二项是"要拟合观测"，$\norm{\bm{a}}^{2}_{\bm{\Sigma}}=\bm{a}^{\top}\bm{\Sigma}^{-1}\bm{a}$。式~\eqref{eq:17-map} 就是把贝叶斯公式 $p(\bm{x}|\bm{z})\propto p(\bm{z}|\bm{x})p(\bm{x})$ 取负对数后忽略常数项的结果——这也说明了滤波器与优化本质上是同一个问题，只是滤波器每来一帧就消掉历史。
+
+设当前迭代点为 $\bm{x}_j$，令 $\bm{x}=\bm{x}_j\boxplus\delta\bm{x}$。在流形上做一阶展开：
+\begin{equation}\label{eq:17-linearize}
+  \bm{x}\boxminus\bar{\bm{x}}\approx\bigl(\bm{x}_j\boxminus\bar{\bm{x}}\bigr)+\delta\bm{x},\qquad
+  \bm{h}(\bm{x})\approx\bm{h}(\bm{x}_j)+\bm{H}_j\delta\bm{x},\qquad
+  \bm{H}_j=\left.\frac{\partial\bm{h}}{\partial\delta\bm{x}}\right|_{\bm{x}_j}.
+\end{equation}
+第一个近似能用，是因为 $\boxplus$ 在切空间里就是加法：从 $\bar{\bm{x}}$ 出发先走 $\bm{x}_j\boxminus\bar{\bm{x}}$ 再走 $\delta\bm{x}$，一阶上等于直接走两者之和。代入式~\eqref{eq:17-map}，代价函数变成 $\delta\bm{x}$ 的二次型：
+\begin{equation}
+  J(\delta\bm{x})=\frac12\norm{\bigl(\bm{x}_j\boxminus\bar{\bm{x}}\bigr)+\delta\bm{x}}^{2}_{\bar{\bm{P}}}
+  +\frac12\norm{\bm{z}-\bm{h}(\bm{x}_j)-\bm{H}_j\delta\bm{x}}^{2}_{\bm{R}}.
+\end{equation}
+对 $\delta\bm{x}$ 求导并令其为零（这正是"正规方程"的流形版本，见第~\ref{ch:02-math}~章）：
+\begin{equation}
+  \bar{\bm{P}}^{-1}\bigl[(\bm{x}_j\boxminus\bar{\bm{x}})+\delta\bm{x}\bigr]
+  -\bm{H}_j^{\top}\bm{R}^{-1}\bigl[\bm{z}-\bm{h}(\bm{x}_j)-\bm{H}_j\delta\bm{x}\bigr]=\bm{0},
+\end{equation}
+整理成
+\begin{equation}\label{eq:17-normal}
+  \bigl(\bar{\bm{P}}^{-1}+\bm{H}_j^{\top}\bm{R}^{-1}\bm{H}_j\bigr)\delta\bm{x}
+  =-\bar{\bm{P}}^{-1}\bigl(\bm{x}_j\boxminus\bar{\bm{x}}\bigr)+\bm{H}_j^{\top}\bm{R}^{-1}\bigl(\bm{z}-\bm{h}(\bm{x}_j)\bigr).
+\end{equation}
+现在要解出 $\delta\bm{x}$，需要对左边那个 $18\times18$ 矩阵求逆。用两次矩阵求逆引理（Woodbury 恒等式）把它化成和 EKF 一样的形式。记 $\bm{M}=\bar{\bm{P}}^{-1}+\bm{H}_j^{\top}\bm{R}^{-1}\bm{H}_j$，先用 $(\bm{A}+\bm{BCD})^{-1}=\bm{A}^{-1}-\bm{A}^{-1}\bm{B}(\bm{C}^{-1}+\bm{DA}^{-1}\bm{B})^{-1}\bm{DA}^{-1}$（取 $\bm{A}=\bar{\bm{P}}^{-1}$、$\bm{B}=\bm{H}_j^{\top}$、$\bm{C}=\bm{R}^{-1}$、$\bm{D}=\bm{H}_j$）：
+\begin{equation}
+  \bm{M}^{-1}=\bar{\bm{P}}-\bar{\bm{P}}\bm{H}_j^{\top}\bigl(\bm{R}+\bm{H}_j\bar{\bm{P}}\bm{H}_j^{\top}\bigr)^{-1}\bm{H}_j\bar{\bm{P}}.
+\end{equation}
+右乘 $\bm{H}_j^{\top}\bm{R}^{-1}$：
+\begin{align}
+  \bm{M}^{-1}\bm{H}_j^{\top}\bm{R}^{-1}
+  &=\bar{\bm{P}}\bm{H}_j^{\top}\bm{R}^{-1}-\bar{\bm{P}}\bm{H}_j^{\top}\bigl(\bm{R}+\bm{H}_j\bar{\bm{P}}\bm{H}_j^{\top}\bigr)^{-1}\bm{H}_j\bar{\bm{P}}\bm{H}_j^{\top}\bm{R}^{-1}\nonumber\\
+  &=\bar{\bm{P}}\bm{H}_j^{\top}\Bigl[\bm{I}-\bigl(\bm{R}+\bm{H}_j\bar{\bm{P}}\bm{H}_j^{\top}\bigr)^{-1}\bm{H}_j\bar{\bm{P}}\bm{H}_j^{\top}\Bigr]\bm{R}^{-1}\nonumber\\
+  &=\bar{\bm{P}}\bm{H}_j^{\top}\bigl(\bm{R}+\bm{H}_j\bar{\bm{P}}\bm{H}_j^{\top}\bigr)^{-1}\bm{R}\,\bm{R}^{-1}
+  =\bm{K}_j,
+\end{align}
+倒数第二步用了 $\bm{I}-(\bm{R}+\bm{S})^{-1}\bm{S}=(\bm{R}+\bm{S})^{-1}\bm{R}$（记 $\bm{S}=\bm{H}_j\bar{\bm{P}}\bm{H}_j^{\top}$）。同理右乘 $\bar{\bm{P}}^{-1}$：
+\begin{equation}
+  \bm{M}^{-1}\bar{\bm{P}}^{-1}=\bm{I}-\bar{\bm{P}}\bm{H}_j^{\top}\bigl(\bm{R}+\bm{H}_j\bar{\bm{P}}\bm{H}_j^{\top}\bigr)^{-1}\bm{H}_j=\bm{I}-\bm{K}_j\bm{H}_j.
+\end{equation}
+两式代回式~\eqref{eq:17-normal}，得到迭代更新公式：
+\begin{equation}\label{eq:17-iekf-update}
+  \boxed{
+  \delta\bm{x}_j=\bm{K}_j\bigl(\bm{z}-\bm{h}(\bm{x}_j)\bigr)-\bigl(\bm{I}-\bm{K}_j\bm{H}_j\bigr)\bigl(\bm{x}_j\boxminus\bar{\bm{x}}\bigr),\qquad
+  \bm{x}_{j+1}=\bm{x}_j\boxplus\delta\bm{x}_j,}
+\end{equation}
+其中 $\bm{K}_j=\bar{\bm{P}}\bm{H}_j^{\top}(\bm{H}_j\bar{\bm{P}}\bm{H}_j^{\top}+\bm{R})^{-1}$ 每次都重新计算（因为 $\bm{H}_j$ 变了），而 $\bar{\bm{P}}$ 在整个迭代过程中保持不变。
+
+式~\eqref{eq:17-iekf-update} 有两项，物理含义清楚：第一项 $\bm{K}_j(\bm{z}-\bm{h}(\bm{x}_j))$ 是"按当前残差做一次标准的 EKF 修正"；第二项 $(\bm{I}-\bm{K}_j\bm{H}_j)(\bm{x}_j\boxminus\bar{\bm{x}})$ 是"把当前迭代点相对先验的偏移扣掉"——因为 $\bm{K}_j$ 的设计是让更新"从 $\bar{\bm{x}}$ 出发"，而我们现在站在 $\bm{x}_j$ 上，必须先把这段位移还回去，否则会重复计算先验信息。初值取 $\bm{x}_0=\bar{\bm{x}}$ 时第二项为零，第一次迭代就退化成标准 EKF 更新；随着迭代进行，$\bm{x}_j\boxminus\bar{\bm{x}}$ 不再为零，第二项开始起作用，保证每次迭代都在解同一个 MAP 问题而不是越走越远。
+
+\subsection{收敛判据与实现细节}
+
+迭代终止条件通常取下面三条之一（或组合）：
+\begin{enumerate}
+  \item 更新量足够小：$\norm{\delta\bm{x}_j}<\varepsilon_x$（典型 $\varepsilon_x=10^{-3}$，各分量单位不同，实现中常按块分别设阈值）；
+  \item 达到最大迭代次数 $j_{\max}$（典型取 $4$，也有取 $3\sim5$ 的实现）；
+  \item 残差平方和不再明显下降。
+\end{enumerate}
+FAST-LIO2 的工程实现主要用第 2 条：固定迭代若干次，因为残差与协方差都在实时变化，动态判据的收益不大。理论上，当 $\bm{H}_j$ 变化很小时，迭代式~\eqref{eq:17-iekf-update} 会以二次速率收敛到 MAP 解——这是高斯-牛顿法的标准结论；实际中限制收敛速度的是"最近邻对应关系"的离散跳变：某次迭代中某个点换了平面，$\bm{h}$ 就会跳一下。
+
+更新完成后协方差按 $\bm{P}=(\bm{I}-\bm{K}\bm{H})\bar{\bm{P}}$ 计算（$\bm{K},\bm{H}$ 用最后一次迭代的值），或者用数值更稳的 Joseph 形式
+\begin{equation}\label{eq:17-joseph}
+  \bm{P}=(\bm{I}-\bm{K}\bm{H})\bar{\bm{P}}(\bm{I}-\bm{K}\bm{H})^{\top}+\bm{K}\bm{R}\bm{K}^{\top},
+\end{equation}
+它在有限精度下能保证 $\bm{P}$ 对称正定。Point-LIO 因为每次只做一维观测更新，特别依赖 Joseph 形式来避免协方差失去正定性。
+
+\begin{pseudo}{FAST-LIO2 主循环（简化）}
+  \item 初始化：读第一帧点云建立初始地图；用静止段估计初始重力方向与零偏
+  \item 收到 IMU 测量 $(\tilde{\bm{\omega}}_k,\tilde{\bm{a}}_k)$：按式~\eqref{eq:17-discrete} 传播状态，按式~\eqref{eq:17-cov-prop} 传播协方差；发布 odom
+  \item 收到一帧点云：用传播轨迹把每个点去畸变到扫描末时刻，再按距离/体素降采样
+  \item 对每个点：在 iKD-Tree 中找最近 $5$ 点，PCA 拟合平面得到 $(\bm{n}_i,\bm{q}_i)$，算残差 $r_i$ 与雅可比 $\bm{H}_i$
+  \item 令 $\bar{\bm{x}}=\bm{x}$（传播结果），$\bm{x}_0=\bar{\bm{x}}$，迭代 $j=0,1,\dots,j_{\max}$：用式~\eqref{eq:17-iekf-update} 计算 $\delta\bm{x}_j$ 并更新 $\bm{x}_{j+1}$
+  \item 用最后一次的 $\bm{H}$ 按式~\eqref{eq:17-joseph} 更新协方差 $\bm{P}$
+  \item 把去畸变后的点用最终位姿变换到世界系，插入 iKD-Tree；用 box-wise 删除清掉远离当前位置的老点
+\end{pseudo}
+
+\section{点到面观测模型与雅可比}\label{sec:17-jacobian}
+
+\subsection{数据关联：从最近邻到平面}
+
+对去畸变后的第 $i$ 个点，令它在雷达系中的坐标为 $\bm{p}_i^{L}$。先把它转到 IMU 系：
+\begin{equation}\label{eq:17-extrinsic}
+  \bm{p}_i^{I}=\bm{R}_L\,\bm{p}_i^{L}+\bm{t}_L,
+\end{equation}
+其中 $(\bm{R}_L,\bm{t}_L)$ 是 LiDAR 到 IMU 的外参。再转到世界系：
+\begin{equation}\label{eq:17-world}
+  \bm{p}_i^{W}=\bm{R}\,\bm{p}_i^{I}+\bm{p}.
+\end{equation}
+在 iKD-Tree 中取 $\bm{p}_i^{W}$ 的最近 $5$ 个地图点 $\{\bm{q}_{i,1},\dots,\bm{q}_{i,5}\}$，计算它们的均值与协方差：
+\begin{equation}\label{eq:17-planefit}
+  \bar{\bm{q}}_i=\frac15\sum_{s=1}^{5}\bm{q}_{i,s},\qquad
+  \bm{\Sigma}_i=\frac15\sum_{s=1}^{5}\bigl(\bm{q}_{i,s}-\bar{\bm{q}}_i\bigr)\bigl(\bm{q}_{i,s}-\bar{\bm{q}}_i\bigr)^{\top}.
+\end{equation}
+对 $\bm{\Sigma}_i$ 做特征分解，最小特征值对应的特征向量取作平面法向 $\bm{n}_i$（$\norm{\bm{n}_i}=1$），平面过点 $\bar{\bm{q}}_i$。如果最小特征值不够小（点不共面，如树叶、边缘处），该点应被剔除——这就是最朴素的平面性检验。取 5 个点而不是 1 个，是因为 5 个点刚好够定出一个平面（3 个自由度）并附带一个可判断"平不平"的协方差。
+
+\subsection{残差与雅可比}
+
+点到面残差定义为世界系中点到平面的有符号距离：
+\begin{equation}\label{eq:17-residual}
+  r_i=\bm{n}_i^{\top}\bigl(\bm{R}\,\bm{p}_i^{I}+\bm{p}-\bar{\bm{q}}_i\bigr)
+  =\bm{n}_i^{\top}\bigl(\bm{p}_i^{W}-\bar{\bm{q}}_i\bigr).
+\end{equation}
+式~\eqref{eq:17-residual} 的几何含义：$\bm{n}_i^{\top}(\cdot)$ 把三维误差投影到法向上，只保留"垂直于平面"的那一个分量；平面内的偏差被投影掉了，因为平面内往哪儿挪都还在同一个平面上，这个残差无法也不应该约束它。这也正是点到面残差只提供 1 维约束、$m$ 个点最多提供 $m$ 维约束的原因。
+
+下面求偏导。用右扰动约定 $\bm{R}=\hat{\bm{R}}\exp([\delta\bm{\theta}]_\times)$（与 \S\ref{sec:17-f} 一致），$\bm{p}=\hat{\bm{p}}+\delta\bm{p}$。把扰动形式代入式~\eqref{eq:17-residual}：
+\begin{align}
+  r_i(\delta\bm{x})&=\bm{n}_i^{\top}\Bigl(\hat{\bm{R}}\exp([\delta\bm{\theta}]_\times)\bm{p}_i^{I}+\hat{\bm{p}}+\delta\bm{p}-\bar{\bm{q}}_i\Bigr)\nonumber\\
+  &\approx\bm{n}_i^{\top}\Bigl(\hat{\bm{R}}\bigl(\bm{I}+[\delta\bm{\theta}]_\times\bigr)\bm{p}_i^{I}+\hat{\bm{p}}+\delta\bm{p}-\bar{\bm{q}}_i\Bigr)\nonumber\\
+  &=r_i(\bm{0})+\bm{n}_i^{\top}\hat{\bm{R}}[\delta\bm{\theta}]_\times\bm{p}_i^{I}+\bm{n}_i^{\top}\delta\bm{p}.
+\end{align}
+再用 $[\delta\bm{\theta}]_\times\bm{p}_i^{I}=\delta\bm{\theta}\times\bm{p}_i^{I}=-[\bm{p}_i^{I}]_\times\delta\bm{\theta}$（这是"叉乘的反对称矩阵表示"，见第~\ref{ch:02-math}~章）：
+\begin{equation}\label{eq:17-jacobian}
+  r_i(\delta\bm{x})\approx r_i(\bm{0})
+  \underbrace{-\bm{n}_i^{\top}\hat{\bm{R}}[\bm{p}_i^{I}]_\times}_{\partial r_i/\partial\delta\bm{\theta}}\delta\bm{\theta}
+  +\underbrace{\bm{n}_i^{\top}}_{\partial r_i/\partial\delta\bm{p}}\delta\bm{p}.
+\end{equation}
+于是第 $i$ 个点的雅可比是一个 $1\times18$ 的行向量：
+\begin{equation}\label{eq:17-Hi}
+  \boxed{
+  \bm{H}_i=\frac{\partial r_i}{\partial\delta\bm{x}}
+  =\begin{bmatrix}
+    -\bm{n}_i^{\top}\hat{\bm{R}}[\bm{p}_i^{I}]_\times, & \bm{n}_i^{\top}, & \bm{0}_{3}^{\top}, & \bm{0}_{3}^{\top}, & \bm{0}_{3}^{\top}, & \bm{0}_{3}^{\top}
+  \end{bmatrix},}
+\end{equation}
+按 $[\delta\bm{\theta},\delta\bm{p},\delta\bm{v},\delta\bm{b}_g,\delta\bm{b}_a,\delta\bm{g}]$ 分块，非零的只有前两块。
+
+逐块解释：$\partial r_i/\partial\delta\bm{\theta}=-\bm{n}_i^{\top}\hat{\bm{R}}[\bm{p}_i^{I}]_\times$ 表"姿态转一点，点在世界上移动 $\bm{R}\delta\bm{\theta}\times\bm{p}_i^{I}$，再投影到法向"；$\partial r_i/\partial\delta\bm{p}=\bm{n}_i^{\top}$ 表"位置挪一点，点在世界上跟着挪，投影到法向"；$\delta\bm{v},\delta\bm{b}_g,\delta\bm{b}_a,\delta\bm{g}$ 的块为零，因为点的坐标变换直接看不出速度、零偏、重力——它们只能通过先验协方差间接被修正（见 \S\ref{sec:17-tight-remark}）。
+
+\begin{table}[htbp]
+  \centering
+  \caption{点到面观测的雅可比分块与含义}\label{tab:17-jacobian}
+  \small
+  \begin{tabular}{llll}
+    \toprule
+    分块 & 维度 & 表达式 & 含义 \\
+    \midrule
+    $\partial r_i/\partial\delta\bm{\theta}$ & $1\times3$ & $-\bm{n}_i^{\top}\hat{\bm{R}}[\bm{p}_i^{I}]_\times$ & 姿态扰动使点位置绕机体系转动 \\
+    $\partial r_i/\partial\delta\bm{p}$ & $1\times3$ & $\bm{n}_i^{\top}$ & 平移沿法向的分量 \\
+    $\partial r_i/\partial\delta\bm{v}$ & $1\times3$ & $\bm{0}$ & 点坐标不依赖速度 \\
+    $\partial r_i/\partial\delta\bm{b}_g$ & $1\times3$ & $\bm{0}$ & 通过先验协方差间接作用 \\
+    $\partial r_i/\partial\delta\bm{b}_a$ & $1\times3$ & $\bm{0}$ & 通过先验协方差间接作用 \\
+    $\partial r_i/\partial\delta\bm{g}$ & $1\times3$ & $\bm{0}$ & 通过先验协方差间接作用 \\
+    \midrule
+    $\partial r_i/\partial\bm{R}_L$ & $1\times3$ & $-\bm{n}_i^{\top}\hat{\bm{R}}\hat{\bm{R}}_L[\bm{p}_i^{L}]_\times$ & 仅在外参可估时存在 \\
+    $\partial r_i/\partial\bm{t}_L$ & $1\times3$ & $\bm{n}_i^{\top}\hat{\bm{R}}$ & 仅在外参可估时存在 \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+\begin{remark}[左扰动与右扰动]
+如果改用左扰动 $\bm{R}=\exp([\delta\bm{\theta}]_\times)\hat{\bm{R}}$，同样的一阶展开给出
+$r_i\approx r_i(\bm{0})-\bm{n}_i^{\top}[\hat{\bm{R}}\bm{p}_i^{I}]_\times\delta\bm{\theta}$，即雅可比是 $-\bm{n}_i^{\top}[\bm{p}_i^{W}-\hat{\bm{p}}]_\times$。两种约定的差别只是把旋转误差表达在世界系还是机体系，数值结果完全等价（相差一个 $\bm{R}$ 的相似变换）。\textbf{关键是不能混用}：如果雅可比按右扰动推导，更新步就必须按右扰动施加（$\bm{R}\leftarrow\bm{R}\exp(\delta\bm{\theta})$），否则会引入一个随姿态变化的系统性错误。FAST-LIO2 的代码用右扰动，本书全程保持一致。
+\end{remark}
+
+\subsection{堆叠与退化分析}
+
+一帧里有 $m$ 个有效点，把它们堆起来：
+\begin{equation}\label{eq:17-Hstack}
+  \bm{r}=\begin{bmatrix}r_1\\\vdots\\r_m\end{bmatrix}\in\R^m,\qquad
+  \bm{H}=\begin{bmatrix}\bm{H}_1\\\vdots\\\bm{H}_m\end{bmatrix}\in\R^{m\times18},\qquad
+  \bm{R}_m=\diag(\sigma_1^2,\dots,\sigma_m^2).
+\end{equation}
+观测方程是 $\bm{0}=\bm{r}(\bm{x})+\bm{v}$，即"理想情况下残差应为零"，所以式~\eqref{eq:17-iekf-update} 里的 $\bm{z}$ 取 $\bm{0}$、$\bm{h}(\bm{x}_j)$ 就是 $\bm{r}(\bm{x}_j)$——这是把"配准"写进滤波器的标准技巧：残差的期望是零，方差是点的测量噪声。
+
+只看平移部分，$\bm{H}^{\top}\bm{H}$ 的平移块是 $\sum_i\bm{n}_i\bm{n}_i^{\top}$。如果所有点都在同一面墙上，所有 $\bm{n}_i$ 相同，这个矩阵的秩是 1：\textbf{沿墙面方向的两个平移没有被任何残差约束}，这就是几何退化。如果场景有两面互相垂直的墙，秩变成 2；三面互相垂直的墙才满秩。这个观察直接给出退化检测方法：对 $\sum_i\bm{n}_i\bm{n}_i^{\top}$ 做特征分解，若最小特征值小于阈值（或小于最大特征值的某个比例），说明机器人在该特征向量方向上"看不见"约束，此时应当依赖 IMU 先验，或者降低该方向的更新增益。
+
+为什么用点到面而不是点到点？点到点残差是 $\bm{p}_i^{W}-\bm{q}_i$ 的三维向量，表面上看提供了 3 维约束，但地图点本身有采样噪声，点到点残差会把"地图点采在哪"的误差当成位姿误差，导致收敛慢、精度低（经典 ICP 的问题，见第~\ref{ch:07-lidar-odom}~章）。点到面残差把沿平面方向的噪声投影掉，只保留真正有信息的法向分量，所以同样的点能给出更准的位姿。代价是：法向估计本身有误差，平面拟合不可靠的点必须剔除，否则会引入系统偏差。
+
+\subsection{零偏与重力如何被间接修正}\label{sec:17-tight-remark}
+
+表~\ref{tab:17-jacobian} 里 $\delta\bm{v},\delta\bm{b}_g,\delta\bm{b}_a,\delta\bm{g}$ 的分块全为零，很多读者由此误以为"激光修正不了零偏"。修正其实走的是先验协方差这条路：把 $\bm{H}$ 分成位姿块 $\bm{H}_p$ 与零块，则 $\bm{K}$ 的零偏部分为
+\begin{equation}\label{eq:17-K-bias}
+  \bm{K}_{b}=\bar{\bm{P}}_{bp}\bm{H}_p^{\top}\bigl(\bm{H}_p\bar{\bm{P}}_{p}\bm{H}_p^{\top}+\bm{R}\bigr)^{-1},
+\end{equation}
+其中 $\bar{\bm{P}}_{bp}$ 是零偏与位姿的互协方差。只要 $\bar{\bm{P}}_{bp}\neq\bm{0}$，零偏就会被激光残差拉动。用一维例子验证：设 $\theta_{k+1}=\theta_k-b_k\Delta t$、$b_{k+1}=b_k$，则 $\bm{F}_k=\begin{bmatrix}1&-\Delta t\\0&1\end{bmatrix}$，传播一步后 $\bar{P}_{\theta b}=P_{\theta b}-\Delta tP_{bb}$——只要 $P_{bb}>0$ 就非零。此时观测到角度（$\bm{h}=[1,0]$）给出 $K_b=\bar{P}_{\theta b}/(\bar{P}_{\theta\theta}+\sigma^2)\neq0$，零偏被修正，尽管观测对零偏的雅可比是零。
+
+这就是"紧耦合"在数学上的真正含义：\textbf{两个传感器共享同一个状态和同一个协方差矩阵，一个传感器的观测可以通过相关性修正另一个传感器的状态}。$\bm{F}$ 的非对角块在传播中建立起来的 $P_{\theta b_g},P_{v b_a},P_{v g}$ 就是这条通道；没有传播，就没有相关性，也就没有紧耦合。
+
+\section{iKD-Tree：增量式地图}\label{sec:17-ikdtree}
+
+\subsection{为什么不能每帧重建}
+
+FAST-LIO2 每帧要做的事是：对每个去畸变后的点，在地图里找最近的 $5$ 个点。地图点数 $n$ 随运行时间增长，典型值 $10^5\sim10^6$。若每帧都把地图点重新建一棵 KD 树，建树复杂度 $O(n\log n)$；$n=10^6$、$10$\,Hz 时每帧约需 $10^8$ 次比较，不可能实时。而实际上每帧只新增几千到几万个点、只删掉远处的一小部分——为一小部分变化付出重建整棵树的代价显然浪费。iKD-Tree（incremental k-d tree）的思路就是：\textbf{把"建树"拆成"插入、删除、局部重建"三种便宜的操作}，让树一帧一帧地长出来。
+
+\subsection{节点里存什么}
+
+iKD-Tree 的每个节点存五类信息：\textbf{一个地图点}；\textbf{分割轴与分割值}（用哪一维 $x/y/z$ 把子树分成两半）；\textbf{轴对齐包围盒}（AABB，即子树所有点的最小/最大坐标）；\textbf{子树规模}（有效点数与总点数，供平衡与重建判断）；\textbf{删除标记}。AABB 是最近邻搜索能剪枝的关键：若"查询点到某子树 AABB 的最近距离"已大于当前找到的第 $k$ 近邻距离，整棵子树都不用看；没有 AABB，KD 树就退化成链表。
+
+\subsection{增量插入}
+
+插入一个点 $\bm{q}$ 的过程就是从根往下走：遇到包围盒为空的节点就新建节点存放 $\bm{q}$；否则按该节点的分割轴取出 $\bm{q}$ 的对应坐标，与分割值比较决定去左还是右子树，递归直到插入完成，再沿路径回溯更新每个祖先的 AABB 与计数。插入后做平衡检查：若某节点左右子树规模之比超过 $\alpha$（典型 $\alpha=0.7$），说明树开始"歪"，把该子树的所有有效点收集起来重建为一棵平衡树。这个条件与"替罪羊树"（scapegoat tree）的思想一致：大部分插入不破坏平衡，偶尔一次重建把子树摊平，均摊到每次插入仍是 $O(\log n)$。若被删除点占该子树的比例超过阈值（典型 $30\%$），同样触发重建，把删除标记真正"兑现"掉——否则树里全是"幽灵节点"，搜索时白白遍历。
+
+\subsection{惰性删除与 box-wise 操作}
+
+删除一个点在 KD 树里是很麻烦的：不能直接摘掉节点（会破坏树的结构），重建整棵树又太贵。iKD-Tree 用\textbf{惰性删除}（lazy delete）：只把节点标记为"已删除"，搜索时跳过它，树的形状不变。这样做的问题是被删节点还占着内存、还参与遍历；解决办法是在满足条件时重建（见上一段）。
+
+更妙的是\textbf{box-wise 操作}。LIO 运行时经常需要"删掉离当前位置超过 $R$ 的所有点"或"把某个立方体里的点全部插入"。这类操作对应一个轴对齐盒子，iKD-Tree 可以直接利用 AABB 判断：
+\begin{itemize}
+  \item \textbf{box-wise 删除}：从根开始，若某节点的 AABB 完全落在删除盒内，直接把这棵子树整体标记删除（$O(1)$），不再往下递归；若不相交，直接返回；只有部分相交时才递归到子节点。
+  \item \textbf{box-wise 插入}：类似地，若插入盒完全包含某子树，可以把新点集整体挂成一个子树，而不是逐个插入。
+\end{itemize}
+一次 box-wise 删除的实际代价与"落在盒边界上的节点数"成正比，而不是与盒内点数成正比——这正是 LIO 里"滑窗式局部地图"能做到实时的原因。
+
+\begin{figure}[htbp]
+  \centering
+  \begin{tikzpicture}[font=\footnotesize]
+    % 左：二维空间划分
+    \draw[thick, black!60] (0,0) rectangle (6,4);
+    \draw[thick, structurecolor] (3,0) -- (3,4);
+    \draw[thick, structurecolor] (0,2.3) -- (3,2.3);
+    \draw[thick, structurecolor] (3,1.7) -- (6,1.7);
+    \draw[thick, structurecolor] (1.5,2.3) -- (1.5,4);
+    \draw[thick, structurecolor] (4.5,1.7) -- (4.5,0);
+    \foreach \x/\y in {0.6/0.7,1.1/1.3,2.2/0.9,2.6/1.4,3.8/0.5,4.2/1.1,5.3/0.6,5.6/1.3,
+                       1.0/3.1,1.9/3.5,2.5/2.8,3.6/3.2,4.2/2.6,5.2/3.3}{
+      \fill[black!70] (\x,\y) circle (1.3pt);
+    }
+    \draw[red!60!black, thick, dashed] (3.1,0.1) rectangle (5.9,1.6);
+    \node[label, text=red!60!black] at (4.5,0.35) {box-wise 删除};
+    \node[label] at (3,-0.55) {(a) 平面划分与删除盒};
+    % 右：树结构
+    \begin{scope}[xshift=7.9cm, yshift=1.1cm]
+      \node[draw=structurecolor, fill=structurecolor!10, rounded corners=1pt, inner sep=1.5pt] (r) at (2.5,2.6) {轴 $x$};
+      \node[draw=structurecolor, fill=structurecolor!10, rounded corners=1pt, inner sep=1.5pt] (l) at (1.1,1.3) {轴 $y$};
+      \node[draw=structurecolor, fill=structurecolor!10, rounded corners=1pt, inner sep=1.5pt] (rr) at (3.9,1.3) {轴 $y$};
+      \node[draw=black!40, fill=white, rounded corners=1pt, inner sep=1.5pt] (ll) at (0.2,0) {叶};
+      \node[draw=black!40, fill=white, rounded corners=1pt, inner sep=1.5pt] (lr) at (1.9,0) {叶};
+      \node[draw=black!40, fill=white, rounded corners=1pt, inner sep=1.5pt] (rl) at (3.0,0) {叶};
+      \node[draw=red!60!black, fill=red!60!black!12, rounded corners=1pt, inner sep=1.5pt] (rrt) at (4.9,0) {子树};
+      \draw[black!60] (r) -- (l);
+      \draw[black!60] (r) -- (rr);
+      \draw[black!60] (l) -- (ll);
+      \draw[black!60] (l) -- (lr);
+      \draw[black!60] (rr) -- (rl);
+      \draw[black!60] (rr) -- (rrt);
+      \node[label] at (2.5,-0.7) {(b) 对应的二叉树：红框子树整体标记删除};
+    \end{scope}
+  \end{tikzpicture}
+  \caption{iKD-Tree 的空间划分与树结构。左图是一条条按轴切分的划分线，红框表示一次"删除这个盒子里的点"的请求；右图中红框对应的整棵子树只需在根上打一个删除标记，搜索时遇到它也只需检查一次标记，不用逐点遍历。}\label{fig:17-ikdtree}
+\end{figure}
+
+\subsection{复杂度与内存}
+
+把每次操作摊开算：普通 KD 树每帧重建要 $O(n\log n)$，而 iKD-Tree 只在初始化时建一次树，之后每次插入均摊 $O(\log n)$、单点删除 $O(1)$（打标记）、box-wise 删除约 $O(\text{边界节点数})$、$k$ 近邻查询 $O(\log n)$（含剪枝）；最坏情况由 $\alpha$ 平衡保证不退化。这正是把"每帧 $O(m\log n)$ 的查询 + $O(n\log n)$ 的重建"变成"只有查询和增量插入"的关键。
+
+"地图只增不减"会带来内存问题：$10^5$ 点/帧、$10$\,Hz，一分钟就是 $6\times10^7$ 个点。FAST-LIO2 的对策是\textbf{局部地图}：只维护以机器人当前位置为中心、边长 \texttt{cube\_side\_length}（典型 $100\sim200$\,m）的立方体内的点，超出范围的用 box-wise 删除清掉；此外当前帧按 \texttt{filter\_size\_surf} 体素降采样（典型 $0.5$\,m），插入地图前再按 \texttt{filter\_size\_map} 降采样（典型 $0.5$\,m）。这样地图点数被限制在"场景表面积 / 体素面积"的量级，跑几小时也不会爆内存。并行方面，建树与查询常用 OpenMP 在左右子树上分任务，实际加速比受内存带宽限制。
+
+\section{Point-LIO：逐点更新}\label{sec:17-pointlio}
+
+\subsection{FAST-LIO2 留下的两个"帧"假设}
+
+FAST-LIO2 虽然把状态更新写得很漂亮，但它有两个隐含假设：其一，\textbf{帧内 IMU 可信}——$100$\,ms 内的状态全靠 IMU 积分外推，直到帧末才被激光修正一次，若这 $100$\,ms 里陀螺饱和（读数被截断在量程上限）或遭遇撞击（加速度计超量程），外推就会跑偏，帧末的数据关联（找最近平面）也会找错，滤波器可能被错误观测带得更偏；其二，\textbf{更新是帧同步的}——两次更新之间的 $100$\,ms 内位姿本质上在"盲推"，高速旋转时 $100$\,ms 就是几十度。直观地说：机器人以 $2000^{\circ}$/s 旋转（很多 MEMS 陀螺的量程上限）时，$100$\,ms 就是 $200^{\circ}$——半圈，这段时间里 IMU 一旦饱和，谁也不知道它转了多少。
+
+\subsection{核心思想：点一到就更新}
+
+Point-LIO~\cite{he2023pointlio} 的做法非常直接：\textbf{每收到一个激光点，就做一次状态更新}。激光点的到达间隔是微秒量级（$10$\,Hz、每帧 $10^4$ 点时约 $10\,\mu$s），于是状态更新的频率从 $10$\,Hz 变成 $10^4\sim10^5$\,Hz。状态不再是"每帧修正一次"，而是"被每个点持续地拽着走"。
+
+\begin{figure}[htbp]
+  \centering
+  \begin{tikzpicture}[font=\footnotesize]
+    % 时间轴
+    \draw[->, black!60] (0,-0.2) -- (12.6,-0.2) node[right]{$t$};
+    % 上：FAST-LIO2
+    \node[label, anchor=west] at (0,1.9) {\textbf{FAST-LIO2}};
+    \draw[thick, structurecolor] (0.2,1.2) -- (12.2,1.2);
+    \foreach \x in {0.2,0.6,...,12.2} { \draw[structurecolor!70] (\x,1.12) -- (\x,1.28); }
+    \foreach \x in {3.2,6.8,10.4} {
+      \fill[red!60!black] (\x,1.2) -- (\x-0.12,1.48) -- (\x+0.12,1.48) -- cycle;
+      \draw[red!60!black, dashed] (\x,1.2) -- (\x,0.05);
+    }
+    \node[label, text=red!60!black, align=left] at (1.6,1.55) {只在帧末更新（每 $100$\,ms 一次）};
+    % 下：Point-LIO
+    \node[label, anchor=west] at (0,-0.85) {\textbf{Point-LIO}};
+    \draw[thick, structurecolor] (0.2,-1.5) -- (12.2,-1.5);
+    \foreach \x in {0.2,0.6,...,12.2} {
+      \fill[green!45!black] (\x,-1.5) circle (1.4pt);
+    }
+    \node[label, text=green!45!black, align=left] at (1.6,-1.95) {每个点一次标量更新（$10\,\mu$s 量级一次）};
+    % 帧边界
+    \foreach \x in {0.2,3.2,6.8,10.4} {
+      \draw[black!35, dotted] (\x,0.05) -- (\x,-0.2);
+    }
+    \draw[decorate, decoration={brace, amplitude=4pt}, black!60] (3.2,2.05) -- (6.8,2.05)
+      node[midway, above=4pt, label] {一帧（$100$\,ms）};
+  \end{tikzpicture}
+  \caption{两种更新粒度的时序对比。上：FAST-LIO2 在每帧末尾做一次 $m$ 维（多残差）更新，两次更新之间状态只靠 IMU 外推；下：Point-LIO 对每个点做一次一维（单残差）更新，状态几乎连续地被观测修正。}\label{fig:17-pointlio}
+\end{figure}
+
+\subsection{逐点传播与标量更新}
+
+设在 $t_{i-1}$ 时刻状态为 $\bm{x}_{i-1}$、协方差为 $\bm{P}_{i-1}$，第 $i$ 个点的时间戳为 $t_i$。一次逐点处理的完整流程是：
+
+\textbf{（1）传播。} 用 $[t_{i-1},t_i]$ 之间的 IMU 数据把状态推到 $t_i$：
+\begin{equation}\label{eq:17-point-prop}
+  \bar{\bm{x}}_i=\bm{f}\bigl(\bm{x}_{i-1},\,\mathcal{U}_{[t_{i-1},t_i]}\bigr),\qquad
+  \bar{\bm{P}}_i=\bm{F}_i\bm{P}_{i-1}\bm{F}_i^{\top}+\bm{Q}_i,
+\end{equation}
+当 $t_i-t_{i-1}$ 只有几十微秒时，通常这段区间内没有 IMU 采样，直接用最近一次的 IMU 测量外推即可（$\bm{F}_i\approx\bm{I}+\bm{F}\Delta t_i$）。
+
+\textbf{（2）关联。} 用 $\bar{\bm{x}}_i$ 把点变换到世界系，在 iKD-Tree 中取最近 $5$ 点、拟合平面，得到 $(\bm{n}_i,\bar{\bm{q}}_i)$ 与残差
+\begin{equation}\label{eq:17-point-residual}
+  r_i=\bm{n}_i^{\top}\bigl(\bm{R}_i\bm{p}_i^{I}+\bm{p}_i-\bar{\bm{q}}_i\bigr),
+\end{equation}
+以及雅可比 $\bm{h}_i=\partial r_i/\partial\delta\bm{x}\in\R^{1\times18}$（形式与式~\eqref{eq:17-Hi} 完全相同）。
+
+\textbf{（3）更新。} 这是一次\textbf{一维观测}的卡尔曼更新：
+\begin{equation}\label{eq:17-scalar-k}
+  \bm{K}_i=\frac{\bar{\bm{P}}_i\bm{h}_i^{\top}}{\bm{h}_i\bar{\bm{P}}_i\bm{h}_i^{\top}+\sigma_i^2},\qquad
+  \delta\bm{x}_i=\bm{K}_i\,r_i,\qquad
+  \bm{x}_i=\bar{\bm{x}}_i\boxplus\delta\bm{x}_i,
+\end{equation}
+\begin{equation}\label{eq:17-scalar-p}
+  \bm{P}_i=(\bm{I}-\bm{K}_i\bm{h}_i)\bar{\bm{P}}_i(\bm{I}-\bm{K}_i\bm{h}_i)^{\top}+\bm{K}_i\sigma_i^2\bm{K}_i^{\top}.
+\end{equation}
+式~\eqref{eq:17-scalar-k} 的推导是标准高斯条件化：$\bm{K}_i$ 就是"状态与观测的互协方差除以观测的总方差"，分母是个\textbf{标量}，所以这里没有矩阵求逆，只有一次除法。式~\eqref{eq:17-scalar-p} 用 Joseph 形式，因为每次更新的步长很小、$\bm{P}$ 的更新次数极多（每秒上万次），必须保证数值上始终对称正定。每更新一次就立刻发布当前状态，于是里程计输出频率可以做到与点频同量级（论文报告可达 $1$\,kHz 以上）。
+
+\subsection{顺序更新与批量更新等价吗}
+
+一个自然的问题：把一帧的 $m$ 个点拆成 $m$ 次一维更新，和 FAST-LIO2 一次 $m$ 维更新，结果一样吗？在\textbf{线性高斯}情形下答案是一样：批量更新的后验信息矩阵 $\bm{\Lambda}=\bar{\bm{P}}^{-1}+\sum_i\bm{h}_i^{\top}\bm{h}_i/\sigma_i^2$ 只是把各点贡献相加，与顺序无关；顺序更新每做一次相当于用 Sherman--Morrison 公式在信息矩阵上加同一项，做完 $m$ 次得到同一个和。所以在\textbf{线性}情形下二者的后验均值与协方差完全相同，区别只在计算路径。
+
+在\textbf{非线性}情形下两者不再严格相等：Point-LIO 在每个点处重新线性化、重新关联，相当于把 IEKF 的迭代分散到时间上，对剧烈运动更友好；但单点的噪声、外点会直接污染状态，必须配合门限。计算上批量更新每帧 $O(m\cdot18+18^3)$，顺序更新是 $m$ 次 $O(18^2)$，后者其实更贵——逐点更新换来的不是算力节省，而是\textbf{更细的时间分辨率和更强的鲁棒性}。
+
+\subsection{IMU 饱和时：把 IMU 从"传播输入"降级为"大噪声"}
+
+这是 Point-LIO 最关键的设计，也是它和 FAST-LIO2 最大的区别。
+
+正常工作时，IMU 读数是"传播的输入"：滤波器相信它，用它积分出两个点之间的状态变化。但陀螺或加速度计一旦饱和，读数被截断，继续信它就会把错误积分进去。Point-LIO 的处理思路是：\textbf{检测到饱和/不可信时，放弃"用 IMU 积分"这件事，改成随机过程模型}——也就是把状态传播写成
+\begin{equation}\label{eq:17-random-walk}
+  \bar{\bm{x}}_i=\bm{x}_{i-1}+\bm{w}_i,\qquad \bm{w}_i\sim\mathcal{N}(\bm{0},\bm{Q}_i^{\mathrm{sat}}),
+\end{equation}
+即"两个点之间的状态怎么变，我不知道，用一个很大的过程噪声 $\bm{Q}_i^{\mathrm{sat}}$ 来表示这种无知"。物理上这相当于假设姿态、速度在两个点之间做随机游走，而不是按某个确定的动力学演化。$\bm{Q}_i^{\mathrm{sat}}$ 的量级由饱和程度决定：读数越接近量程、越不可信，$\bm{Q}$ 就放得越大（论文中的做法是按饱和检测结果自适应放大；不同版本实现细节略有差异，但思想都是"越不可信，越不依赖它"）。
+
+为什么这样做能行？因为逐点更新的频率极高：即使"完全不知道"两个点之间怎么动的，每过 $10\,\mu$s 就有一个激光点来告诉滤波器"你现在应该在这个平面上"。用一维卡尔曼滤波的稳态解可以估出误差上界。标量情形下，每步过程噪声方差 $q$、观测噪声方差 $\sigma^2$，协方差递推为 $\bar{P}=P+q$、$P'=(P+q)\sigma^2/(P+q+\sigma^2)$；令 $P'=P$ 得二次方程 $P^2+Pq-q\sigma^2=0$，正根为
+\begin{equation}\label{eq:17-riccati}
+  P_\infty=\frac{-q+\sqrt{q^2+4q\sigma^2}}{2}.
+\end{equation}
+代入 $q=10^{-4}\,\mathrm{m^2}$（每步"完全不知道"的极端情况）、$\sigma^2=10^{-4}\,\mathrm{m^2}$（单点平面观测标准差 $1$\,cm），得 $P_\infty\approx6.2\times10^{-5}\,\mathrm{m^2}$，即 $\sqrt{P_\infty}\approx7.9$\,mm。也就是说：\textbf{即使动力学模型完全失效、每步注入 $1$\,cm 量级的不确定性，只要每个点都提供一次 $1$\,cm 精度的观测，稳态误差仍被压在 $8$\,mm 左右}——这就是"高频更新"换来的鲁棒性。代价是：如果点云也退化（长走廊等），逐点更新同样失效，只能靠其他传感器或运动约束。
+
+\subsection{代价与收益}
+
+\begin{table}[htbp]
+  \centering
+  \caption{FAST-LIO2 与 Point-LIO 的对比}\label{tab:17-compare}
+  \footnotesize
+  \begin{tabular}{lll}
+    \toprule
+    维度 & FAST-LIO2 & Point-LIO \\
+    \midrule
+    更新粒度 & 每帧一次（$m$ 维） & 每个点一次（$1$ 维） \\
+    更新频率 & $10$\,Hz & $10^4\sim10^5$\,Hz（点频） \\
+    odom 输出 & IMU 频率（$100\sim200$\,Hz） & 点频（可达 $1$\,kHz 以上） \\
+    单次更新代价 & $O(m\cdot18+18^3)$ & $O(18^2)$ \\
+    单帧总代价 & 较低 & 较高（每点一次矩阵更新） \\
+    帧内 IMU 依赖 & 强（$100$\,ms 全靠它外推） & 弱（每个点都在纠偏） \\
+    IMU 饱和 & 可能发散 & 降级为随机过程模型，通常仍稳定 \\
+    外点敏感性 & 一帧内平均，较鲁棒 & 单点直接进状态，需门限剔除 \\
+    实现复杂度 & 中 & 高（时间戳粒度、饱和检测、门限） \\
+    适用场景 & 通用、高动态但 IMU 够用 & 超高速旋转、IMU 量程不足、需要极高频输出 \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+表~\ref{tab:17-compare} 再补充两点工程经验。第一，Point-LIO 的"逐点"依赖激光点自带精确时间戳；机械式多线激光的每个点时间戳由方位角推算，扫描一圈内的时间精度是微秒级的，可以用；但某些雷达只给整帧时间戳，此时要先用帧内运动模型给每个点分配时间，效果会打折。第二，逐点更新对外点极其敏感：一个点如果落在了错误的平面（比如打到移动的人身上），它会把状态直接拽偏。实践中必须做残差门限（例如把 $|r_i|/\sigma$ 超过若干倍的点丢弃）或者用鲁棒核函数降权。
+
+\section{VoxelMap 与地图表示对比}\label{sec:17-voxelmap}
+
+iKD-Tree 把地图存成"点"，每次查询做 $k$ 近邻搜索再拟合平面。VoxelMap~\cite{yuan2022voxelmap} 换了一个思路：\textbf{把地图直接存成平面}。
+
+\subsection{自适应体素与平面模型}
+
+VoxelMap 把空间划分成体素（初始边长如 $1$\,m），对每个体素内的点做 PCA：算出均值 $\bar{\bm{q}}$ 与协方差矩阵 $\bm{\Sigma}$，其特征值为 $\lambda_1\ge\lambda_2\ge\lambda_3$、对应特征向量 $\bm{u}_1,\bm{u}_2,\bm{u}_3$。若最小特征值 $\lambda_3$ 足够小（相对 $\lambda_1$，或小于一个绝对阈值），说明这些点近似共面，就把该体素建模为一个平面 $\pi=(\bm{n},d)$，其中 $\bm{n}=\bm{u}_3$（最小特征值对应的法向）、$d=\bm{n}^{\top}\bar{\bm{q}}$；否则把体素八等分，递归处理八个子体素，直到每个体素"足够平"或者小到不再细分。这就是\textbf{自适应体素}：平面区域用大块，复杂区域用小块。
+
+每个平面不只存参数，还存它的不确定性：平面拟合的协方差可由点分布协方差近似（$\bm{n}$ 的不确定性大致与 $\lambda_3/\lambda_2$ 相关），也可用递归最小二乘在信息形式下增量更新。这样平面参数随观测增多越来越准，残差的噪声方差可直接取平面参数的方差——比 iKD-Tree 里"所有点用同一个常数 $\sigma$"更精细。
+
+\begin{table}[htbp]
+  \centering
+  \caption{iKD-Tree 与 VoxelMap 的地图表示对比}\label{tab:17-map}
+  \small
+  \begin{tabular}{lll}
+    \toprule
+    维度 & iKD-Tree（点地图） & VoxelMap（平面地图） \\
+    \midrule
+    存储单元 & 点 & 体素/平面（含协方差） \\
+    查询 & $k$ 近邻 + 现场 PCA，$O(\log n)$ & 哈希到体素，直接取平面，近似 $O(1)$ \\
+    平面拟合 & 每次查询现算 & 增量维护，可复用 \\
+    精度 & 高（点云原始信息全保留） & 平面区域高，复杂区域退化 \\
+    内存 & 与点数成正比，需滑窗删除 & 与体素数成正比，可预测 \\
+    退化场景 & 依赖法向估计 & 平面本身即法向，更稳 \\
+    非结构化场景 & 好 & 大量细分，优势下降 \\
+    实现复杂度 & 中（树操作） & 中高（八叉树 + 概率更新） \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+选型上可以这样记：\textbf{场景以平面为主、内存紧张、想要更快}，选 VoxelMap 类；\textbf{场景复杂、点云信息宝贵、想要更通用}，选 iKD-Tree 类。二者的残差与雅可比形式完全一样（都是点到面），差别只在地图这一层。
+
+\section{视觉-激光-惯性：FAST-LIVO2 一句话}\label{sec:17-livo}
+
+FAST-LIVO2~\cite{yuan2024fastlivo2} 沿着同一个 IEKF 框架把相机接了进来：状态不变，观测从"点到面残差"扩充为"点到面残差 + 光度误差"。光度误差为 $r_j^{\mathrm{vis}}=\bm{I}_j(\bm{\pi}(\bm{R},\bm{p},\bm{\rho}_j))-\bar{I}_j$，即把地图点按当前位姿投影到图像上取灰度、与参考帧同名点相减，$\bm{\pi}(\cdot)$ 是针孔投影。两类残差在同一个 $\bm{H}$ 里堆叠、用同一个 $\bm{P}$ 融合，视觉便在激光退化的方向上补充约束。适用条件是环境有纹理、光照稳定；纯黑、纯白、强反光的场地仍只能靠激光和 IMU。
+
+\section{论文公式与源码对照}\label{sec:17-code}
+
+\subsection{对照表}
+
+表~\ref{tab:17-code} 把本章的公式与 FAST-LIO2 官方仓库（以及同源的 Point-LIO）中常见的文件/函数对应起来。不同版本的仓库可能有重命名，但"状态结构体 $\to$ 传播函数 $\to$ 更新函数 $\to$ 残差函数"这条主线是不变的。
+
+\begin{table}[htbp]
+  \centering
+  \caption{论文公式与源码对照（以官方仓库某一版本为例，函数名可能随版本微调）}\label{tab:17-code}
+  \scriptsize
+  \begin{tabular}{llll}
+    \toprule
+    概念/公式 & 本章公式 & 文件 & 典型函数/变量 \\
+    \midrule
+    状态定义 & 式~\eqref{eq:17-state} & \texttt{use-ikfom.hpp} & \texttt{struct state\_ikfom} \{pos, rot, vel, bg, ba, grav\} \\
+    流形加减 & 式~\eqref{eq:17-plus-minus} & \texttt{use-ikfom.hpp} & \texttt{operator+}、\texttt{operator-} \\
+    IMU 传播 & 式~\eqref{eq:17-discrete} & \texttt{IMU\_Processing.hpp} & \texttt{ProcessModel()} \\
+    去畸变 & 见第~\ref{ch:16-lio-evolution}~章 & \texttt{IMU\_Processing.hpp} & \texttt{UndistortPcl()} \\
+    协方差传播 & 式~\eqref{eq:17-cov-prop} & \texttt{esekfom.hpp}（IKFoM） & \texttt{predict()}、\texttt{predict\_dyn()} \\
+    IEKF 迭代更新 & 式~\eqref{eq:17-iekf-update} & 同上 & \texttt{update\_iterated\_dyn\_share\_modified()} \\
+    点面残差与雅可比 & 式~\eqref{eq:17-residual},\eqref{eq:17-Hi} & \texttt{laserMapping.cpp} & \texttt{h\_share\_model()} \\
+    主循环与回调 & 伪代码骨架 & \texttt{laserMapping.cpp} & \texttt{main()}、\texttt{imu\_cbk()} \\
+    地图查询/插入/删除 & \S\ref{sec:17-ikdtree} & \texttt{ikd\_Tree.cpp} & \texttt{Nearest\_Search()} 等三接口 \\
+    逐点更新 & 式~\eqref{eq:17-scalar-k} & Point-LIO 仓库 & 逐点更新函数（与 FAST-LIO 同源） \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+\subsection{一段关键代码的骨架}
+
+下面这段代码是\texttt{h\_share\_model()} 的骨架（为可读性做了简化，变量名沿用官方风格；真正的实现还要处理外参、盲区、点的时间戳和并行化）：
+
+\begin{lstlisting}[language=C++, caption={点到面残差与雅可比（示意图，非逐字源码）}, label={lst:17-hshare}]
+// schematic skeleton, names follow the official FAST-LIO2 layout
+for (int i = 0; i < feats_down_size; ++i) {
+    Vector3d p_imu = offset_R_L_I * p_lidar + offset_T_L_I;   // to IMU frame
+    Vector3d p_world = rot * p_imu + pos;                     // to world frame
+    ikdtree.Nearest_Search(p_world, NUM_MATCH_POINTS,
+                           nearest_points, sq_dist);          // 5-NN
+    if (nearest_points.size() < NUM_MATCH_POINTS) continue;
+    plane = fit_plane(nearest_points);                        // PCA normal
+    if (!plane.is_planar) continue;                           // reject
+    residual[i] = plane.normal.dot(p_world - plane.centroid);
+    H.block<1, 3>(i, 0) = -plane.normal.transpose() * rot * SKEW(p_imu);
+    H.block<1, 3>(i, 3) =  plane.normal.transpose();
+}
+// H is stacked as (m x 23); only pose (and extrinsics) blocks are non-zero
+\end{lstlisting}
+
+这段代码与式~\eqref{eq:17-Hi} 一一对应：\texttt{p\_imu} 是式~\eqref{eq:17-extrinsic} 的 $\bm{p}_i^{I}$，\texttt{p\_world} 是式~\eqref{eq:17-world} 的 $\bm{p}_i^{W}$，\texttt{residual[i]} 是式~\eqref{eq:17-residual} 的 $r_i$，\texttt{H.block(0)} 与 \texttt{H.block(3)} 分别是表~\ref{tab:17-jacobian} 的前两块。注意 \texttt{SKEW(p\_imu)} 就是 $[\bm{p}_i^{I}]_\times$，负号来自 $[\delta\bm{\theta}]_\times\bm{p}=-\bm{p}\times\delta\bm{\theta}$。读代码时按"状态 $\to$ 传播 $\to$ 更新 $\to$ 残差 $\to$ 地图"的顺序走，正好对应表~\ref{tab:17-code} 的行序。
+
+\section{工程实践：参数、发散与开销}\label{sec:17-tuning}
+
+最常调的几个参数：\texttt{filter\_size\_surf} 与 \texttt{filter\_size\_map}（当前帧/入图前的降采样体素，典型 $0.5$\,m，调大则点少更快但精度降）、\texttt{cube\_side\_length}（局部地图边长，典型 $100\sim200$\,m，调大保留远处点但内存涨）、\texttt{point\_filter\_num}（每 $N$ 点取 $1$，典型 $3$）、\texttt{maximum\_iter}（IEKF 迭代次数，典型 $4$，调大更准更慢）、\texttt{extrinsic\_T/R}（标定值，差 $1^{\circ}$ 在 $10$\,m 处偏 $17$\,cm）。
+
+\textbf{常见发散原因}（按现场出现频率排序）：\textbf{时间同步}——激光与 IMU 时间戳差 $10$\,ms，$2$\,m/s 下就是 $2$\,cm 错位，这是"代码没问题但一跑就飘"的头号原因；\textbf{外参错误}——标定不准或把 LiDAR 系/IMU 系搞反，表现为"静止正常、一转就飘"；\textbf{IMU 饱和}——撞击瞬间角速度超量程，积分立刻跑偏；\textbf{初始化时机器人在动}——首帧需要近似静止来对齐重力、估零偏；\textbf{场景退化}——长走廊、纯平面、玻璃幕墙，激光约束不足；\textbf{点太少或太远}；\textbf{迭代次数不够}——被撞后初值差，$4$ 次迭代可能没收敛，表现为一两帧内位姿跳变。
+
+\textbf{开销量级与调试}（x86 单核、$10$\,Hz、每帧 $10^5$ 原始点降采样到 $5\times10^3\sim2\times10^4$）：$k$ 近邻查询约占一半时间、残差与矩阵运算占另一半；整机 CPU 占用通常在单核 $20\%\sim40\%$，内存随局部地图规模在百 MB 量级。调参时先看 odom 是否连续（有无跳变），再看残差均值是否稳定在厘米级、协方差 trace 是否收敛；把 iKD-Tree 点数打出来看是否持续增长（增长说明滑窗删除没生效）；最后用 rosbag 回放对照真值。第~\ref{ch:27-tuning}~章给出更系统的排错流程。
+
+\begin{summary}
+
+\begin{enumerate}
+  \item FAST-LIO2 的骨架是"IMU 高频预测 + 激光帧更新"：预测用式~\eqref{eq:17-discrete}，协方差用式~\eqref{eq:17-cov-prop}，更新用式~\eqref{eq:17-iekf-update}；状态 $\bm{x}=[\bm{R},\bm{p},\bm{v},\bm{b}_g,\bm{b}_a,\bm{g}]$ 中姿态在 $\SO(3)$、重力在 $S^2$ 上，误差状态用 $\boxplus/\boxminus$ 在切空间运算（官方实现含外参，共 $23$ 维）。
+  \item $\bm{F}$ 的非零块只有六个：$-[\hat{\bm{\omega}}]_\times$、$-\bm{I}$（零偏进姿态）、$\bm{I}$（速度进位置）、$-\hat{\bm{R}}[\tilde{\bm{a}}-\hat{\bm{b}}_a]_\times$、$-\hat{\bm{R}}$（零偏进速度）、$\bm{I}$（重力进速度）；位置块不注入噪声，位置误差靠速度误差积分增长。
+  \item IEKF 是"对 MAP 问题做高斯-牛顿"：$\delta\bm{x}_j=\bm{K}_j(\bm{z}-\bm{h}(\bm{x}_j))-(\bm{I}-\bm{K}_j\bm{H}_j)(\bm{x}_j\boxminus\bar{\bm{x}})$，每次迭代重新线性化、重新关联，而 $\bar{\bm{P}}$ 保持不变。
+  \item 点到面残差 $r_i=\bm{n}_i^{\top}(\bm{R}\bm{p}_i^{I}+\bm{p}-\bar{\bm{q}}_i)$ 对右扰动的雅可比只有两块：$-\bm{n}_i^{\top}\bm{R}[\bm{p}_i^{I}]_\times$ 与 $\bm{n}_i^{\top}$；零偏、重力、速度的块为零，它们靠先验互协方差被间接修正。
+  \item iKD-Tree 用"增量插入 + 惰性删除 + box-wise 操作 + 局部重建"把地图维护降到每帧 $O(m\log n)$；Point-LIO 把更新粒度从"帧"降到"点"，每点一次标量卡尔曼更新，IMU 饱和时改用随机过程模型、放大 $\bm{Q}$，稳态误差由式~\eqref{eq:17-riccati} 给出。
+\end{enumerate}
+
+
+\end{summary}
+
+\begin{problemset}
+
+  \item 从 $\dot{\bm{R}}=\bm{R}[\bm{\omega}]_\times$ 出发，推导式~\eqref{eq:17-discrete} 中 $\bm{v}_{k+1}$ 的表达式，并写出被忽略的二阶项（提示：把 $\exp([\bm{\omega}s]_\times)$ 展开到 $s^2$ 后积分）。
+  \item 若把重力从状态里去掉（当作常量 $\bm{g}=[0,0,-9.81]^{\top}$），误差状态维数变成多少？初始姿态差 $2^{\circ}$ 会导致什么后果？请用式~\eqref{eq:17-dv} 解释。
+  \item 用左扰动 $\bm{R}=\exp([\delta\bm{\theta}]_\times)\hat{\bm{R}}$ 重新推导式~\eqref{eq:17-Hi}，验证雅可比为 $-\bm{n}_i^{\top}[\bm{R}\bm{p}_i^{I}]_\times$，并说明它与右扰动版本的关系。
+  \item 证明线性高斯下顺序标量更新与批量更新的后验相同（提示：信息矩阵可加），再推导式~\eqref{eq:17-riccati} 并计算 $\sigma=0.02$\,m、$q=10^{-3}\,\mathrm{m^2}$ 时的稳态标准差。
+  \item 一帧点云只有一面墙：写出 $\bm{H}^{\top}\bm{H}$ 的平移块、秩与零空间方向，说明此时为何要降低更新增益；再解释 box-wise 删除为何是 $O(\text{边界节点数})$。
+\end{problemset}
+
+\begin{reading}
+
+\begin{itemize}
+  \item FAST-LIO2 论文~\cite{xu2022fastlio2} 与官方仓库：按表~\ref{tab:17-code} 的顺序读代码，核对论文附录 $\bm{F}$ 与式~\eqref{eq:17-F}，前置读 ESKF 教程~\cite{sola2017eskf}。
+  \item Point-LIO~\cite{he2023pointlio}、VoxelMap~\cite{yuan2022voxelmap}、FAST-LIVO2~\cite{yuan2024fastlivo2}：逐点更新、体素地图、视觉残差三支。
+\end{itemize}
+
+
+
+\end{reading}

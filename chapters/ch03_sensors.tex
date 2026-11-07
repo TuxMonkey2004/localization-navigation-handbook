@@ -1,0 +1,275 @@
+\chapter{传感器与观测模型}\label{ch:03-sensors}
+
+\chapterintro{所有定位算法都建立在传感器之上。这一章把机器人常用的五类传感器——IMU、轮式编码器、激光雷达、相机、UWB/GNSS——逐个拆开：它们测什么、输出什么、噪声长什么样、在什么情况下会骗你。我们会为每类传感器建立“测量模型”，也就是“测量值 = 真值 + 零偏 + 噪声”这样的数学表达。后面所有估计器（卡尔曼滤波、因子图、ICP）都是在这个模型上做概率推断。}
+
+\section{观测与测量模型}\label{sec:03-model}
+
+\begin{definition}[测量模型]
+测量模型（measurement model）描述传感器读数与真实物理量之间的统计关系，通常写成
+\begin{equation}
+\bm{z}=\bm{h}(\bm{x})+\bm{n},
+\end{equation}
+其中 $\bm{z}$ 是测量值，$\bm{x}$ 是待估计的真实状态，$\bm{h}(\cdot)$ 是已知的观测函数，$\bm{n}$ 是\textbf{观测噪声}。
+\end{definition}
+
+观测噪声通常假设为零均值高斯：$\bm{n}\sim\mathcal{N}(\bm{0},\bm{R})$，$\bm{R}$ 叫噪声协方差（在卡尔曼滤波里也记作测量噪声矩阵）。这个假设不是“真理”，而是工程上的折中：高斯分布只需要均值和方差两个数，且高斯经过线性变换后仍是高斯，这让滤波器的推导变得极其简洁。第 2 章已经证明，若 $\bm{n}\sim\mathcal{N}(\bm{0},\bm{R})$，则负对数似然正比于马氏范数 $\norm{\bm{z}-\bm{h}(\bm{x})}_{\bm{R}^{-1}}^{2}$——这正是最小二乘的来源。
+
+\begin{keybox}{为什么噪声协方差这么重要}
+残差同样大，协方差小的观测会被“更相信”，协方差大的会被“更怀疑”。调参时如果发现某个传感器“压不住”或“带偏”了融合结果，第一反应应该是检查它的协方差是否设得合理。
+\end{keybox}
+
+\section{IMU：惯性测量单元}\label{sec:03-imu}
+
+\subsection{它测什么}
+
+IMU 通常由两部分组成：
+\begin{itemize}
+  \item \textbf{陀螺仪}（gyroscope）：测量角速度 $\bm{\omega}=[\omega_x,\omega_y,\omega_z]^{\top}$，单位 rad/s 或 $^\circ$/s。
+  \item \textbf{加速度计}（accelerometer）：测量比力（specific force）$\bm{f}$，单位 m/s$^{2}$。注意它测的不是“加速度”，而是“加速度减去重力”，静止时读数是 $\approx 9.81$ m/s$^{2}$ 指向天空。
+\end{itemize}
+
+现代 IMU 多为 MEMS 工艺，体积小、成本低，但噪声大、零偏随温度漂移。工业级/战术级 IMU 精度高一个到几个数量级，价格也高一个到几个数量级。
+
+\subsection{测量模型}
+
+IMU 的测量模型是全书第一个正式的传感器模型，务必理解每一项：
+\begin{align}
+\tilde{\bm{\omega}}&=\bm{\omega}+\bm{b}_g+\bm{n}_g,\label{eq:03-gyro}\\
+\tilde{\bm{a}}&=\bm{R}_{WB}^{\top}\left(\bm{a}_W-\bm{g}\right)+\bm{b}_a+\bm{n}_a,\label{eq:03-accel}
+\end{align}
+其中：
+\begin{itemize}
+  \item $\tilde{\bm{\omega}},\tilde{\bm{a}}$ 是\textbf{测量值}（带弯弯的波浪号在全书统一表示原始测量）；
+  \item $\bm{\omega},\bm{a}_W$ 是真实的角速度和世界系加速度；
+  \item $\bm{b}_g,\bm{b}_a$ 是\textbf{零偏}（bias），即传感器在零输入时的非零输出，缓慢变化；
+  \item $\bm{n}_g,\bm{n}_a$ 是零均值高斯白噪声；
+  \item $\bm{g}$ 是重力向量，本书约定 $\bm{g}=[0,0,-9.81]^{\top}$（世界系 $z$ 轴向上）；
+  \item $\bm{R}_{WB}^{\top}$ 把世界系向量转到机体系。
+\end{itemize}
+
+\begin{keybox}{加速度计的“坑”}
+式~\eqref{eq:03-accel} 最容易被新手写错的地方是重力符号和参考系。静止时 $\bm{a}_W=\bm{0}$，测量值应为 $\tilde{\bm{a}}=-\bm{R}_{WB}^{\top}\bm{g}$。如果模拟数据里 IMU 读数模长不是 $9.81$ 左右，或者静止时方向不对，先别怀疑算法，先检查模型实现。
+\end{keybox}
+
+
+零偏不是常数，而是缓慢漂移的随机过程。常用模型是\textbf{随机游走}：
+\begin{equation}
+\dot{\bm{b}}_g=\bm{n}_{bg},\qquad \dot{\bm{b}}_a=\bm{n}_{ba},
+\label{eq:03-bias-rw}
+\end{equation}
+其中 $\bm{n}_{bg},\bm{n}_{ba}$ 是零均值高斯白噪声。随机游走意味着零偏的方差随时间的增长而线性增长——这也是 IMU 不能长时间单独定姿的根本原因。
+
+\subsection{噪声参数与离散化}
+
+厂商给出的噪声密度通常是连续时间参数（如 $\sigma_g=0.001$ rad/s/$\sqrt{\text{Hz}}$）。把它离散到采样周期 $\Delta t$ 上，噪声标准差变为
+\begin{equation}
+\sigma_{g,d}=\frac{\sigma_g}{\sqrt{\Delta t}},\qquad \sigma_{bg,d}=\sigma_{bg}\sqrt{\Delta t}.
+\label{eq:03-discrete}
+\end{equation}
+为什么采样越快、单步噪声越大？因为连续白噪声的方差是无穷的，我们实际观测的是它在 $\Delta t$ 上的积分；采样间隔越短，积分区间越小，但单位和归一化方式使得离散标准差与 $\sqrt{\Delta t}$ 成反比。第 6 章会从功率谱密度出发给出这个关系的完整推导。
+
+\subsection{关键指标}
+
+选购或评估 IMU 时关注这些量：
+\begin{itemize}
+  \item \textbf{零偏稳定性}（bias instability）：零偏在长时间内的波动，单位 $^\circ$/h 或 $\mu$g。越小越好。
+  \item \textbf{角度随机游走}（ARW）：陀螺噪声，单位 $^\circ/\sqrt{\text{h}}$。
+  \item \textbf{速度随机游走}（VRW）：加速度计噪声。
+  \item \textbf{量程}（range）：超过量程会\textbf{饱和}，读数被截断——这是 FAST-LIO 类算法在剧烈运动下的典型失效原因。
+  \item \textbf{带宽}与采样率：常见 100--1000 Hz。
+\end{itemize}
+
+图~\ref{fig:03-imu} 展示了 IMU 测量模型中各分量如何叠加成读数。
+
+\begin{figure}[htbp]
+  \centering
+  \begin{tikzpicture}[node distance=1.2cm]
+    \node[block2, minimum width=20mm] (true) {真实角速度\\$\bm{\omega}$};
+    \node[block, right=0.8cm of true, minimum width=20mm] (bias) {零偏\\$\bm{b}_g(t)$};
+    \node[block, right=0.8cm of bias, minimum width=20mm] (noise) {白噪声\\$\bm{n}_g$};
+    \node[block2, right=0.8cm of noise, minimum width=20mm] (meas) {测量\\$\tilde{\bm{\omega}}$};
+    \draw[arrow] (true) -- (bias);
+    \draw[arrow] (bias) -- (noise);
+    \draw[arrow] (noise) -- (meas);
+    \node[below=0.5cm of bias, font=\footnotesize, text=black!60] {缓慢漂移（随机游走）};
+    \node[below=0.5cm of noise, font=\footnotesize, text=black!60] {高频抖动};
+  \end{tikzpicture}
+  \caption{IMU 角速度的测量模型：真值叠加零偏与白噪声。}
+  \label{fig:03-imu}
+\end{figure}
+
+\section{轮式编码器}\label{sec:03-wheel}
+
+\subsection{原理与分辨率}
+
+增量式编码器装在电机或轮轴上，轮子每转一圈输出固定数量的脉冲。设编码器线数为 $N$（每圈 $N$ 个脉冲）、减速比为 $i$、轮半径为 $r$，则轮子每转一圈，电机端产生 $N$ 个脉冲，轮端产生 $Ni$ 个脉冲。若采用四倍频计数（A/B 相正交，上升沿和下降沿都计数），单圈计数为 $4Ni$，于是每个计数对应的行进距离为
+\begin{equation}
+\Delta s=\frac{2\pi r}{4Ni}.
+\label{eq:03-encoder}
+\end{equation}
+\textbf{例}：$N=500$、$i=20$、$r=0.075$ m，则
+\begin{equation}
+\Delta s=\frac{2\pi\times0.075}{4\times500\times20}\approx5.9\times10^{-6}\ \text{m}\approx5.9\ \mu\text{m}.
+\end{equation}
+分辨率远高于实际精度——真正的误差来自轮子打滑、地面不平、轮胎磨损，而不是编码器本身。
+
+\subsection{输出}
+
+编码器本身只给出“转了多少”，需要结合时间得到轮速 $v=\Delta s/\Delta t$，再结合底盘运动学（第 5 章）得到车体线速度和角速度。ROS 2 中通常由底盘驱动节点发布 \lstinline{nav_msgs/Odometry}，并广播 odom 到 base\_link 的变换。
+
+\section{激光雷达}\label{sec:03-lidar}
+
+\subsection{分类}
+
+按扫描方式：
+\begin{itemize}
+  \item \textbf{机械旋转式}：电机带动激光模块旋转，360$^\circ$ 扫描，线数 16/32/64/128。代表：Velodyne、Ouster、Hesai。点云规则、每线一个 \lstinline{ring} 编号。
+  \item \textbf{半固态/固态}：MEMS 微振镜、转镜、OPA 等。视场角有限（如 $120^\circ\times90^\circ$），点云非重复。代表：Livox Mid-360、Avia。
+  \item \textbf{面阵/Flash}：一次曝光成图，无扫描线。
+\end{itemize}
+
+按测距原理：dToF（直接飞行时间）、iToF（间接飞行时间）、FMCW（调频连续波，可测速、抗干扰）。这个细节对算法影响不大，知道即可。
+
+\subsection{关键参数}
+
+\begin{table}[htbp]
+  \centering
+  \caption{激光雷达关键参数}\label{tab:03-lidar-params}
+  \small
+  \begin{tabular}{p{3.2cm}p{5.2cm}p{4.6cm}}
+    \toprule
+    参数 & 含义 & 对算法的影响 \\
+    \midrule
+    线数 / 视场角 & 垂直方向的分辨能力 & 影响点云密度与建图完整性 \\
+    水平角分辨率 & 相邻两束激光的角度间隔 & 影响远处点云稀疏程度 \\
+    测距范围与盲区 & 最近/最远有效距离 & 盲区内的障碍物“看不见” \\
+    点频 & 每秒输出点数 & 影响单帧点数与匹配耗时 \\
+    精度 & 单点测距误差（cm 级） & 影响点面残差噪声模型 \\
+    回波模式 & 单回波/双回波 & 影响玻璃、雨雾场景 \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+\subsection{点云与运动畸变}
+
+\begin{definition}[点云]
+点云是三维点的集合 $\mathcal{P}=\{\bm{p}_i\}_{i=1}^{N}$，每个点通常带有坐标、反射强度、时间戳，机械式雷达还带 \lstinline{ring} 编号。
+\end{definition}
+
+激光雷达不是“瞬间拍一张照片”，而是逐点扫描。一帧点云里，第一个点和最后一个点的采样时间可能相差一个扫描周期（10 Hz 雷达约 100 ms）。如果机器人在这一帧内运动了，点云就会“拖影”——同一个平面被扫成斜面。这叫\textbf{运动畸变}，必须用 IMU 或匀速模型做\textbf{去畸变}（第 16 章详述）。
+
+\begin{keybox}{Livox 的非重复扫描}
+Livox 系列采用非重复花瓣式扫描，单帧点云不形成规则的行列结构，不能直接套用“按 ring 处理”的算法。它的优势是同样点频下覆盖更均匀、近距离更密，适合 FAST-LIO 这类直接配准方法。代价是点云无序，很多传统特征提取方法需要改造。
+\end{keybox}
+
+\section{相机}\label{sec:03-camera}
+
+相机输出二维图像，信息丰富但缺少深度。按获取深度的方式分：
+\begin{itemize}
+  \item \textbf{单目}：结构最简单，但尺度不可观（需要 IMU 或已知物体提供尺度）。
+  \item \textbf{双目}：通过视差恢复深度，$d=\dfrac{f\,b}{Z}$（$f$ 焦距、$b$ 基线、$Z$ 深度），远处精度迅速下降。
+  \item \textbf{RGB-D}：结构光或 ToF 直接给深度，室内近距离好用，阳光下易失效。
+\end{itemize}
+
+\begin{keybox}{内参与外参}
+\textbf{内参}（intrinsic）描述相机自身的成像几何，如焦距 $f_x,f_y$、主点 $c_x,c_y$、畸变系数。\textbf{外参}（extrinsic）描述相机与另一个坐标系（如 IMU、车体）之间的旋转和平移。两者都要标定，混用会直接导致投影错位。第 26 章给出完整标定流程。
+\end{keybox}
+
+
+相机在定位里的角色通常是“提供视觉约束”：特征点重投影误差（第 8 章）、光度误差、回环场景识别。纯视觉定位的优点是信息丰富、成本低；缺点是对光照、纹理、动态物体敏感，且单目有尺度问题。
+
+\section{其他传感器}\label{sec:03-others}
+
+\begin{itemize}
+  \item \textbf{UWB}（超宽带）：通过无线信号飞行时间测距，多个基站可解算三维位置。精度 10--30 cm，室内可用，但多径、遮挡、基站几何分布会显著影响精度。第 23 章会看到它如何作为先验地图缺失时的位置辅助。
+  \item \textbf{GNSS}（卫星导航）：室外绝对定位，RTK 可达厘米级；室内、隧道、城市峡谷不可用。
+  \item \textbf{二维码/ArUco}：视觉标签，精度高但需要布置，适合定点校准或小范围定位。
+  \item \textbf{磁力计}：提供航向参考，易受电机、金属干扰，在机器人上通常只做辅助。
+  \item \textbf{轮式触觉/IMU 之外的里程计}：如视觉里程计、雷达里程计，本质上都是“用其他传感器推算运动”，见第 4 章。
+\end{itemize}
+
+\section{时间同步与坐标系}\label{sec:03-sync}
+
+\subsection{时间同步}
+
+\begin{definition}[时间同步]
+时间同步是让不同传感器的数据带有同一时间基准的过程，包括：硬件触发（PPS、PTP）、软件时间戳对齐、以及估计并补偿传感器之间的固定延迟。
+\end{definition}
+
+为什么重要？假设机器人以 $2$ m/s 运动，两个传感器时间戳相差 $10$ ms，位置差就是 $2\times0.01=2$ cm。对于厘米级定位，这个误差已经不可忽略；对点云配准，时间错位会让点云“错层”，残差永远降不下去。
+
+工程上的检查清单：
+\begin{enumerate}
+  \item 所有传感器的时间戳是否来自同一个时钟源（\lstinline{/clock} 或系统时钟）？
+  \item 回放 bag 时是否加了 \lstinline{--clock}、所有节点是否设置了 \lstinline{use_sim_time:=true}？
+  \item 雷达时间戳是“帧起始”还是“帧结束”？IMU 时间戳是否已做延迟补偿？
+  \item 外参标定文件中，平移和旋转的方向是否与公式一致？
+\end{enumerate}
+
+\subsection{外参}
+
+\begin{definition}[外参]
+外参是传感器坐标系相对于机器人本体坐标系（或另一个传感器坐标系）的位姿，记作 $\bm{T}_{BL}=(\bm{R}_{BL},{}^{B}\bm{p}_{L})$，表示“雷达系到机体系的变换”。
+\end{definition}
+
+外参错误的典型表现：点云与图像对不齐、地图出现双层墙、LIO 建图“越走越歪”、静止时点云漂移。所有外参都必须标定并在配置文件中正确填写（第 26 章）。
+
+\section{传感器选型对比}\label{sec:03-compare}
+
+\begin{table}[htbp]
+  \centering
+  \caption{常用传感器对比（数量级参考）}\label{tab:03-compare}
+  \small
+  \begin{tabular}{lcccl}
+    \toprule
+    传感器 & 频率 & 精度 & 成本 & 主要失效场景 \\
+    \midrule
+    轮式编码器 & 50--100 Hz & 1--10\% 行程 & 极低 & 打滑、悬空、地面沉降 \\
+    MEMS IMU & 100--1000 Hz & 姿态短时好 & 低 & 零偏漂移、饱和、振动 \\
+    2D 激光 & 10--40 Hz & cm 级 & 中 & 无高度信息、玻璃、长走廊 \\
+    3D 激光 & 10--20 Hz & cm 级 & 中高 & 雨雾、强光、稀疏远处 \\
+    单目相机 & 20--60 Hz & 尺度不可观 & 低 & 光照、纹理、动态物体 \\
+    RGB-D & 10--30 Hz & 近距离 cm 级 & 中 & 阳光、远距离、反光 \\
+    UWB & 10--100 Hz & 10--30 cm & 中 & 多径、遮挡、基站几何差 \\
+    GNSS-RTK & 1--20 Hz & cm--m 级 & 高 & 室内、遮挡、多路径 \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+这张表的用法不是“选最贵的”，而是“看清每种传感器的失效场景，用另一种去补它”。这也是第 9 章多传感器融合的出发点。
+
+\begin{summary}
+
+\begin{enumerate}
+  \item 测量模型是“读数 = 真值 + 零偏 + 噪声”，高斯噪声假设让最小二乘与卡尔曼滤波得以成立。
+  \item IMU 测角速度与比力，零偏缓慢漂移，量程饱和是剧烈运动下的典型问题；离散噪声与 $\sqrt{\Delta t}$ 相关。
+  \item 编码器分辨率很高，但轮式里程计的真正误差来自打滑与地面。
+  \item 激光雷达逐点扫描产生运动畸变，机械式与固态的点云结构差异很大，算法选型要匹配。
+  \item 相机内参、外参、时间同步三者任何一个出错，都会表现为“算法不收敛”。
+  \item 没有完美的传感器，只有互补的组合。
+\end{enumerate}
+
+\end{summary}
+
+\begin{problemset}
+
+  \item 静止时 IMU 加速度计读数应该是多少？如果模长是 $9.5$ 或 $10.2$，可能是什么原因？
+  \item 一台 16 线雷达、水平角分辨率 $0.2^\circ$，在 10 m 处的相邻两点间距约是多少？
+  \item 机器人以 $1.5$ m/s 运动，雷达与 IMU 时间戳相差 $20$ ms，会产生多大的位置误差？如果这个误差一直存在，点云配准会表现为什么现象？
+  \item 为什么单目相机有“尺度不可观”问题？双目为什么可以恢复尺度？请写出视差与深度的关系式并解释。
+  \item 列出你所用机器人上所有传感器，写出它们的时间戳来源和坐标系名称，画出 TF 树草图。
+\end{problemset}
+
+\begin{reading}
+
+\begin{itemize}
+  \item \cite{thrun2005probabilistic}：第 2--5 章详细讨论传感器模型与噪声。
+  \item \cite{sola2017eskf}：IMU 噪声模型与离散化的标准参考。
+  \item \cite{barfoot2017state}：第 6--7 章从估计理论角度讲传感器模型。
+  \item 各传感器厂商数据手册：噪声密度、零偏稳定性、量程等参数的实际含义。
+\end{itemize}
+
+
+\end{reading}
+
+

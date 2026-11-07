@@ -1,0 +1,517 @@
+% 本章使用 TikZ 的 arrows.meta / positioning 库（main.tex 与 tests 均已加载，此行幂等无害）
+\usetikzlibrary{arrows.meta, positioning}
+
+\chapter{SLAM 后端详解}\label{ch:13-backend}
+
+\chapterintro{第~\ref{ch:12-frontend}~章的前端把原始数据变成一条条相对位姿约束，本章的后端要回答：拿到这一大堆互相矛盾的约束之后，怎么算出一条``全局一致''的轨迹？这是全书数学密度最高的章节之一。我们会从第~\ref{ch:11-slam-framework}~章的 MAP 表述出发，完整推导三件事：高斯噪声下``最大后验''如何变成``最小二乘''并如何迭代求解；位姿图的残差与雅可比如何一步一步求出来；束调整（BA）里让实时成为可能的``舒尔补''到底在做什么。最后两节讲工程上躲不开的两个问题：错误回环如何毁掉整张图（鲁棒核），以及滑窗优化里旧状态怎么``移出去而不丢信息''（边缘化）。}
+
+\section{从最大后验到最小二乘}\label{sec:13-map2ls}
+
+第~\ref{ch:11-slam-framework}~章已经做过完整推导：把联合后验拆成先验、运动、观测三类因子，在高斯噪声、观测独立、系统一阶马尔可夫的假设下取负对数，得到
+\begin{equation}
+X^{\star}=\argmin_{X}\;\sum_{k=1}^{K}\frac12\norm{\bm{r}_k(X)}_{\bm{\Sigma}_k^{-1}}^{2},
+\qquad
+\norm{\bm{r}}_{\bm{\Sigma}^{-1}}^{2}=\bm{r}^{\top}\bm{\Sigma}^{-1}\bm{r}.
+\label{eq:13-ls}
+\end{equation}
+其中 $\bm{\Sigma}_k^{-1}$ 是第 $k$ 个因子的信息矩阵（定义见第~\ref{ch:09-fusion}~章），$\bm{r}_k$ 是该因子对应的残差，$X$ 是全部待估状态（位姿，可能还有地图点）。式~\eqref{eq:13-ls} 称为\textbf{非线性最小二乘}问题：``非线性''指 $\bm{r}_k(X)$ 一般不是 $X$ 的线性函数（旋转矩阵、投影、对数映射都是非线性的）。它成立的三个前提决定了本章方法的边界：噪声已知且为高斯（否则二范数会被外点带偏，见 \S\ref{sec:13-robust}）、数据关联已确定（关联错了该式本身发现不了）、线性化只是局部的（初值太差会收敛到错误的局部极小）。
+
+\section{Gauss-Newton 与 Levenberg-Marquardt}\label{sec:13-gn}
+
+式~\eqref{eq:13-ls} 没有解析解，只能迭代。高斯-牛顿（Gauss-Newton，GN）的思路是：在当前估计 $X$ 附近把残差线性化，把非线性问题变成一系列线性子问题。
+
+\subsection{线性化与正规方程}
+
+设当前估计为 $X$，给状态一个小的增量 $\delta$（在流形上用 ``$\oplus$'' 表示，定义见第~\ref{ch:02-math}~章，例如 $\bm{R}\oplus\delta\bm{\theta}=\bm{R}\exp(\delta\bm{\theta}^{\wedge})$）。对残差做一阶泰勒展开：
+\begin{equation}
+\bm{r}_k(X\oplus\delta)\approx\bm{r}_k(X)+\bm{J}_k\delta,
+\qquad
+\bm{J}_k=\frac{\partial\bm{r}_k}{\partial\delta}\in\R^{m_k\times n},
+\label{eq:13-taylor}
+\end{equation}
+其中 $m_k$ 是残差维数，$n$ 是全部状态维数。代入式~\eqref{eq:13-ls}，第 $k$ 项变成
+\begin{align}
+\frac12\norm{\bm{r}_k+\bm{J}_k\delta}_{\bm{\Sigma}_k^{-1}}^{2}
+&=\frac12\big(\bm{r}_k+\bm{J}_k\delta\big)^{\top}\bm{\Sigma}_k^{-1}\big(\bm{r}_k+\bm{J}_k\delta\big)\notag\\
+&=\frac12\bm{r}_k^{\top}\bm{\Sigma}_k^{-1}\bm{r}_k
+ +\delta^{\top}\bm{J}_k^{\top}\bm{\Sigma}_k^{-1}\bm{r}_k
+ +\frac12\delta^{\top}\bm{J}_k^{\top}\bm{\Sigma}_k^{-1}\bm{J}_k\delta .
+\label{eq:13-quadratic}
+\end{align}
+第一项与 $\delta$ 无关，可以丢掉。于是整体目标函数变成 $\delta$ 的二次型：
+\begin{equation}
+F(\delta)=\delta^{\top}\bm{b}+\frac12\delta^{\top}\bm{H}\delta,
+\qquad
+\bm{H}=\sum_{k}\bm{J}_k^{\top}\bm{\Sigma}_k^{-1}\bm{J}_k,\quad
+\bm{b}=\sum_{k}\bm{J}_k^{\top}\bm{\Sigma}_k^{-1}\bm{r}_k .
+\label{eq:13-Hb}
+\end{equation}
+对 $\delta$ 求导并令其为零：
+\begin{equation}
+\frac{\partial F}{\partial\delta}=\bm{b}+\bm{H}\delta=\bm{0}
+\;\Longrightarrow\;
+\bm{H}\delta=-\bm{b}.
+\label{eq:13-normal}
+\end{equation}
+式~\eqref{eq:13-normal} 就是\textbf{正规方程}（定义见第~\ref{ch:02-math}~章），$\bm{H}$ 称为\textbf{海森矩阵}。严格的海森矩阵还应包含 $\sum_k\sum_i r_{k,i}\nabla^2 r_{k,i}$ 这样的二阶项，GN 把它忽略了：当残差接近零或残差的二阶导数很小时，这一项可以忽略；代价是初值很差时 GN 可能不收敛甚至发散。求解得到增量后按 $X\leftarrow X\oplus\delta$ 更新状态，再重新计算残差与雅可比，进入下一轮，这就是 GN 迭代。
+
+\subsection{Levenberg-Marquardt：给步长加个``刹车''}
+
+GN 的问题在于它假设线性化在整个步长内都有效。初值差时，算出来的 $\delta$ 可能很大，一步跨到线性化失效的区域，目标函数反而上升。Levenberg-Marquardt（LM）的解决办法很朴素：\textbf{在目标函数里惩罚过大的步长}，即求解
+\begin{equation}
+\min_{\delta}\;\frac12\norm{\bm{r}+\bm{J}\delta}_{\bm{\Sigma}^{-1}}^{2}+\frac12\lambda\norm{\delta}_2^{2}.
+\label{eq:13-lm-objective}
+\end{equation}
+对 $\delta$ 求导：
+\begin{equation}
+\frac{\partial}{\partial\delta}\Big[\frac12(\bm{r}+\bm{J}\delta)^{\top}\bm{\Sigma}^{-1}(\bm{r}+\bm{J}\delta)+\frac{\lambda}{2}\delta^{\top}\delta\Big]
+=\bm{J}^{\top}\bm{\Sigma}^{-1}\bm{r}+\bm{J}^{\top}\bm{\Sigma}^{-1}\bm{J}\delta+\lambda\delta .
+\end{equation}
+令其为零，得到 LM 的线性方程：
+\begin{equation}
+\big(\bm{H}+\lambda\bm{I}\big)\delta=-\bm{b},
+\label{eq:13-lm-eq}
+\end{equation}
+其中 $\bm{I}$ 是单位矩阵。式~\eqref{eq:13-lm-eq} 的物理意义很清楚：$\lambda\to0$ 时它退化为 GN 方程~\eqref{eq:13-normal}，适合初值好、残差小的情形；$\lambda\to\infty$ 时 $\bm{H}$ 相对可忽略，$\delta\approx-\bm{b}/\lambda$，退化为沿负梯度方向的一小步（梯度下降），适合初值差的情形。工程上常取 $\lambda$ 与 $\bm{H}$ 对角线同量级，即 $(\bm{H}+\lambda\,\mathrm{diag}(\bm{H}))\delta=-\bm{b}$，以抵消不同状态量纲不同的影响。
+
+LM 的迭代策略是``试探—接受/拒绝''：算出一个 $\delta$ 后先试探，若目标函数真的下降，就接受并\textbf{减小} $\lambda$（$\lambda\leftarrow\lambda/2$，更信任 GN）；若上升，就拒绝并\textbf{增大} $\lambda$（$\lambda\leftarrow2\lambda$，更保守）。这套策略使 LM 在初值差时也能稳定收敛，是 Ceres、g2o、GTSAM 的默认选择。
+
+\begin{pseudo}{Gauss-Newton / Levenberg-Marquardt 迭代}
+  \item 输入：初始状态 $X_0$、最大迭代次数、收敛阈值
+  \item 初始化 $\lambda=\lambda_0$（如 $10^{-4}$），计算当前目标函数值 $F_0$
+  \item \textbf{repeat}
+  \item \quad 对每个因子计算残差 $\bm{r}_k$ 与雅可比 $\bm{J}_k$
+  \item \quad 累加 $\bm{H}=\sum_k\bm{J}_k^{\top}\bm{\Sigma}_k^{-1}\bm{J}_k$，$\bm{b}=\sum_k\bm{J}_k^{\top}\bm{\Sigma}_k^{-1}\bm{r}_k$
+  \item \quad 求解 $(\bm{H}+\lambda\bm{I})\delta=-\bm{b}$（用稀疏 Cholesky 分解）
+  \item \quad 若 $\norm{\delta}$ 小于阈值：收敛，跳出
+  \item \quad 试探 $X'=X\oplus\delta$，计算 $F'$
+  \item \quad 若 $F'<F$：接受 $X\leftarrow X'$，$\lambda\leftarrow\lambda/2$
+  \item \quad 否则：拒绝，保留 $X$，$\lambda\leftarrow2\lambda$
+  \item \textbf{until} 达到最大迭代次数
+\end{pseudo}
+
+\subsection{海森矩阵为什么是稀疏的}
+
+式~\eqref{eq:13-Hb} 里 $\bm{H}$ 是全部因子的 ${\bm{J}_k^{\top}\bm{\Sigma}_k^{-1}\bm{J}_k}$ 之和。关键事实是：\textbf{每个因子只涉及少数几个状态变量}。一个里程计因子只连第 $i$ 帧和第 $i+1$ 帧；一个点到面因子只连一帧位姿；回环因子只连两帧位姿。于是 $\bm{J}_k$ 在绝大多数列上都是零，$\bm{H}$ 的绝大部分元素也是零。
+
+图~\ref{fig:13-sparse} 画出了 5 个位姿的位姿图对应的 $\bm{H}$ 结构（每个位姿 2 维，共 10 维）。对角块来自``自己与自己''的项，相邻块来自里程计边，左下与右上那个非零块来自回环边。一个 $N$ 帧的位姿图，$\bm{H}$ 是 $2N\times2N$（3D 时 $6N\times6N$）的矩阵，但非零元只有 $O(N)$ 个。正是这种稀疏性，让 ``$N=1000$ 也能毫秒级求解''成为可能。
+
+\begin{figure}[htbp]
+  \centering
+  \begin{tikzpicture}[scale=0.36]
+    \foreach \i in {0,...,9} \foreach \j in {0,...,9}
+      \draw[black!12] (\i,\j) rectangle ++(1,1);
+    % diagonal blocks (self terms)
+    \foreach \b in {0,2,4,6,8}
+      \fill[structurecolor] (\b,\b) rectangle ++(2,2);
+    % odometry edges: off-diagonal 2x2 blocks
+    \foreach \a/\b in {0/2,2/0,2/4,4/2,4/6,6/4,6/8,8/6}
+      \fill[structurecolor!45] (\a,\b) rectangle ++(2,2);
+    % loop edge blocks (0,8) and (8,0)
+    \fill[red!60!black] (0,8) rectangle ++(2,2);
+    \fill[red!60!black] (8,0) rectangle ++(2,2);
+    \node[label] at (5,-1.0) {$5$ 个位姿、每个 $2$ 维，共 $10\times10$};
+  \end{tikzpicture}
+  \caption{位姿图海森矩阵的稀疏结构。深色为对角块（单个位姿自身项），中色为相邻位姿之间的里程计块，红色为回环边产生的远距离非零块。}\label{fig:13-sparse}
+\end{figure}
+
+\section{位姿图}\label{sec:13-posegraph}
+
+\begin{definition}[因子图]
+因子图（factor graph）是一种二分图，用来表示``一堆变量通过一堆约束联系在一起''的概率模型：图中有两类节点——\textbf{变量节点}（待估状态，如位姿、地图点）与\textbf{因子节点}（每个观测/先验构成的约束）。因子节点与它涉及的所有变量节点相连。式~\eqref{eq:13-ls} 的每一项就对应一个因子。
+\end{definition}
+
+\begin{definition}[位姿图]
+位姿图（pose graph）是因子图的一个特例：变量节点只有位姿 $T_1,\dots,T_N\in SE(3)$，因子节点只有两类——相邻帧之间的``里程计因子''和回环产生的``回环因子''，每个因子都是一条二元边 $(i,j)$，约束 $T_i$ 与 $T_j$ 的相对位姿。位姿图是 SLAM 后端最常用的模型，因为它把地图点全部消掉，只优化位姿，规模小得多。
+\end{definition}
+
+\subsection{残差的定义}
+
+对每条边 $(i,j)$，前端给出的测量是一个相对位姿 $Z_{ij}$（带信息矩阵 $\bm{\Omega}_{ij}$）。若两个位姿完全正确，那么用 $T_i,T_j$ 算出来的相对位姿应等于测量值：
+\begin{equation}
+Z_{ij}\;\overset{?}{=}\;T_i^{-1}T_j .
+\end{equation}
+二者之差用``误差变换'' $E_{ij}$ 表示：
+\begin{equation}
+E_{ij}=Z_{ij}^{-1}\,T_i^{-1}T_j\in SE(3).
+\label{eq:13-error-transform}
+\end{equation}
+$E_{ij}$ 是单位变换就说明没有误差。用李代数把它映射成 $\R^{6}$ 中的向量（对数映射，定义见第~\ref{ch:02-math}~章）：
+\begin{equation}
+\bm{r}_{ij}=\log\big(Z_{ij}^{-1}T_i^{-1}T_j\big)^{\vee}\in\R^{6}.
+\label{eq:13-pg-residual}
+\end{equation}
+式~\eqref{eq:13-pg-residual} 中 $(\cdot)^{\vee}$ 把反对称矩阵变回向量，$\log$ 是李群到李代数的对数映射。为什么要取 $\log$ 而不是直接减？因为 $SE(3)$ 不是向量空间，两个变换``相减''没有定义；$\log$ 把``差多少''映射到切空间上，才能用欧氏范数量化。
+
+\subsection{雅可比的逐步推导（二维情形）}
+
+3D 的完整推导要用到 BCH 公式，篇幅很长。为了把每一步都写清楚，我们在二维 $SE(2)$ 上推导，最后给出 3D 的结论。二维位姿写成 $T_i=(\bm{R}_i,\bm{t}_i)$，其中 $\bm{R}_i$ 是 $2\times2$ 旋转矩阵，$\bm{t}_i\in\R^{2}$。
+
+先把式~\eqref{eq:13-pg-residual} 展开成具体分量。预测的相对位姿是
+\begin{equation}
+\hat{\bm{R}}=\bm{R}_i^{\top}\bm{R}_j,\qquad
+\hat{\bm{t}}=\bm{R}_i^{\top}(\bm{t}_j-\bm{t}_i).
+\end{equation}
+误差变换 $E=Z^{-1}\hat{T}$ 的旋转与平移分别是
+\begin{equation}
+\bm{R}_E=\bm{R}_z^{\top}\hat{\bm{R}}=\bm{R}_z^{\top}\bm{R}_i^{\top}\bm{R}_j,
+\qquad
+\bm{t}_E=\bm{R}_z^{\top}(\hat{\bm{t}}-\bm{t}_z).
+\label{eq:13-E-2d}
+\end{equation}
+残差取 $\bm{r}=(\bm{t}_E,\theta_E)$，其中 $\theta_E$ 是 $\bm{R}_E$ 对应的转角：
+\begin{equation}
+\theta_E=\mathrm{atan2}\big(R_E(2,1),\,R_E(1,1)\big).
+\end{equation}
+残差维数 3，正好等于单个二维位姿的自由度（2 平移 $+$ 1 旋转）。
+
+现在施加扰动。采用\textbf{右扰动}（扰动加在自身坐标系，见第~\ref{ch:02-math}~章）：$T_i\leftarrow T_i\exp(\delta_i)$，$T_j\leftarrow T_j\exp(\delta_j)$，其中 $\delta=(\delta\bm{\rho},\delta\theta)\in\R^{3}$。对 $SE(2)$ 的指数映射做一阶展开（$\delta\theta$ 很小时 $\sin\delta\theta\approx\delta\theta$、$1-\cos\delta\theta\approx0$）：
+\begin{equation}
+\exp(\delta)\approx\Big(\bm{I}+\begin{bmatrix}0&-\delta\theta\\\delta\theta&0\end{bmatrix},\ \delta\bm{\rho}\Big)
+=\Big(\bm{I}+[\delta\theta]_\times,\ \delta\bm{\rho}\Big),
+\label{eq:13-exp2d}
+\end{equation}
+其中 $[\delta\theta]_\times$ 是二维反对称矩阵。于是
+\begin{equation}
+\bm{R}_i\to\bm{R}_i(\bm{I}+[\delta\theta_i]_\times),\qquad
+\bm{t}_i\to\bm{t}_i+\bm{R}_i\delta\bm{\rho}_i .
+\label{eq:13-perturb-i}
+\end{equation}
+
+\textbf{第一步：算 $\bm{t}_E$ 对 $\delta_i$ 的导数。}把式~\eqref{eq:13-perturb-i} 代入 $\hat{\bm{t}}$：
+\begin{align}
+\hat{\bm{t}}\to\big(\bm{R}_i(\bm{I}+[\delta\theta_i]_\times)\big)^{\top}
+\big((\bm{t}_j-\bm{t}_i)-\bm{R}_i\delta\bm{\rho}_i\big)
+&=\big(\bm{I}-[\delta\theta_i]_\times\big)\bm{R}_i^{\top}(\bm{t}_j-\bm{t}_i)
+ -\big(\bm{I}-[\delta\theta_i]_\times\big)\delta\bm{\rho}_i\notag\\
+&=\hat{\bm{t}}-[\delta\theta_i]_\times\hat{\bm{t}}-\delta\bm{\rho}_i+O(\delta^{2}).
+\end{align}
+这里用了 $(\bm{R}_i(\bm{I}+[\delta\theta]_\times))^{\top}=(\bm{I}+[\delta\theta]_\times)^{\top}\bm{R}_i^{\top}=(\bm{I}-[\delta\theta]_\times)\bm{R}_i^{\top}$，以及 $\bm{R}_i^{\top}\bm{R}_i=\bm{I}$。所以
+\begin{equation}
+\delta\hat{\bm{t}}=-\delta\bm{\rho}_i-[\delta\theta_i]_\times\hat{\bm{t}} .
+\end{equation}
+再由 $\bm{t}_E=\bm{R}_z^{\top}(\hat{\bm{t}}-\bm{t}_z)$ 得
+\begin{equation}
+\delta\bm{t}_E=\bm{R}_z^{\top}\delta\hat{\bm{t}}
+=-\bm{R}_z^{\top}\delta\bm{\rho}_i-\delta\theta_i\,\bm{R}_z^{\top}[\bm{e}_z]_\times\hat{\bm{t}}
+=-\bm{R}_z^{\top}\delta\bm{\rho}_i-\delta\theta_i\,[\bm{e}_z]_\times\bm{R}_z^{\top}\hat{\bm{t}},
+\label{eq:13-dte-i}
+\end{equation}
+最后一步用了二维情形的交换关系 $\bm{R}_z^{\top}[\bm{e}_z]_\times=[\bm{e}_z]_\times\bm{R}_z^{\top}$（旋转与``逆时针转 90 度''可交换）。式~\eqref{eq:13-dte-i} 说明：$\delta\bm{\rho}_i$ 经 $\bm{R}_z^{\top}$ 旋转后直接进入 $\bm{t}_E$，而 $\delta\theta_i$ 的效果是让 $\hat{\bm{t}}$ 绕原点转了一下，幅度与 $\hat{\bm{t}}$ 的长度成正比。
+
+\textbf{第二步：算 $\bm{t}_E$ 对 $\delta_j$ 的导数。}同理
+\begin{align}
+\hat{\bm{t}}\to\bm{R}_i^{\top}\big(\bm{t}_j+\bm{R}_j\delta\bm{\rho}_j-\bm{t}_i\big)
+&=\hat{\bm{t}}+\bm{R}_i^{\top}\bm{R}_j\delta\bm{\rho}_j
+=\hat{\bm{t}}+\hat{\bm{R}}\,\delta\bm{\rho}_j,
+\end{align}
+于是
+\begin{equation}
+\delta\bm{t}_E=\bm{R}_z^{\top}\hat{\bm{R}}\,\delta\bm{\rho}_j=\bm{R}_E\,\delta\bm{\rho}_j,
+\end{equation}
+即 $\partial\bm{t}_E/\partial\delta\bm{\rho}_j=\bm{R}_E$，而 $\partial\bm{t}_E/\partial\delta\theta_j=\bm{0}$（$\hat{\bm{t}}$ 与 $\bm{R}_j$ 无关）。
+
+\textbf{第三步：算 $\theta_E$ 的导数。}由式~\eqref{eq:13-E-2d}，
+\begin{equation}
+\bm{R}_E\to\bm{R}_z^{\top}\big(\bm{R}_i(\bm{I}+[\delta\theta_i]_\times)\big)^{\top}\bm{R}_j
+=\bm{R}_z^{\top}(\bm{I}-[\delta\theta_i]_\times)\bm{R}_i^{\top}\bm{R}_j
+=\bm{R}_E-\bm{R}_E[\delta\theta_i]_\times .
+\end{equation}
+最后一步把 $[\delta\theta_i]_\times$ 移到最右边（同样利用交换性）。而 $\bm{R}_E-\bm{R}_E[\delta\theta]_\times=\bm{R}_E(\bm{I}-[\delta\theta]_\times)=\bm{R}_E\bm{R}(-\delta\theta)$，相当于转角减少 $\delta\theta_i$，所以
+\begin{equation}
+\frac{\partial\theta_E}{\partial\delta\theta_i}=-1 .
+\end{equation}
+对 $\delta_j$ 同理有 $\bm{R}_E\to\bm{R}_E(\bm{I}+[\delta\theta_j]_\times)=\bm{R}_E\bm{R}(\delta\theta_j)$，转角增加 $\delta\theta_j$，故 $\partial\theta_E/\partial\delta\theta_j=1$。平移扰动对转角没有影响。
+
+\textbf{第四步：拼成矩阵。}把上面三步的结果按 $\delta=(\delta\bm{\rho},\delta\theta)$ 的列顺序拼起来，得到 $3\times6$ 的分块雅可比：
+\begin{equation}
+\frac{\partial\bm{r}}{\partial(\delta_i,\delta_j)}=
+\left[
+\begin{array}{cc|cc}
+-\bm{R}_z^{\top} & -[\bm{e}_z]_\times\bm{R}_z^{\top}\hat{\bm{t}} & \bm{R}_E & \bm{0}\\[2pt]
+\bm{0}^{\top} & -1 & \bm{0}^{\top} & 1
+\end{array}
+\right]\in\R^{3\times6}.
+\label{eq:13-pg-jac}
+\end{equation}
+（为紧凑起见，矩阵中每个 2×2 或 2×1 的块各写成一个元素；按行展开即为标准的 $3\times6$ 矩阵。）式~\eqref{eq:13-pg-jac} 中左半 $3\times3$ 是残差对 $T_i$ 的雅可比，右半 $3\times3$ 是对 $T_j$ 的雅可比，所有量都在当前估计处求值，每轮迭代重算一次。读它时不必死记：平移残差对自己平移扰动的响应是 $-\bm{R}_z^{\top}$（把误差转到测量坐标系），旋转残差对自己是 $-1$、对对方是 $+1$（因为相对位姿是 $T_i^{-1}T_j$，一正一负），而两处旋转扰动都会``串''到平移残差里。
+
+\subsection{三维情形}
+
+三维位姿图残差仍是式~\eqref{eq:13-pg-residual}，只是 $\bm{r}_{ij}\in\R^{6}$（3 平移 $+$ 3 旋转）。按同样的``右扰动 + 一阶 BCH''推导（BCH 公式见第~\ref{ch:02-math}~章），可得
+\begin{equation}
+\frac{\partial\bm{r}_{ij}}{\partial\delta\bm{\xi}_i}
+=-\bm{J}_l^{-1}(\bm{r}_{ij})\,\mathrm{Ad}\big(T_j^{-1}T_i\big),
+\qquad
+\frac{\partial\bm{r}_{ij}}{\partial\delta\bm{\xi}_j}
+=\bm{J}_r^{-1}(\bm{r}_{ij}),
+\label{eq:13-pg-jac3d}
+\end{equation}
+其中 $\mathrm{Ad}(\cdot)$ 是 $SE(3)$ 的伴随矩阵，
+\begin{equation}
+\mathrm{Ad}(T)=\begin{bmatrix}\bm{R}&[\bm{t}]_\times\bm{R}\\\bm{0}&\bm{R}\end{bmatrix}\in\R^{6\times6},
+\end{equation}
+$\bm{J}_l^{-1},\bm{J}_r^{-1}$ 是 $SE(3)$ 左/右雅可比的逆。当残差较小时 $\bm{J}_l^{-1}\approx\bm{J}_r^{-1}\approx\bm{I}$，很多实现直接采用简化形式
+\begin{equation}
+\frac{\partial\bm{r}_{ij}}{\partial\delta\bm{\xi}_i}\approx-\mathrm{Ad}\big(T_j^{-1}T_i\big),
+\qquad
+\frac{\partial\bm{r}_{ij}}{\partial\delta\bm{\xi}_j}\approx\bm{I},
+\end{equation}
+这也是 g2o\cite{kummerle2011g2o} 中位姿图边的经典形式。式~\eqref{eq:13-pg-jac3d} 的推导与二维完全同构：把式~\eqref{eq:13-perturb-i} 里的 $\bm{R}_i(\bm{I}+[\delta\theta]_\times)$ 换成 $\bm{R}_i\exp([\delta\bm{\theta}]_\times)$，把标量转角换成 $\R^{3}$ 旋转向量，把二维叉乘换成 $3\times3$ 反对称矩阵，再用 BCH 的一阶展开把``$\exp$ 的乘积''并成``对数的和''。
+
+\section{从位姿图到 BA：舒尔补}\label{sec:13-schur}
+
+位姿图把地图点消掉了。但如果我们要同时优化``相机位姿 + 地图点''，模型里就多了一大类变量。这就是光束法平差（Bundle Adjustment，BA，定义见第~\ref{ch:08-visual-odom}~章）：以重投影误差为残差，同时优化相机位姿与三维点。
+
+\subsection{BA 的残差与雅可比}
+
+设第 $i$ 个相机位姿为 $T_i\in SE(3)$（世界到相机的变换），第 $j$ 个地图点在世界系下为 $\bm{X}_j\in\R^{3}$。投影与重投影残差为
+\begin{equation}
+\bm{u}_{ij}=\pi(\bm{R}_i\bm{X}_j+\bm{t}_i),\qquad
+\bm{r}_{ij}=\bm{z}_{ij}-\pi(\bm{R}_i\bm{X}_j+\bm{t}_i)\in\R^{2},
+\end{equation}
+其中 $\pi(\bm{p})=\big(f_x p_x/p_z+c_x,\ f_y p_y/p_z+c_y\big)^{\top}$ 是针孔投影（$f_x,f_y$ 为焦距，$c_x,c_y$ 为主点），$\bm{z}_{ij}$ 是观测到的像素坐标。残差由两部分雅可比组成。先算投影对相机坐标的导数：
+\begin{equation}
+\frac{\partial\pi}{\partial\bm{p}}=\begin{bmatrix}
+\dfrac{f_x}{p_z}&0&-\dfrac{f_x p_x}{p_z^{2}}\\[4pt]
+0&\dfrac{f_y}{p_z}&-\dfrac{f_y p_y}{p_z^{2}}
+\end{bmatrix}\in\R^{2\times3}.
+\end{equation}
+再算相机坐标对位姿扰动 $\delta\bm{\xi}=(\delta\bm{\rho},\delta\bm{\phi})$ 的导数。位姿扰动 $T\leftarrow T\exp(\delta\bm{\xi})$ 作用在点上，一阶展开为 $\bm{p}\to\bm{p}+[\delta\bm{\phi}]_\times\bm{p}+\delta\bm{\rho}$，写成矩阵即
+\begin{equation}
+\frac{\partial\bm{p}}{\partial\delta\bm{\xi}}=\begin{bmatrix}\bm{I}&-[\bm{p}]_\times\end{bmatrix}\in\R^{3\times6}
+\end{equation}
+（因为 $[\delta\bm{\phi}]_\times\bm{p}=-[\bm{p}]_\times\delta\bm{\phi}$）。对点 $\bm{X}_j$ 的导数是 $\partial\bm{p}/\partial\bm{X}_j=\bm{R}_i$。链式相乘，最终
+\begin{equation}
+\bm{J}^{\mathrm{pose}}_{ij}=-\frac{\partial\pi}{\partial\bm{p}}\begin{bmatrix}\bm{I}&-[\bm{p}_{ij}]_\times\end{bmatrix}\in\R^{2\times6},
+\qquad
+\bm{J}^{\mathrm{point}}_{ij}=-\frac{\partial\pi}{\partial\bm{p}}\bm{R}_i\in\R^{2\times3}.
+\label{eq:13-ba-jac}
+\end{equation}
+看式~\eqref{eq:13-ba-jac} 的维度就知道：\textbf{一条观测只涉及一个位姿（6 维）和一个点（3 维）}，所以 $\bm{H}$ 一定是极端稀疏的。
+
+\subsection{分块与舒尔补}
+
+把所有变量排成``相机在前、点在后''的顺序，海森矩阵自然分成四块：
+\begin{equation}
+\begin{bmatrix}
+\bm{H}_{cc}&\bm{H}_{cp}\\[2pt]
+\bm{H}_{pc}&\bm{H}_{pp}
+\end{bmatrix}
+\begin{bmatrix}\delta\bm{\xi}_c\\[2pt]\delta\bm{X}_p\end{bmatrix}
+=
+\begin{bmatrix}-\bm{b}_c\\[2pt]-\bm{b}_p\end{bmatrix}.
+\label{eq:13-ba-block}
+\end{equation}
+其中 $\bm{H}_{cc}$ 是``相机—相机''块（尺寸 $6N_c\times6N_c$），$\bm{H}_{pp}$ 是``点—点''块（$3N_p\times3N_p$），$\bm{H}_{cp}=\bm{H}_{pc}^{\top}$ 是交叉块。
+
+关键观察：\textbf{每个三维点只在``观测到它的那些相机''里出现，点与点之间没有任何因子}。所以 $\bm{H}_{pp}$ 是\textbf{块对角}的：
+\begin{equation}
+\bm{H}_{pp}=\mathrm{diag}\big(\bm{H}_{1},\bm{H}_{2},\dots,\bm{H}_{N_p}\big),
+\qquad \bm{H}_{j}\in\R^{3\times3}.
+\end{equation}
+块对角矩阵的逆就是逐块求逆，每个只有 $3\times3$，极其便宜。这正是舒尔补能用的前提。
+
+\begin{definition}[舒尔补]
+对分块矩阵 $\begin{bmatrix}\bm{A}&\bm{B}\\\bm{C}&\bm{D}\end{bmatrix}$（$\bm{D}$ 可逆），称 $\bm{A}-\bm{B}\bm{D}^{-1}\bm{C}$ 为其（关于 $\bm{D}$ 的）舒尔补（Schur complement）。它在消去分块线性方程组中的变量 $\delta_p$ 时自然出现。
+\end{definition}
+
+下面一步一步消去 $\delta\bm{X}_p$。把式~\eqref{eq:13-ba-block} 写成两个方程：
+\begin{align}
+\bm{H}_{cc}\delta\bm{\xi}_c+\bm{H}_{cp}\delta\bm{X}_p&=-\bm{b}_c, \label{eq:13-ba-r1}\\
+\bm{H}_{pc}\delta\bm{\xi}_c+\bm{H}_{pp}\delta\bm{X}_p&=-\bm{b}_p. \label{eq:13-ba-r2}
+\end{align}
+由式~\eqref{eq:13-ba-r2} 解出 $\delta\bm{X}_p$（$\bm{H}_{pp}$ 块对角可逆）：
+\begin{equation}
+\delta\bm{X}_p=\bm{H}_{pp}^{-1}\big(-\bm{b}_p-\bm{H}_{pc}\delta\bm{\xi}_c\big).
+\label{eq:13-ba-dp}
+\end{equation}
+代入式~\eqref{eq:13-ba-r1}：
+\begin{align}
+\bm{H}_{cc}\delta\bm{\xi}_c+\bm{H}_{cp}\bm{H}_{pp}^{-1}\big(-\bm{b}_p-\bm{H}_{pc}\delta\bm{\xi}_c\big)&=-\bm{b}_c\notag\\
+\bm{H}_{cc}\delta\bm{\xi}_c-\bm{H}_{cp}\bm{H}_{pp}^{-1}\bm{H}_{pc}\delta\bm{\xi}_c&=-\bm{b}_c+\bm{H}_{cp}\bm{H}_{pp}^{-1}\bm{b}_p\notag\\
+\Big(\bm{H}_{cc}-\bm{H}_{cp}\bm{H}_{pp}^{-1}\bm{H}_{pc}\Big)\delta\bm{\xi}_c&=-\bm{b}_c+\bm{H}_{cp}\bm{H}_{pp}^{-1}\bm{b}_p .
+\label{eq:13-reduced}
+\end{align}
+式~\eqref{eq:13-reduced} 就是\textbf{缩减相机系统}（reduced camera system），它的系数矩阵
+\begin{equation}
+\bm{S}=\bm{H}_{cc}-\bm{H}_{cp}\bm{H}_{pp}^{-1}\bm{H}_{pc}
+\label{eq:13-schur}
+\end{equation}
+正是舒尔补。解出 $\delta\bm{\xi}_c$ 后，回代式~\eqref{eq:13-ba-dp} 就得到所有点的增量。
+
+为什么这能``实时''？设 $N_c=200$ 个相机、$N_p=20000$ 个点：直接解 $\bm{H}\delta=-\bm{b}$ 是 $6\times200+3\times20000=61200$ 维，点变量极多、填充（fill-in）严重；舒尔补后只解 $6\times200=1200$ 维的 $\bm{S}$，点变量则通过 $3\times3$ 块逐块求逆、逐块回代，计算量与点数成线性。两者规模比约为 $(61200/1200)^{3}\approx1.3\times10^{5}$，这就是``BA 能实时''的秘密。位姿图可以看作``把所有点都边缘化掉之后的 BA''，这也是它规模小、速度快的原因。
+
+\begin{pseudo}{基于舒尔补的 BA 一轮求解}
+  \item 遍历所有观测，累加 $\bm{H}_{cc},\bm{H}_{cp},\bm{H}_{pp},\bm{b}_c,\bm{b}_p$
+  \item 对每个点 $j$：求 $\bm{H}_j^{-1}$（$3\times3$），计算 $\bm{H}_j^{-1}\bm{H}_{pc}$ 的对应行块与 $\bm{H}_j^{-1}\bm{b}_p$
+  \item 累加 $\bm{S}=\bm{H}_{cc}-\sum_j\bm{H}_{cp,j}\bm{H}_j^{-1}\bm{H}_{pc,j}$ 与右端
+  \item 用稀疏 Cholesky 解 $\bm{S}\,\delta\bm{\xi}_c=$ 右端
+  \item 对每个点 $j$：回代 $\delta\bm{X}_j=\bm{H}_j^{-1}(-\bm{b}_{p,j}-\bm{H}_{pc,j}\delta\bm{\xi}_c)$
+  \item 用 $\oplus$ 更新全部位姿与点，进入下一轮迭代
+\end{pseudo}
+
+\section{回环与鲁棒核}\label{sec:13-robust}
+
+回环闭合是后端最有价值、也最危险的功能。图~\ref{fig:13-factorgraph} 上半部分是正常情况下的一条链式因子图：位姿 $x_0\to x_1\to\cdots\to x_5$，相邻帧有里程计因子，$x_5$ 与 $x_0$ 之间有一条回环因子。正是这条回环边把``漂移了几十厘米''的轨迹拉回闭合。下半部分是错误回环：把``看起来很像、其实不是同一个地方''的两帧连起来，优化器为了满足这条假约束，会把整段轨迹拧成一团。
+
+\begin{figure}[htbp]
+  \centering
+  \begin{tikzpicture}[font=\footnotesize]
+    % panel A: correct loop closure
+    \foreach \i in {0,...,5}{
+      \node[circle, draw=structurecolor, thick, fill=structurecolor!12, minimum size=6.5mm] (x\i) at (\i*1.5,1.2) {$x_{\i}$};
+    }
+    \foreach \i [evaluate=\i as \j using int(\i+1)] in {0,...,4}{
+      \node[rectangle, fill=structurecolor, minimum size=2.4mm, inner sep=0pt] (f\i) at (\i*1.5+0.75,0.25) {};
+      \draw[black!60] (f\i) -- (x\i);
+      \draw[black!60] (f\i) -- (x\j);
+    }
+    \node[rectangle, fill=structurecolor, minimum size=2.4mm, inner sep=0pt] (fp) at (-1.0,1.2) {};
+    \draw[black!60] (fp) -- (x0);
+    \node[label] at (-1.0,1.8) {先验};
+    \node[rectangle, fill=red!60!black, minimum size=2.4mm, inner sep=0pt] (fl) at (3.75,2.35) {};
+    \draw[red!60!black] (fl) -- (x0);
+    \draw[red!60!black] (fl) -- (x5);
+    \node[label, red!60!black] at (3.75,2.85) {回环因子};
+    % panel B: wrong loop closure
+    \foreach \i in {0,...,4}{
+      \node[circle, draw=structurecolor, thick, fill=structurecolor!12, minimum size=6.5mm] (y\i) at (\i*1.5,-2.3) {$x_{\i}$};
+    }
+    \node[rectangle, fill=red!60!black, minimum size=2.4mm, inner sep=0pt] (wl) at (2.9,-0.85) {};
+    \draw[red!60!black] (wl) -- (y1);
+    \draw[red!60!black] (wl) -- (y3);
+    \node[label, red!60!black] at (2.9,-0.45) {错误回环};
+    \node[label, anchor=west, align=left] at (7.6,1.2) {上：正确回环，\\轨迹被拉闭合\\[3pt]下：错误回环，\\轨迹被拧成一团};
+  \end{tikzpicture}
+  \caption{上：正确的回环。圆圈是位姿变量，实心方块是因子节点；相邻位姿由里程计因子相连，$x_5$ 与 $x_0$ 之间的回环因子把累积漂移拉回闭合。下：错误回环。$x_1$ 与 $x_3$ 被错误地连起来，优化器为了满足这条假约束会把轨迹拧成一团，破坏地图一致性。}\label{fig:13-factorgraph}
+\end{figure}
+
+问题来了：最小二乘对残差是\textbf{平方}惩罚，一条错边的残差很大时，平方会把它的``话语权''放大到压倒所有正确约束。鲁棒核函数（robust kernel / M-estimator）的思路是：\textbf{让大残差的惩罚增长得比平方慢}，从而自动给可疑约束降权。
+
+\begin{definition}[鲁棒核函数]
+鲁棒核函数是一个非负、单调递增、在 $s=0$ 处为 $0$ 的函数 $\rho(s)$，用于把``残差的平方''$\norm{\bm{r}}^2_{\bm{\Omega}}$ 替换成 $\rho\big(\norm{\bm{r}}^2_{\bm{\Omega}}\big)$，使优化目标变为
+\begin{equation}
+\min_{X}\;\sum_{k}\rho\big(s_k\big),\qquad s_k=\norm{\bm{r}_k}_{\bm{\Omega}_k}^{2}.
+\end{equation}
+当 $\rho(s)=s$ 时退化为普通最小二乘；$\rho$ 在 $s$ 很大时增长得比线性慢（次线性），就得到鲁棒性。
+\end{definition}
+
+最常用的是 Huber 核：
+\begin{equation}
+\rho(s)=\begin{cases}
+s, & s\le\delta^{2},\\[2pt]
+2\delta\sqrt{s}-\delta^{2}, & s>\delta^{2},
+\end{cases}
+\label{eq:13-huber}
+\end{equation}
+其中 $\delta$ 是``软阈值''，$s$ 是残差平方范数（注意 $\sqrt{s}=\norm{\bm{r}}_{\bm{\Omega}}$）。在 $s=\delta^2$ 处两侧值相等（$\delta^2$），导数也相等，所以 $\rho$ 是连续可导的。
+
+\textbf{推导它对迭代求解的影响。}目标函数对状态的梯度为
+\begin{equation}
+\frac{\partial}{\partial X}\sum_k\rho(s_k)
+=\sum_k\rho'(s_k)\frac{\partial s_k}{\partial X}
+=\sum_k\rho'(s_k)\cdot 2\,\bm{J}_k^{\top}\bm{\Omega}_k\bm{r}_k,
+\end{equation}
+其中用了 $\partial s_k/\partial X=2\bm{J}_k^{\top}\bm{\Omega}_k\bm{r}_k$。令梯度为零、约掉常数 2，得
+\begin{equation}
+\sum_k w_k\,\bm{J}_k^{\top}\bm{\Omega}_k\bm{r}_k=\bm{0},
+\qquad w_k=\rho'(s_k).
+\end{equation}
+再用 GN 的线性化 $\bm{r}_k+\bm{J}_k\delta$ 代替 $\bm{r}_k$，就得到\textbf{加权正规方程}：
+\begin{equation}
+\Big(\sum_k w_k\bm{J}_k^{\top}\bm{\Omega}_k\bm{J}_k\Big)\delta
+=-\sum_k w_k\bm{J}_k^{\top}\bm{\Omega}_k\bm{r}_k .
+\label{eq:13-irls}
+\end{equation}
+式~\eqref{eq:13-irls} 与普通 GN 的唯一区别是每个因子的信息矩阵被乘上了权重 $w_k$。对 Huber 核，$\rho'(s)=1$（$s\le\delta^2$）或 $\rho'(s)=\delta/\sqrt{s}$（$s>\delta^2$），于是
+\begin{equation}
+w_k=\min\Big(1,\;\frac{\delta}{\norm{\bm{r}_k}_{\bm{\Omega}_k}}\Big).
+\label{eq:13-huber-weight}
+\end{equation}
+这就是 Huber 核的全部魔力：\textbf{残差小于阈值时权重为 1（完全相信），残差大于阈值时权重与残差成反比}。残差再大，它对法方程的贡献也不会超过阈值对应的量级。这种``用当前残差算权重、再解加权最小二乘''的迭代方式，称为迭代重加权最小二乘（Iteratively Reweighted Least Squares，IRLS）。
+
+\begin{keybox}{鲁棒核不能``修正''错误关联}
+鲁棒核只是\textbf{降权}，不是\textbf{修正}。一条错误的回环边即便权重降到很低，它仍然在``往错误方向拉''，只是拉得轻了；当错误边很多、或者错误边与其他边形成``一致但错误''的组合时，降权救不了场。所以工程上要三层保险：前端回环几何校验（第~\ref{ch:12-frontend}~章）、后端鲁棒核降权、以及\textbf{开关变量}（给每条回环边一个 $s_k\in[0,1]$ 的连续变量，与位姿一起优化，收敛到 0 表示``这条边被判定为假''）。开源实现里 GTSAM 的 \lstinline{SwitchableConstraint} 就是这个思想\cite{dellaert2017factorgraphs}。
+\end{keybox}
+
+\section{边缘化：把旧状态``移出去''但不丢信息}\label{sec:13-marginalization}
+
+滑窗优化的困境是：窗口里只能保留最近 $M$ 个位姿，更旧的状态必须移出窗口，否则计算量无限增长。但直接把旧状态``删掉''会丢信息——旧状态和保留状态之间是相关的，删掉就等于假装它们独立，会引入不一致。
+
+正确做法是\textbf{边缘化}：把旧状态从概率分布里积掉，留下它对保留状态的影响。在线性化框架下，这件事正好又是舒尔补。
+
+\begin{definition}[边缘化]
+边缘化（marginalization）是指从联合概率分布 $p(X_m,X_r)$ 中，通过对被移除变量 $X_m$ 积分得到保留变量 $X_r$ 的边缘分布：
+\begin{equation}
+p(X_r)=\int p(X_m,X_r)\,\diff X_m .
+\end{equation}
+在高斯情形下，积分的结果仍是一个高斯分布，其信息矩阵恰好是舒尔补。
+\end{definition}
+
+推导与 \S\ref{sec:13-schur} 的块消元完全相同：把联合目标函数在旧线性化点附近写成二次型，按 $(\delta_m,\delta_r)$ 分块，从 $\delta_m$ 那一块解出
+\begin{equation}
+\bm{H}_{mm}\delta_m+\bm{H}_{mr}\delta_r+\bm{b}_m=\bm{0}
+\;\Longrightarrow\;
+\delta_m=\bm{H}_{mm}^{-1}\big(-\bm{b}_m-\bm{H}_{mr}\delta_r\big),
+\end{equation}
+再代回另一块，就得到只含 $\delta_r$ 的二次型：
+\begin{equation}
+F(\delta_r)=\frac12\delta_r^{\top}\underbrace{\Big(\bm{H}_{rr}-\bm{H}_{rm}\bm{H}_{mm}^{-1}\bm{H}_{mr}\Big)}_{\bm{\Lambda}}\delta_r
++\underbrace{\Big(\bm{b}_r-\bm{H}_{rm}\bm{H}_{mm}^{-1}\bm{b}_m\Big)}_{\bm{\eta}}^{\top}\delta_r+\text{常数}.
+\label{eq:13-marg-prior}
+\end{equation}
+式~\eqref{eq:13-marg-prior} 中的 $\bm{\Lambda}$ 与 $\bm{\eta}$ 定义了一个关于 $\delta_r$ 的先验因子：$\bm{\Lambda}$ 是它的信息矩阵，$\bm{\eta}$ 是信息向量。下一轮优化时，把这个先验因子加到目标函数里，就等价于``没有丢掉旧状态的信息''。
+
+边缘化有一个绕不开的副作用：\textbf{线性化误差}。式~\eqref{eq:13-marg-prior} 是在旧线性化点 $\bar{X}$ 附近做的二次近似，它只在 $\bar{X}$ 附近有效。随着后续迭代把 $X_r$ 更新到离 $\bar{X}$ 越来越远，这个先验会``拉''住新的估计，产生偏差。更麻烦的是，如果每一轮都用新的线性化点重新计算 $\bm{\Lambda},\bm{\eta}$，边缘化的``零点''会漂移，导致同一信息被重复计数或丢失（不一致）。工程上的标准解法是\textbf{固定线性化点}（First Estimate Jacobian，FEJ）：边缘化产生的先验，其雅可比始终在第一次线性化点处计算，不再更新。这是 VINS-Mono\cite{qin2018vinsmono}、OKVIS 等滑窗 VIO 的关键实现细节。
+
+\section{求解器工程}\label{sec:13-solver}
+
+最后把``用什么库''这件事说清楚。表~\ref{tab:13-solver} 对比了三个最常用的后端库。
+
+\begin{table}[htbp]
+  \centering
+  \caption{三个常用后端求解器的定位}\label{tab:13-solver}
+  \footnotesize
+  \begin{tabular}{p{0.10\linewidth}p{0.20\linewidth}p{0.30\linewidth}p{0.30\linewidth}}
+    \toprule
+    库 & 模型组织方式 & 优势 & 典型使用场景 \\
+    \midrule
+    g2o & 图（顶点/边），C++ & 轻量、可定制、贴合 ROS 生态 & 教学与研究，Cartographer 早期版本 \\
+    GTSAM & 因子图，C++ & 增量式求解（iSAM2）、理论完备 & LIO-SAM、需要在线增量的系统 \\
+    Ceres & 通用非线性最小二乘 & 自动微分、鲁棒核齐全、性能强 & Cartographer、VINS-Mono \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+三者底层是同一件事：构造 $\bm{H}\delta=-\bm{b}$，用稀疏 Cholesky（如 SuiteSparse 的 CHOLMOD）求解；区别只在\textbf{如何组织因子}与\textbf{如何利用增量信息}。g2o 用``顶点—边''的图结构，最贴近 $\bm{H}$ 的块稀疏本质，但不是增量式的，每轮都要重新分解；GTSAM 的 iSAM2 用贝叶斯树（Bayes tree）只更新被新因子影响的部分，适合在线长期运行；Ceres 提供自动微分与齐全的鲁棒核，写残差最省事，但通常整图重解。量级参考（桌面 CPU）：1000 个节点的位姿图一轮优化 $10\sim50\ \mathrm{ms}$；200 个相机 $+$ 2 万个点的 BA 一轮 $50\sim200\ \mathrm{ms}$。所以后端通常\textbf{降频运行}（每 $1\sim5\ \mathrm{s}$ 一次，或检测到回环时触发），而不是每帧都优化。
+
+\begin{summary}
+\begin{enumerate}
+  \item 后端要解的是第~\ref{ch:11-slam-framework}~章得到的非线性最小二乘式~\eqref{eq:13-ls}（前提：噪声高斯、关联正确、初值不太差）。Gauss-Newton 用一阶泰勒展开把残差线性化，得到正规方程 $\bm{H}\delta=-\bm{b}$，其中 $\bm{H}=\sum\bm{J}^{\top}\bm{\Sigma}^{-1}\bm{J}$、$\bm{b}=\sum\bm{J}^{\top}\bm{\Sigma}^{-1}\bm{r}$（式~\eqref{eq:13-Hb}）；海森矩阵稀疏的根本原因是每个因子只连少数变量（图~\ref{fig:13-sparse}）。
+  \item LM 在目标函数上加 $\frac{\lambda}{2}\norm{\delta}^2$ 的惩罚，得到 $(\bm{H}+\lambda\bm{I})\delta=-\bm{b}$（式~\eqref{eq:13-lm-eq}）；$\lambda$ 大时接近梯度下降、小时接近 GN，按``下降就减、上升就增''调节，因此初值差时也稳。
+  \item 位姿图是只有位姿变量的因子图，残差取误差变换的李代数 $\bm{r}_{ij}=\log(Z_{ij}^{-1}T_i^{-1}T_j)^{\vee}$（式~\eqref{eq:13-pg-residual}）；二维情形可逐步求出 $3\times6$ 的分块雅可比（式~\eqref{eq:13-pg-jac}），3D 情形用伴随矩阵写成式~\eqref{eq:13-pg-jac3d}。
+  \item BA 的 $\bm{H}$ 按相机与点分块后，$\bm{H}_{pp}$ 块对角，消去点变量得到缩减相机系统，其系数正是舒尔补 $\bm{S}=\bm{H}_{cc}-\bm{H}_{cp}\bm{H}_{pp}^{-1}\bm{H}_{pc}$（式~\eqref{eq:13-schur}），求解规模从``点数''降到``相机数''。
+  \item 鲁棒核把残差平方换成次线性增长函数；Huber 核给出的 IRLS 权重是 $w_k=\min(1,\delta/\norm{\bm{r}_k})$（式~\eqref{eq:13-huber-weight}），本质是给可疑约束降权，但\textbf{不能修正}错误关联。
+  \item 边缘化用舒尔补把旧状态积掉，得到保留状态的先验因子（式~\eqref{eq:13-marg-prior}）；代价是线性化误差，工程上用固定线性化点（FEJ）缓解。g2o / GTSAM / Ceres 底层都是稀疏最小二乘，区别在因子组织方式与是否增量求解，后端通常降频运行。
+\end{enumerate}
+
+
+\end{summary}
+
+\begin{problemset}
+  \item 在式~\eqref{eq:13-ls} 中，若某个因子的信息矩阵 $\bm{\Sigma}^{-1}$ 取为单位阵，最小二乘就退化为``残差平方和''。此时 Huber 核与直接对残差做截断（把大残差直接丢弃）有什么区别？
+  \item 用 $SU(2)$ 或 $SO(2)$ 的直觉解释：为什么位姿图残差必须取 $\log$，而不能直接把两个变换矩阵相减再取范数？举一个数值反例。
+  \item 在式~\eqref{eq:13-pg-jac} 中令 $\bm{R}_z=\bm{I}$、$\hat{\bm{t}}=\bm{0}$，请写出简化后的雅可比矩阵，并解释它的物理含义。
+  \item 假设 BA 有 $N_c=100$ 个相机、$N_p=10^4$ 个点。直接解与舒尔补解各要处理多少维的线性系统？若 Cholesky 复杂度为 $O(n^3)$，两者相差多少倍？
+  \item 边缘化产生的先验因子为什么不能每轮用新的线性化点重算？如果不固定线性化点，可能出现什么现象（提示：信息被重复计数或丢失）？
+\end{problemset}
+
+\begin{reading}
+\begin{enumerate}
+  \item Dellaert \& Kaess, ``Factor Graphs for Robot Perception''\cite{dellaert2017factorgraphs}：因子图与增量求解的系统教程，第 3--4 章可配合本章 \S\ref{sec:13-posegraph} 阅读。
+  \item Kümmerle 等，g2o 论文\cite{kummerle2011g2o}：本章位姿图部分的工程对照，重点看 ``Types of Edges'' 与稀疏求解器；Barfoot《State Estimation for Robotics》\cite{barfoot2017state} 第 7 章可补 $SE(3)$ 雅可比与伴随矩阵的细节。
+\end{enumerate}
+
+
+\end{reading}

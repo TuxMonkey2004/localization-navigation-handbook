@@ -1,0 +1,213 @@
+\chapter{定位、建图与导航：全景导论}\label{ch:01-overview}
+
+\chapterintro{这是全书的“地图”。我们不急着推公式，而是先回答三个最朴素的问题：机器人怎么知道自己在哪里？它怎么知道周围长什么样？它怎么决定往哪走？答案分别对应定位、建图、导航。你会看到这三件事是如何互相纠缠、又如何在工程上被拆开的；也会第一次听到“前端/后端”这两个词，并知道它们在三种不同语境下分别指什么。读完本章，你应该能在脑子里画出整本书的结构，知道后面每一章大概在解决哪一块拼图。}
+
+\section{一个场景：机器人第一次进场地}\label{sec:01-scene}
+
+想象一台刚组装好的哨兵机器人，被放在 RoboMaster 场地的一角。它有一台激光雷达、一个 IMU、四个麦轮，还有一块算力有限的板子。比赛开始前，它需要回答三个问题：
+
+\begin{enumerate}
+  \item \textbf{我在哪？} 具体到“我在场地的 $(x,y)$ 坐标、朝向多少度”。这叫\textbf{定位}（localization）。
+  \item \textbf{周围长什么样？} 哪里有墙、哪里是通道、哪里可以走。这叫\textbf{建图}（mapping）。
+  \item \textbf{我该怎么过去？} 从当前位置到目标点，走哪条路、怎么避开动态的对手。这叫\textbf{导航}（navigation）。
+\end{enumerate}
+
+三个问题看起来可以按顺序解决，实际却是一个循环：没有地图，定位只能靠猜；没有定位，建出来的图是歪的；没有可靠的定位和地图，导航就是蒙眼狂奔。本章先把它们的定义和关系理清楚。
+
+\section{三个问题的精确定义}\label{sec:01-def}
+
+\subsection{定位}
+
+\begin{definition}[定位]
+定位是估计机器人在某个参考坐标系中的\textbf{位姿}（pose）的过程。位姿包含位置和姿态：
+\begin{equation}
+\bm{x}=\left(x,\ y,\ z,\ \text{roll},\ \text{pitch},\ \text{yaw}\right),
+\end{equation}
+在平面移动机器人上通常简化为 $(x,y,\theta)$ 三个量。
+\end{definition}
+
+“位姿”这个词在后面会反复出现，务必先建立直觉：位置是“你在哪”，姿态是“你朝哪”。两者缺一不可——只知道位置不知道朝向，机器人不知道往哪走；只知道朝向不知道位置，它不知道自己在场地的哪个角落。
+
+按参考坐标系的不同，定位又分为两类：
+\begin{itemize}
+  \item \textbf{相对定位}（relative localization）：相对于起点估计位姿，误差会累积。里程计就是典型。
+  \item \textbf{绝对定位}（absolute localization）：直接在地图坐标系中估计位姿，误差有界。AMCL、先验地图配准属于这一类。
+\end{itemize}
+
+\subsection{建图}
+
+\begin{definition}[建图]
+建图是把传感器观测转换成环境表示的过程。环境表示可以是二维占据栅格、三维点云、八叉树、TSDF、语义地图等，取决于用途。
+\end{definition}
+
+地图不是“越精细越好”。给导航用的地图要能快速查询“这一点能不能走”；给定位用的地图要能快速做点云配准；给人看的地图要清晰。同一个环境，三种用途往往需要三种不同的地图表示。第 14 章会详细讨论。
+
+\subsection{导航}
+
+\begin{definition}[导航]
+导航是在已知（或未知）环境中，从当前位置安全、高效地到达目标位置的过程。一个完整的导航系统通常包含：定位、地图、全局规划、局部规划、运动控制。
+\end{definition}
+
+导航不是一个算法，而是一套系统。它把定位和建图的输出当作输入，把速度和转向指令当作输出。第 18 章会给出完整的系统架构。
+
+\subsection{三者的关系}
+
+三者的关系可以用图~\ref{fig:01-triangle} 概括：定位和建图互相依赖（定位需要地图，建图需要位姿），导航同时依赖两者。
+
+\begin{figure}[htbp]
+  \centering
+  \begin{tikzpicture}[node distance=2.6cm]
+    \node[block2, minimum width=28mm] (loc) {定位\\我在哪};
+    \node[block, right=of loc, minimum width=28mm] (map) {建图\\环境什么样};
+    \node[block2, below=1.9cm of loc, xshift=1.3cm, minimum width=28mm] (nav) {导航\\怎么过去};
+    \draw[darrow] (loc) -- node[above, label]{互相依赖} (map);
+    \draw[arrow] (loc) -- node[left, label]{位姿} (nav);
+    \draw[arrow] (map) -- node[right, label]{地图} (nav);
+  \end{tikzpicture}
+  \caption{定位、建图、导航三者的关系。定位与建图互为前提，导航同时依赖两者。}
+  \label{fig:01-triangle}
+\end{figure}
+
+\section{定位问题的分类}\label{sec:01-taxonomy}
+
+初学者最容易混淆的，是“定位”这个词在不同上下文里指的东西完全不同。表~\ref{tab:01-loc-types} 给出四种常见的分类维度。
+
+\begin{table}[htbp]
+  \centering
+  \caption{定位问题的四种分类维度}\label{tab:01-loc-types}
+  \small
+  \begin{tabular}{p{2.6cm}p{4.4cm}p{5.6cm}}
+    \toprule
+    维度 & 两类 & 典型方法 \\
+    \midrule
+    参考系 & 相对定位 / 绝对定位 & 里程计 / AMCL、先验地图配准 \\
+    初始信息 & 局部定位 / 全局定位 & 已知初始位姿 / 绑架问题、重定位 \\
+    时间特性 & 单帧定位 / 递推滤波 & 单帧配准 / EKF、粒子滤波 \\
+    先验地图 & 有地图 / 无地图 & 地图匹配 / SLAM、UWB 辅助 \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+这四组概念经常组合出现。比如“哨兵开机后不知道自己在场地哪里，靠着先验地图找回位置”，就是“绝对定位 + 全局定位 + 有地图”；而“比赛过程中用 FAST-LIO 连续估计位姿”，是“相对定位 + 局部定位 + 无地图”。
+
+理解这张表的意义在于：\textbf{没有“最好的定位算法”，只有“匹配场景的定位方案”}。这也是为什么本书会花大量篇幅讲每种方法的适用条件和失效场景。
+
+\section{SLAM：先有鸡还是先有蛋}\label{sec:01-slam}
+
+把定位和建图放在一起，就出现了著名的“鸡生蛋”问题：定位需要地图，建图需要定位，那到底先有谁？
+
+这个问题的正式名字叫\textbf{同时定位与建图}（Simultaneous Localization and Mapping，SLAM）。它的解决思路不是“先有鸡还是先有蛋”，而是\textbf{同时估计两者}：把位姿序列和地图都当作未知量，用所有观测一起做最大后验估计。
+
+用数学语言写出来，就是
+\begin{equation}
+\left(\bm{X}^{*},\bm{M}^{*}\right)=\argmax_{\bm{X},\bm{M}}\ p\left(\bm{X},\bm{M}\mid\bm{Z}\right),
+\label{eq:01-map}
+\end{equation}
+其中 $\bm{X}$ 是位姿序列，$\bm{M}$ 是地图，$\bm{Z}$ 是所有观测。对式~\eqref{eq:01-map} 取负对数，就变成一个大规模最小二乘问题——这正是第 13 章“后端”要做的事。
+
+直观上，SLAM 的逻辑是：
+\begin{enumerate}
+  \item 先用短时间内的观测估计相邻两帧之间的相对运动（这一步不需要地图）；
+  \item 把相对运动串起来，得到一条“局部一致”的轨迹；
+  \item 随着轨迹变长，误差累积，轨迹开始漂；
+  \item 当机器人回到曾经去过的地方（回环），用这个信息把整条轨迹“拉回来”；
+  \item 轨迹修正后，地图也跟着修正。
+\end{enumerate}
+
+第 1--2 步是前端，第 4--5 步是后端。这就是下一节要讲的划分。
+
+\section{“前端/后端”到底指什么}\label{sec:01-febe}
+
+“前端”和“后端”是本书出现频率最高的两个词，也是最容易被误用的两个词。它们在不同语境下含义不同，先在这里建立直觉，细节分别在第 11 章（SLAM）、第 18 章（导航）展开。
+
+\begin{keybox}{一句话版本}
+\textbf{前端负责“局部、快速、增量”的估计，后端负责“全局、较慢、一致”的优化。}
+\end{keybox}
+
+
+三种常见语境：
+
+\begin{enumerate}
+  \item \textbf{SLAM 语境}（最常见）：前端 = 数据关联 + 帧间位姿估计 + 局部地图；后端 = 回环检测 + 全局优化 + 地图修正。这是第 11--13 章的内容。
+  \item \textbf{定位系统语境}：前端 = 里程计（LIO/VIO），后端 = 先验地图配准 + 因子图 + 状态机。这是第 23 章 Z-Localization 的划分：LIO 自己维护 odom 系，后端负责 $\text{map}\to\text{odom}$ 的变换。
+  \item \textbf{导航系统语境}：前端 = 定位与建图（感知），后端 = 规划与控制（决策）。这种说法在工程口语里很常见，但并不严谨——它把“导航”当成了一个更大的系统。
+\end{enumerate}
+
+第 11 章会用一张表把三种语境并列对比。你现在只需要记住：\textbf{看到“前端/后端”时，先问一句“相对于什么系统而言”}。
+
+\section{全书地图与阅读路线}\label{sec:01-roadmap}
+
+本书共五篇三十章，结构如图~\ref{fig:01-roadmap} 所示。
+
+\begin{figure}[htbp]
+  \centering
+  \begin{tikzpicture}[node distance=0.45cm, every node/.style={font=\small}]
+    \node[block2, minimum width=13cm, minimum height=9mm] (p1) {第 I 篇\quad 基础篇：坐标系、概率、优化、传感器（第 1--3 章）};
+    \node[block, below=of p1, minimum width=13cm, minimum height=9mm] (p2) {第 II 篇\quad 里程计篇：轮式、IMU、激光、视觉、融合、全局定位（第 4--10 章）};
+    \node[block2, below=of p2, minimum width=13cm, minimum height=9mm] (p3) {第 III 篇\quad SLAM 篇：前端、后端、建图、Cartographer、LIO（第 11--17 章）};
+    \node[block, below=of p3, minimum width=13cm, minimum height=9mm] (p4) {第 IV 篇\quad 导航篇：Nav2、全局/局部规划、CMU 3D 导航、Z-Localization（第 18--24 章）};
+    \node[block2, below=of p4, minimum width=13cm, minimum height=9mm] (p5) {第 V 篇\quad 工程篇：ROS 2、标定、调参、评测、实战（第 25--30 章）};
+    \draw[arrow] (p1) -- (p2);
+    \draw[arrow] (p2) -- (p3);
+    \draw[arrow] (p3) -- (p4);
+    \draw[arrow] (p4) -- (p5);
+    \node[right=0.15cm of p1, font=\scriptsize, text=black!55] {必读};
+    \node[right=0.15cm of p2, font=\scriptsize, text=black!55] {核心};
+    \node[right=0.15cm of p3, font=\scriptsize, text=black!55] {核心};
+    \node[right=0.15cm of p4, font=\scriptsize, text=black!55] {进阶};
+    \node[right=0.15cm of p5, font=\scriptsize, text=black!55] {落地};
+  \end{tikzpicture}
+  \caption{全书结构。建议按顺序阅读第一篇，之后可按兴趣跳读。}
+  \label{fig:01-roadmap}
+\end{figure}
+
+如果时间有限，有三种读法：
+
+\begin{itemize}
+  \item \textbf{速成路线}（一周）：第 1、2、4、6、11、16、17 章。理解“里程计怎么算、前端后端各干什么、FAST-LIO 怎么工作”。
+  \item \textbf{建图路线}（两周）：第 1--3、7、11--15 章。重点是 Cartographer 和地图表示。
+  \item \textbf{导航路线}（两周）：第 1、10、11、18--22 章。重点是 Nav2 与 CMU 3D 导航栈。
+\end{itemize}
+
+\section{给新手的三个建议}\label{sec:01-advice}
+
+\begin{enumerate}
+  \item \textbf{先在脑子里跑通数据流，再抠公式。} 每读一个算法，先问：输入是什么？输出是什么？中间经过几个模块？每个模块的频率是多少？把这张图画出来，比记公式有用得多。
+  \item \textbf{公式要能“算一个数”。} 看到一个公式，尝试代入具体数字算一遍（比如 $\Delta t=10$ ms、速度 $1$ m/s，走 1 秒误差多少）。能算出数量级，才算真懂。
+  \item \textbf{不要跳过标定和坐标变换。} 新手 80\% 的“算法不工作”，最后都发现是外参错了、时间戳错了、TF 树断了。第 26 章值得反复看。
+\end{enumerate}
+
+\begin{summary}
+
+\begin{enumerate}
+  \item 定位估计位姿，建图表示环境，导航规划并执行运动；三者互相依赖，构成一个闭环。
+  \item 定位可按参考系、初始信息、时间特性、先验地图四个维度分类；没有万能的算法，只有匹配场景的方案。
+  \item SLAM 通过“同时估计位姿与地图”解决鸡生蛋问题，本质是一个大规模最大后验估计。
+  \item 前端负责局部、快速、增量的估计；后端负责全局、较慢、一致的优化。看到这两个词时先明确“相对于哪个系统”。
+  \item 全书五篇三十章：基础 → 里程计 → SLAM → 导航 → 工程。
+\end{enumerate}
+
+\end{summary}
+
+\begin{problemset}
+
+  \item 用一句话分别定义定位、建图、导航，并各举一个 RoboMaster 场景中的例子。
+  \item 为什么“相对定位”的误差会累积，而“绝对定位”的误差有界？请从参考系的角度解释。
+  \item 如果机器人开机时不知道自己在场地的哪个角落，它属于哪一种定位问题？可以用哪些方法解决？
+  \item 用自己的话解释“前端/后端”，并说明在 SLAM 语境和导航语境下有什么不同。
+  \item 画出你心目中一台哨兵机器人的数据流图（传感器 → 算法模块 → 执行器），标出每一路数据的频率量级。
+\end{problemset}
+
+\begin{reading}
+
+\begin{itemize}
+  \item \cite{thrun2005probabilistic}：第 1 章给出了定位、建图、SLAM 的经典定义与分类，是本章最好的补充。
+  \item \cite{barfoot2017state}：第 1 章从状态估计角度统一了定位与 SLAM。
+  \item \cite{macenski2022ros2}：了解 ROS 2 的工程背景，为第 25 章做准备。
+  \item 本书第 11 章：前端/后端的正式定义与数据流。
+\end{itemize}
+
+
+\end{reading}
+
+

@@ -1,0 +1,347 @@
+\chapter{3D 导航与 CMU 自主探索栈}\label{ch:21-3d-nav}
+
+\usetikzlibrary{arrows.meta,positioning,calc,fit,patterns,decorations.pathreplacing}
+
+\chapterintro{前两章的规划器都假设世界是一张 2D 平面栅格：障碍是“墙”，可走区域是“空地”。但 RoboMaster 之外的很多场景——室外坡道、台阶、多层建筑、越野地形——机器人会上下起伏，2D 栅格会把“坡”压成“平地”，把“台阶”压成“墙”，规划出的路径要么上不去，要么明明能过却被判死。本章讲 3D 导航，并以用户点名的 \textbf{CMU（卡内基梅隆大学 Ji Zhang 组，CMU AirLab）自主探索开发环境}为主线：讲清 terrain\_analysis 怎么做 2.5D 地形可通行性分析、local\_planner 怎么在地形上避障、FAR Planner 怎么用可视图在未知环境里“试探着规划”、TARE 怎么做分层自主探索。学完本章，你应该能画出这套栈的模块数据流，能推导坡度/粗糙度/台阶高度的公式，并知道如何把 FAST-LIO2 的点云喂给它。}
+
+\section{为什么 2D 导航不够}\label{sec:21-why3d}
+
+2D 导航的本质是\textbf{降维假设}：把机器人当成一个在平面上运动的圆盘，把世界投影到 $z=0$ 的平面上。这个假设在平整室内非常好用，代价是丢掉三样信息：
+
+\begin{enumerate}
+  \item \textbf{高度}：坡道、台阶、门槛、减速带都有高度变化。2D 栅格一旦把“坡”投影成“可走”，机器人可能因坡度太陡而打滑；把“台阶”投影成“障碍”，则明明能上的小台阶被当成墙。
+  \item \textbf{垂直净空}：桌子底下、桥洞、悬空管道下方，2D 地图只看到“有障碍”，3D 才知道“能从下面过”。
+  \item \textbf{地形质量}：同样平坦的格子，草地、碎石、沙地的可通过性完全不同；2D 只区分“占据/空闲”。
+\end{enumerate}
+
+解决思路有两条：\textbf{真 3D}（体素地图、ESDF、无人机式轨迹优化）与 \textbf{2.5D}（把地图表示成“每个格子一个高度”的高程图）。真 3D 表达力强但内存与计算量大（$100\ \mathrm{m}\times100\ \mathrm{m}\times10\ \mathrm{m}$、$0.1\ \mathrm{m}$ 体素就是 $10^8$ 个体素）；2.5D 假设“每个 $(x,y)$ 只有一个高度”，内存是 2D 级别，又能表达坡度和台阶，是地面机器人最实用的折中。CMU 这套栈走的就是 2.5D 路线。
+
+\section{CMU 自主探索栈的总体架构}\label{sec:21-arch}
+
+CMU AirLab 开源了一套“点云进、速度出”的完整导航与探索系统，名为 Autonomous Exploration Development Environment（下称 CMU 栈），配套论文是 ICRA 2022 的 \cite{cao2022tare}，其中 FAR Planner 的工作另见 \cite{yang2022farplanner}。它的设计哲学是：\textbf{把“地形理解”与“规划”解耦}——先由地形分析把 3D 点云压成可通行性地图，再由规划器在可通行性地图上做局部与全局规划。
+
+\begin{figure}[htbp]
+  \centering
+  \begin{tikzpicture}[font=\small,
+      box/.style={rectangle, rounded corners=2pt, draw=structurecolor, thick,
+                  fill=structurecolor!8, minimum height=7mm, minimum width=30mm, align=center}]
+    \node[box] (lio) at (0,0) {LIO\\{\footnotesize FAST-LIO2 / LIO-SAM}};
+    \node[box] (ta) at (0,-1.6) {terrain\_analysis\\{\footnotesize 2.5D 地形}};
+    \node[box] (lp) at (0,-3.2) {local\_planner\\{\footnotesize 局部避障}};
+    \node[box] (cmd) at (0,-4.8) {底盘\\{\footnotesize /cmd\_vel}};
+    \node[box] (far) at (5.7,-1.6) {FAR Planner\\{\footnotesize 可视图全局规划}};
+    \node[box] (tare) at (5.7,-3.2) {TARE\\{\footnotesize 分层自主探索}};
+    \draw[arrow] (lio) -- node[label, right]{\scriptsize /registered\_scan} (ta);
+    \draw[arrow] (ta) -- node[label, right]{\scriptsize /terrain\_map} (lp);
+    \draw[arrow] (lp) -- node[label, right]{\scriptsize /cmd\_vel} (cmd);
+    \draw[arrow] (ta) -- node[label, above]{\scriptsize /terrain\_map\_ext} (far);
+    \draw[arrow] (far) -- node[label, right]{\scriptsize 探索目标} (tare);
+    \draw[arrow, dashed] (far.west) -- node[label, below, sloped]{\scriptsize /way\_point} (lp.east);
+  \end{tikzpicture}
+  \caption{CMU 自主探索栈的模块数据流（简化）。LIO 输出配准后的点云，地形分析把它变成 2.5D 可通行性地图；局部规划器在局部地形图上避障并输出速度；FAR Planner 在全局可视图上选下一个目标点（\texttt{/way\_point}）；TARE 负责“没有目标时自己找目标”的探索任务。\texttt{terrain\_analysis\_ext}、\texttt{path\_follower} 与 \texttt{visualization\_tools} 是辅助模块，图中省略。}
+  \label{fig:21-stack}
+\end{figure}
+
+各模块职责如下（频率为典型量级，具体以仓库配置为准）：
+
+\begin{itemize}
+  \item \texttt{terrain\_analysis}：订阅 LIO 输出的配准点云（\texttt{/registered\_scan}），维护一张以机器人为中心的 2.5D 高程栅格，计算每格的坡度、粗糙度、台阶高度与到障碍的距离，发布 \texttt{/terrain\_map}（每点携带“到最近障碍的距离”，供局部规划做净空判断）。
+  \item \texttt{terrain\_analysis\_ext}：在更大范围内做“扩展地形清理”，输出 \texttt{/terrain\_map\_ext}，供 FAR Planner 构建全局可视图；范围大、分辨率可稍粗。
+  \item \texttt{local\_planner}：在 \texttt{/terrain\_map} 上做局部路径规划（本质是带净空约束的图搜索 + 速度平滑），跟踪 \texttt{/way\_point} 并输出 \texttt{/cmd\_vel}，同时把碰撞检测做成“机器人尺寸 + 离地间隙”的模板。
+  \item \texttt{far\_planner}：维护增量可视图（visibility graph），在已知/未知混合环境里规划到目标（或探索目标）的全局路线，输出下一个 waypoint；核心思想是 \emph{attemptable}（可尝试）：允许穿未知区域，走不通再重规划。
+  \item \texttt{tare\_planner}：自主探索（exploration）规划器，没有人类给的目标，自己决定“去哪里看”，采用局部/全局两层结构：局部层在当前区域找边界（frontier），全局层决定远距离的探索顺序。
+  \item \texttt{path\_follower}：跟踪一条给定路线（如示教轨迹），不负责避障。
+  \item \texttt{visualization\_tools}：RViz 可视化与调试工具。
+\end{itemize}
+
+\begin{table}[htbp]
+  \centering
+  \caption{CMU 栈主要话题（名字以仓库为准，这里给出最常见的）}
+  \label{tab:21-topics}
+  \small
+  \begin{tabular}{lll}
+    \toprule
+    话题 & 方向 & 内容 \\
+    \midrule
+    \texttt{/state\_estimation} & 输入 & LIO 位姿（odom/map） \\
+    \texttt{/registered\_scan} & 输入 & 世界系下的配准点云 \\
+    \texttt{/terrain\_map} & 中间 & 局部 2.5D 地形图 \\
+    \texttt{/terrain\_map\_ext} & 中间 & 扩展地形图（给 FAR） \\
+    \texttt{/way\_point} & 中间 & 局部规划的目标点 \\
+    \texttt{/cmd\_vel} & 输出 & 底盘速度指令 \\
+    \texttt{/exploration\_paths} & 可视化 & TARE 的探索路径 \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+\section{地形分析：把点云压成 2.5D 高程图}\label{sec:21-terrain}
+
+\begin{definition}[地形可通行性分析]
+地形可通行性分析（terrain traversability analysis）是给每个空间位置打一个“机器人能否安全通过”的分数或标签的过程。常用四个几何量：\textbf{坡度}（slope，局部平面与水平面的夹角）、\textbf{粗糙度}（roughness，局部高度起伏的统计量）、\textbf{台阶高度}（step height，相邻格之间允许的高度突变）、\textbf{净空}（clearance，到最近障碍物的距离）。四者都满足阈值时判为可通行。
+\end{definition}
+
+\subsection{2.5D 栅格的组织}
+
+地形图是一个栅格 $\{(i,j)\}$，分辨率 $r$ 通常取 $0.1$--$0.2\ \mathrm{m}$，每格记录三样东西：高度 $h_{ij}$（格内点云 $z$ 的中位数或最低值）、粗糙度 $\sigma_{ij}$（格内 $z$ 的标准差）、以及净空 $d_{ij}$（到最近“障碍格”的平面距离，用距离变换一次算出）。点云到来时，把每个点按 $(x,y)$ 投到格子，更新该格的统计量；机器人移动时用滑动窗口平移整张图（只重算新进入窗口的格子）。
+
+\subsection{坡度：从高度差到角度}
+
+对 4 邻接的两个格子，水平距离就是分辨率 $r$；高度差 $\Delta z=h_{i'j'}-h_{ij}$。它们连线与水平面的夹角就是坡度：
+\begin{equation}
+  \theta_{\mathrm{slope}}=\arctan\!\left(\frac{\abs{\Delta z}}{r}\right).
+  \label{eq:21-slope}
+\end{equation}
+对 8 邻接的对角邻居，水平距离是 $\sqrt2\,r$，分母换成 $\sqrt{\Delta x^2+\Delta y^2}$。例：$r=0.1\ \mathrm{m}$，相邻格高差 $0.05\ \mathrm{m}$，则 $\theta=\arctan(0.5)=26.6^\circ$；若高差 $0.1\ \mathrm{m}$，则 $\theta=45^\circ$。工程上坡道阈值常取 $25^\circ$--$30^\circ$（约 $0.44$--$0.52\ \mathrm{rad}$），因为再陡四轮底盘就开始打滑。
+
+若用格内全部点拟合平面，设平面法向为 $\bm{n}$，坡度还可以写成
+\begin{equation}
+  \theta_{\mathrm{slope}}=\arccos\!\left(\frac{\bm{n}^{\top}\bm{e}_z}{\norm{\bm{n}}}\right),
+  \label{eq:21-slope-normal}
+\end{equation}
+其中 $\bm{e}_z=(0,0,1)^{\top}$。法向用 PCA 求：对格内点 $\{\bm{p}_i\}$ 先算均值 $\bar{\bm{p}}$，再算协方差
+\begin{equation}
+  \bm{C}=\frac{1}{N}\sum_{i=1}^{N}(\bm{p}_i-\bar{\bm{p}})(\bm{p}_i-\bar{\bm{p}})^{\top},
+  \label{eq:21-cov}
+\end{equation}
+取最小特征值对应的特征向量即法向（这是第 7 章扫描匹配里“平面拟合”的同一套工具）。只有三个点时可以直接用叉积，例：$\bm{p}_1=(0,0,0)$、$\bm{p}_2=(1,0,0.1)$、$\bm{p}_3=(0,1,0.1)$，则
+\begin{equation}
+  \bm{n}=(\bm{p}_2-\bm{p}_1)\times(\bm{p}_3-\bm{p}_1)=(1,0,0.1)\times(0,1,0.1)=(-0.1,-0.1,1),
+\end{equation}
+归一化后 $\hat{\bm{n}}=(-0.0995,-0.0995,0.995)$，$\theta=\arccos(0.995)=5.7^\circ$，说明这三个点所在的平面几乎是平的。
+
+\subsection{粗糙度与台阶高度}
+
+\textbf{粗糙度}用邻域高度的标准差衡量。设某格及其 $3\times3$ 邻域共 9 个高度值，均值 $\bar h$，则
+\begin{equation}
+  \sigma=\sqrt{\frac{1}{N}\sum_{i=1}^{N}(h_i-\bar h)^2}.
+  \label{eq:21-rough}
+\end{equation}
+例：5 个高度 $0.02,0.01,0.03,0.00,0.04$（单位 m），均值 $0.02$，偏差为 $0,-0.01,0.01,-0.02,0.02$，平方和 $=10^{-3}$，方差 $=10^{-3}/5=2\times10^{-4}$，标准差 $\sigma=0.0141\ \mathrm{m}$，即起伏约 1.4 cm——很平。若 $\sigma>0.03\ \mathrm{m}$，通常是碎石或草地，应降低速度或判为不可通行。
+
+\textbf{台阶高度}定义为邻域内最大高度突变：
+\begin{equation}
+  h_{\mathrm{step}}=\max_{\substack{(i',j')\in\mathcal{N}(i,j)}}\abs{h_{i'j'}-h_{ij}}.
+  \label{eq:21-step}
+\end{equation}
+路缘石 $0.15\ \mathrm{m}$、门槛 $0.2\ \mathrm{m}$ 是典型值；轮式底盘能过的台阶通常不超过 $0.1$--$0.2\ \mathrm{m}$，超过就必须绕行。注意台阶与坡度的区别：$0.15\ \mathrm{m}$ 的台阶在 $0.1\ \mathrm{m}$ 分辨率下坡度是 $\arctan(1.5)=56^\circ$，会被坡度阈值直接判死；但在 $0.2\ \mathrm{m}$ 分辨率下可能被平均成 $37^\circ$，于是需要台阶项单独把关。
+
+\subsection{可通行性判定与伪代码}
+
+\begin{pseudo}{2.5D 地形可通行性判定（单帧）}
+  \item 对每个新点，按 $(x,y)$ 投到格子 $(i,j)$，更新 $h_{ij}$ 与 $\sigma_{ij}$
+  \item 对每个格子，用式~\eqref{eq:21-slope} 或式~\eqref{eq:21-slope-normal} 算坡度 $\theta_{ij}$
+  \item 用式~\eqref{eq:21-step} 算台阶高度 $h_{\mathrm{step}}$，用式~\eqref{eq:21-rough} 算粗糙度 $\sigma$
+  \item 用距离变换算净空 $d_{ij}$（到最近障碍格的距离）
+  \item 若 $\theta_{ij}>\theta_{\max}$ 或 $h_{\mathrm{step}}>h_{\max}$ 或 $\sigma>\sigma_{\max}$ 或 $d_{ij}<r_{\mathrm{robot}}$，标记为不可通行
+  \item 发布 \texttt{/terrain\_map}：可通行点附带净空值 $d_{ij}$，供局部规划使用
+\end{pseudo}
+
+关键参数的量级（以仓库默认配置为参考，不同平台要重调）：分辨率 $r\approx0.1$--$0.2\ \mathrm{m}$；坡度阈值 $\theta_{\max}\approx25^\circ$--$30^\circ$；台阶阈值 $h_{\max}\approx0.2$--$0.3\ \mathrm{m}$（对应代码里的“相对高度阈值”类参数，如 \texttt{maxRelZ} 在 $0.2$--$0.3$ 量级）；粗糙度阈值 $\sigma_{\max}\approx0.03$--$0.05\ \mathrm{m}$；机器人半径 $r_{\mathrm{robot}}$ 按车体设。车越高、轮越大，这些阈值越宽松。
+
+\subsection{2.5D 与真 3D 的折中}
+
+2.5D 的优点是内存小、查询快、与 2D 规划器兼容（把“可通行性”当地图值，就能复用 A*/Dijkstra）。它的局限也很清楚：
+
+\begin{itemize}
+  \item \textbf{一个 $(x,y)$ 只能存一个高度}：桥洞、多层建筑、桌子下方会打架；工程上靠“分层高程图”或“多地图分层”补救。
+  \item \textbf{悬空障碍}：树枝、管道只要在点云里，就会把下面的格子标成障碍；需要按高度带过滤（只保留 $[z_{\min},z_{\max}]$ 的点）。
+  \item \textbf{动态物体}：行人、其他机器人会被压成“高地”，导致地形图抖动；需要时间衰减与一致性滤波。
+\end{itemize}
+
+\begin{figure}[htbp]
+  \centering
+  \begin{tikzpicture}[font=\footnotesize, scale=1.1]
+    % side view
+    \begin{scope}
+      \draw[step=0.5cm, black!15] (0,0) grid (4.5,1.5);
+      \draw[thick, black!70] (0,0.1) -- (1.0,0.1) -- (1.0,0.4) -- (2.0,0.4)
+        -- (3.0,1.0) -- (4.5,1.0);
+      \draw[structurecolor!70, dashed] (1.0,0.1) -- (1.0,0.4);
+      \node[structurecolor!80, label] at (0.45,0.8) {台阶 $h_{\mathrm{step}}$};
+      \draw[structurecolor!80, thin, ->] (0.75,0.68) -- (0.97,0.32);
+      \node[green!45!black, label] at (3.55,1.42) {坡度 $\theta$};
+      \draw[green!45!black, thin, ->] (3.4,1.34) -- (2.6,0.72);
+      \draw[<->, black!50, thin] (2.0,1.28) -- (2.5,1.28);
+      \node[black!60, label, above] at (2.25,1.28) {$r$};
+      \node[label] at (2.25,-0.32) {（a）侧视：台阶、坡度与分辨率};
+    \end{scope}
+    % top view
+    \begin{scope}[xshift=6.1cm]
+      \fill[green!45!black!22] (0,0) rectangle (3.0,2.0);
+      \fill[red!60!black!28] (2.0,1.0) rectangle (3.0,2.0);
+      \fill[black!55] (0.5,0.5) rectangle (1.0,1.0);
+      \draw[step=0.5cm, black!15] (0,0) grid (3.0,2.0);
+      \node[label] at (1.5,-0.32) {（b）俯视：可通行性与障碍};
+      \fill[green!45!black!22] (0,-0.95) rectangle (0.3,-0.75);
+      \node[label, right] at (0.3,-0.85) {可通行};
+      \fill[red!60!black!28] (1.45,-0.95) rectangle (1.75,-0.75);
+      \node[label, right] at (1.75,-0.85) {不可通行};
+      \fill[black!55] (2.75,-0.95) rectangle (3.05,-0.75);
+      \node[label, right] at (3.05,-0.85) {障碍};
+    \end{scope}
+  \end{tikzpicture}
+  \caption{2.5D 地形分析的两个视角。左（a）：侧视，格子分辨率 $r$、台阶高度 $h_{\mathrm{step}}$、坡度 $\theta$ 的定义；右（b）：俯视，每个格子按坡度/台阶/粗糙度/净空判为可通行（绿）、不可通行（红）或障碍（黑）。}
+  \label{fig:21-terrain}
+\end{figure}
+
+\section{局部规划与 FAR Planner}\label{sec:21-local-far}
+
+\subsection{local\_planner：在地形图上做带净空的局部规划}
+
+CMU 栈的局部规划器与第~\ref{ch:20-local-planning}~章的 DWA/TEB 不同：它不是在速度空间采样，而是\textbf{在 2.5D 地形图上做带净空约束的图搜索 + 轨迹平滑}。核心步骤是：
+
+\begin{enumerate}
+  \item 以机器人为中心取局部窗口（如 $10\ \mathrm{m}\times10\ \mathrm{m}$），把窗口内的可通行格建成图；
+  \item 给每个可通行格赋代价：离障碍越近代价越高（用 \texttt{/terrain\_map} 的净空值），坡度越大代价越高；
+  \item 从当前位置向 \texttt{/way\_point} 做图搜索（Dijkstra/A*），得到一条初始路径；
+  \item 沿路径做“碰撞模板检查”：把机器人的矩形/圆形足迹沿路径扫一遍，任何位置净空不足就剔除或绕行；
+  \item 对路径做速度规划与平滑（限制线速度、角速度、加速度），输出 \texttt{/cmd\_vel}。
+\end{enumerate}
+
+与 2D 局部规划相比，它多了两件事：\textbf{地形代价}（坡度陡的格子即使可通行也贵）与\textbf{三维足迹}（车体高度、离地间隙决定“能不能从悬空物下方过”）。这也是为什么它需要 \texttt{/terrain\_map} 携带净空值，而不是只用 0/1 占据。
+
+\subsection{FAR Planner：可视图 + attemptable}
+
+\begin{definition}[可视图与 FAR Planner]
+\textbf{可视图}（visibility graph）是以“关键点”为节点、以“两点之间无碰撞的直线段”为边的图，图上最短路就是多边形障碍环境中的几何最短路。\textbf{FAR Planner}（Fast, Attemptable Route Planner）\cite{yang2022farplanner} 是 CMU 提出的 3D 增量可视图规划器：节点是自由空间中的采样点，边是可通行的直线段，未知区域允许规划但标记为“可尝试”（attemptable），一旦观测到不通就删边重规划。
+\end{definition}
+
+它在三件事上与经典 A* 不同：
+
+\begin{enumerate}
+  \item \textbf{表示}：A* 在稠密栅格上扩展，FAR 在稀疏可视图上搜索。可视图节点数通常只有几百到几千，而 $100\ \mathrm{m}\times100\ \mathrm{m}\times0.1\ \mathrm{m}$ 的栅格有 $10^6$ 量级格子，所以 FAR 在大范围场景里快得多。
+  \item \textbf{增量维护}：机器人边走边看，FAR 只更新机器人附近的可视图——新观测到的自由区域加点加边，新观测到的障碍删点删边。更新是局部的，不需要每次重建整张图。
+  \item \textbf{attemptable}：这是 FAR 的核心思想。经典导航只走“已确认自由”的区域；但在未知环境里，如果坚持“确认后才走”，机器人只能原地等。FAR 把穿过未知区域的边标成“可尝试”，先规划、先走，走到新观测证明此路不通时，把这条边删掉、重新规划。这样既不会鲁莽撞墙（局部规划仍在实时避障），又不会因为未知而停滞。
+\end{enumerate}
+
+\begin{pseudo}{FAR Planner 的增量更新与规划}
+  \item 收到新地形图 $\rightarrow$ 找出机器人附近新变为自由/障碍的格子
+  \item 对自由格：若离已有节点足够远，采样为新节点，插入 KD 树
+  \item 对每个新节点：与附近节点连线，做可见性检查；无碰撞则加边，穿过未知区则标为 attemptable
+  \item 对障碍格：删除落在障碍里的节点，删除与之相交的边
+  \item 在图上跑 Dijkstra（边权 = 长度 + 未知区域惩罚）
+  \item 输出路径上下一个 waypoint 给 local\_planner；若 waypoint 不可达（走进死路），回到第 1 步重规划
+\end{pseudo}
+
+可见性检查（visibility check）是 FAR 里最耗时的操作：对候选边 $\overline{AB}$，沿线段以地形分辨率采样，检查每个采样点所在格的净空是否大于机器人半径。设边长为 $L$、采样步长 $\delta$，需要检查 $\lceil L/\delta\rceil$ 个点。优化手段是先用“包围盒 + 粗粒度占据检查”快速排除明显相交的边，只对可能可见的边做逐点检查。
+
+\begin{figure}[htbp]
+  \centering
+  \begin{tikzpicture}[font=\footnotesize, scale=1.0]
+    \fill[black!10] (3.0,0.2) rectangle (4.0,1.5);
+    \node[black!55, label] at (3.5,0.85) {障碍};
+    \fill[black!5] (5.6,0.1) rectangle (7.9,2.8);
+    \node[black!45, label] at (6.7,0.55) {未知区域};
+    \coordinate (s) at (0,0.3);
+    \coordinate (a) at (1.3,0.6);
+    \coordinate (b) at (2.3,1.6);
+    \coordinate (c) at (4.3,2.4);
+    \coordinate (d) at (5.0,0.95);
+    \coordinate (t) at (7.2,2.35);
+    \draw[structurecolor!80, thick] (s) -- (a) -- (b) -- (c);
+    \draw[structurecolor!80, thick] (a) -- (d);
+    \draw[red!60!black, thick, dashed] (a) -- (t);
+    \draw[green!45!black, thick, dashed] (c) -- (t);
+    \foreach \p in {s,a,b,c,d,t}
+      \fill[structurecolor] (\p) circle (0.06);
+    \node[red!60!black, label] at (5.3,1.33) {被障碍挡住};
+    \node[green!45!black, label] at (5.0,3.05) {attemptable（穿未知区）};
+    \node[structurecolor, label] at (2.2,2.3) {已确认自由边};
+    \fill[green!45!black] (s) circle (0.08);
+    \fill[red!70!black] (t) circle (0.08);
+    \node[label, below left] at (s) {起点};
+    \node[label, above] at (t) {目标};
+  \end{tikzpicture}
+  \caption{FAR Planner 的可视图。实线是已确认的可通行边，绿色虚线是穿过未知区域的 attemptable 边（先试着走，走不通再删），红色虚线是被障碍挡住、不允许的边。图是稀疏的，节点数远少于栅格数，因此能在大范围未知环境中保持实时。}
+  \label{fig:21-far}
+\end{figure}
+
+\subsection{TARE：从“导航”到“探索”}
+
+\begin{definition}[自主探索与 TARE]
+\textbf{自主探索}（autonomous exploration）是指没有人工指定目标时，机器人自主选择“下一步去看哪里”，以最快速度把未知区域变成已知的过程。它的目标不是“到达某点”，而是“最大化信息增益 / 最小化剩余未知体积”。\textbf{TARE}（Tiered Autonomous Robot Exploration）\cite{cao2022tare} 是 CMU 栈里的探索规划器，用“局部 + 全局”两层结构解决大范围探索中的短视问题。
+\end{definition}
+
+探索与导航的区别可以先从“目标从哪来”说起：导航的目标是人给的，探索的目标是算法自己算的。TARE 的目标选择分两层：
+
+\begin{itemize}
+  \item \textbf{局部层}：在当前可视图上，从机器人附近的可视节点里找“能看到最多未知区域”的位置，计算探索增益（gain）——通常用“从该点射线投射能看到的未知体素数”近似；再除以路径代价（gain/cost），选比值最大的作为下一个 waypoint。增益/代价的比值让机器人优先去“近且能看很多”的地方。
+  \item \textbf{全局层}：当局部区域没有可观的增益（当前房间看完了），再从一张低分辨率的全局地图上找远处的边界（frontier，已知与未知的交界），选一个全局目标，交给 FAR Planner 规划过去。这样避免局部层在“看完的房间里反复打转”，也避免一上来就冲向很远的未知区域。
+\end{itemize}
+
+\begin{pseudo}{TARE 式分层探索主循环}
+  \item 更新地图与可视图；若没有剩余未知区域，结束
+  \item 计算局部候选节点的探索增益 $g_i$ 与路径代价 $c_i$
+  \item 若存在 $g_i/c_i$ 超过阈值：选最优节点，令 FAR Planner 规划过去，执行
+  \item 否则：在全局低分辨率地图上找边界，选增益最大的边界作为全局目标
+  \item 若全局也没有边界：探索完成；否则规划到全局目标后回到第 1 步
+\end{pseudo}
+
+“探索”这个词在 CMU 栈里还包含一层含义：\textbf{探索本身就是一个不断试错的过程}。TARE 依赖 FAR 的 attemptable 边去“试探”未知区域，走进去看到更多，再更新增益；这正是 FAR 与 TARE 配套使用的原因——一个负责“敢走”，一个负责“去哪”。
+
+\section{部署、调参与和 LIO 的配合}\label{sec:21-deploy}
+
+\subsection{与 LIO 的分工}
+
+CMU 栈不自己估计位姿，它假设你已经在跑一个 LIO（仓库默认配 FAST-LIO2\cite{xu2022fastlio2} 或 LIO-SAM），并且 LIO 发布：世界系（或 odom 系）下的配准点云 \texttt{/registered\_scan} 与位姿 \texttt{/state\_estimation}。地形分析直接消费配准点云，所以：
+
+\begin{itemize}
+  \item \textbf{LIO 的漂移会变成地形图的“重影”}：同一条墙被扫成两层，坡度与净空都会算错，进而导致“幽灵障碍”。室外大范围场景要开回环（LIO-SAM）或用带全局优化的方案。
+  \item \textbf{点云去畸变必须做好}：快速转向时点云拖尾会让坡度噪声变大，地形图抖动，局部规划误刹车。
+  \item \textbf{外参要准}：雷达相对底盘的高度与俯仰角直接进入地形图；装歪 $2^\circ$，$10\ \mathrm{m}$ 外的高度就偏 $0.35\ \mathrm{m}$，足以把平地判成坡。
+\end{itemize}
+
+\subsection{关键参数与常见问题}
+
+\begin{lstlisting}[language=bash]
+# Typical workflow (ROS 1 / ROS 2 packages share the same idea)
+roslaunch vehicle_simulator system_garage.launch   # start simulator + stack
+roslaunch terrain_analysis terrain_analysis.launch # 2.5D terrain map
+roslaunch local_planner local_planner.launch       # local planner
+roslaunch far_planner far_planner.launch           # visibility graph
+roslaunch tare_planner tare_planner.launch         # exploration
+# Key parameters (names vary slightly across versions):
+#   vehicle_height / sensor_height  -> footprint and clearance
+#   terrain grid resolution         -> 0.1-0.2 m
+#   slope / step / roughness limits -> traversability thresholds
+#   maxRelZ                         -> relative height tolerance (m)
+\end{lstlisting}
+
+常见问题与排查方向：\textbf{地形图抖动}（点云噪声或外参抖动，先查 LIO 与雷达安装，再加大地形滤波窗口）；\textbf{局部规划卡住}（净空阈值太保守或车体尺寸填大，先看 \texttt{/terrain\_map} 里机器人周围是否被误判为窄）；\textbf{FAR 不更新}（\texttt{/terrain\_map\_ext} 没接上，或可视图更新半径小于移动速度$\times$更新周期）；\textbf{探索原地转}（增益阈值过高或全局层没触发，检查边界提取）。这些问题与第~\ref{ch:27-tuning}~章的排查表是同一套方法：\emph{先看数据流有没有，再看数值对不对，最后才怀疑算法}。
+
+\begin{summary}
+
+\begin{enumerate}
+  \item 2D 导航把世界压成平面，丢掉了高度、垂直净空与地形质量；2.5D 高程图用“每格一个高度”在内存与表达力之间取得平衡，是地面 3D 导航的主流选择。
+  \item CMU 栈的分工是“地形理解与规划解耦”：LIO 给配准点云，terrain\_analysis 出 2.5D 可通行性地图，local\_planner 做带净空的局部规划，FAR Planner 做增量可视图全局规划，TARE 做分层自主探索。
+  \item 地形可通行性由坡度（式~\eqref{eq:21-slope}）、粗糙度（式~\eqref{eq:21-rough}）、台阶高度（式~\eqref{eq:21-step}）与净空共同判定；分辨率会“平均掉”小台阶，所以台阶项要单独把关。
+  \item FAR 用稀疏可视图替代稠密栅格，用增量更新维持实时，用 attemptable 边“先走未知、走不通再删”，适合大范围未知环境。
+  \item TARE 用局部/全局两层解决探索的短视问题：局部比 gain/cost，全局找 frontier；探索的目标是信息增益而不是到达某点。
+  \item 这套栈依赖 LIO 的位姿与配准点云；漂移、去畸变、外参都会直接变成地形图误差，进而影响规划。
+\end{enumerate}
+
+
+\end{summary}
+
+\begin{problemset}
+
+  \item 用式~\eqref{eq:21-slope} 计算：$r=0.15\ \mathrm{m}$、相邻格高差 $0.06\ \mathrm{m}$ 时的坡度；若阈值是 $25^\circ$，该格可通行吗？
+  \item 为什么在 $0.2\ \mathrm{m}$ 分辨率下台阶会被“平均”掉？请构造一个 $0.15\ \mathrm{m}$ 台阶的例子，说明坡度项与台阶项判定的差异。
+  \item 2.5D 地图遇到“桥洞”会怎么错？给出两种工程上的补救方案。
+  \item FAR 的 attemptable 边与 A* 在未知栅格上“把未知当自由”有什么区别？为什么后者更危险？
+  \item TARE 的增益/代价比值中，如果只用增益、不看代价，机器人会表现成什么样？
+  \item 如果 LIO 出现约 $1^\circ$ 的俯仰角误差，$10\ \mathrm{m}$ 外的高度误差是多少？这会怎样影响地形分析？
+\end{problemset}
+
+\begin{reading}
+
+\begin{itemize}
+  \item \cite{cao2022tare}：CMU 自主探索开发环境的系统论文，读它建立“地形分析—局部规划—FAR—TARE”的整体框架。
+  \item \cite{yang2022farplanner}：FAR Planner 论文，重点看可视图的增量更新与 attemptable 策略的定义。
+  \item \cite{oleynikova2017voxblox}：ESDF 的增量构建，理解“距离场”之后再看 2.5D 净空会更容易。
+  \item \cite{xu2022fastlio2}：CMU 栈常用的 LIO 前端，理解它输出的配准点云是地形分析的输入。
+  \item 代码仓库 \href{https://github.com/caochao39/autonomous_exploration_development_environment}{caochao39/autonomous\_exploration\_development\_environment}：有 ROS 1/ROS 2 分支与仿真场景，按 README 跑一遍仿真比读十篇论文更直观。
+\end{itemize}
+
+
+\end{reading}

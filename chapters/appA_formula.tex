@@ -1,0 +1,207 @@
+\chapter{公式与符号速查}
+
+\section*{A.1 全局符号表}
+
+\begin{table}[htbp]
+  \centering
+  \caption{全书通用符号}\label{tab:a-symbols}
+  \small
+  \begin{tabular}{llp{7.2cm}}
+    \toprule
+    符号 & 名称 & 含义 \\
+    \midrule
+    $W$ & 世界系 / map 系 & 全局参考坐标系，$z$ 轴向上 \\
+    $O$ & odom 系 & 连续、无跳变的局部参考系 \\
+    $B$ & 机体系 & 默认与 IMU 系重合 \\
+    $L$、$C$ & 雷达系、相机系 & 传感器坐标系 \\
+    $T_{AB}=(R_{AB},{}^{A}p_B)$ & 位姿 & 从 $B$ 系到 $A$ 系的变换 \\
+    $R$、$q$ & 旋转矩阵、四元数 & $R\in\SO(3)$ \\
+    $p$、$v$、$a$ & 位置、速度、加速度 & 列向量 \\
+    $\omega$、$g$ & 角速度、重力 & $g=[0,0,-9.81]^{\top}$ \\
+    $\tilde{\omega}$、$\tilde{a}$ & IMU 测量值 & 含零偏与噪声 \\
+    $b_g$、$b_a$ & 陀螺仪/加速度计零偏 & 缓慢漂移 \\
+    $x$、$\delta x$ & 状态、误差状态 & \\
+    $z$、$h(\cdot)$、$r$ & 测量、观测函数、残差 & \\
+    $P$、$Q$、$R$ & 状态/过程/测量协方差 & \\
+    $J$、$H$ & 雅可比、海森 & \\
+    $\Lambda$ & 信息矩阵 & $\Lambda=P^{-1}$ 或 $J^{\top}R^{-1}J$ \\
+    $\pi=(n_\pi,d)$ & 平面参数 & $n_\pi^{\top}x=d$ \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+\section*{A.2 旋转与刚体变换}
+
+\paragraph{旋转矩阵的性质}
+\begin{equation}
+R^{\top}R=I,\quad \det(R)=1,\quad (R_1R_2)^{-1}=R_2^{\top}R_1^{\top}.
+\end{equation}
+
+\paragraph{Rodrigues 公式}
+设 $\phi=\theta a$（$\norm{a}=1$），则
+\begin{equation}
+\exp(\phi^{\wedge})=I+\sin\theta\,a^{\wedge}+(1-\cos\theta)(a^{\wedge})^{2}.
+\end{equation}
+
+\paragraph{对数映射}
+\begin{equation}
+\theta=\arccos\frac{\tr(R)-1}{2},\qquad
+\phi=\frac{\theta}{2\sin\theta}(R-R^{\top})^{\vee}.
+\end{equation}
+
+\paragraph{$\SE(3)$ 的逆}
+\begin{equation}
+T^{-1}=\begin{bmatrix}R^{\top}&-R^{\top}t\\0^{\top}&1\end{bmatrix}.
+\end{equation}
+
+\paragraph{位姿复合与逆}
+\begin{equation}
+T_{AC}=T_{AB}T_{BC},\qquad
+T_{AB}^{-1}=T_{BA}.
+\end{equation}
+
+\paragraph{右扰动}
+\begin{equation}
+R\leftarrow R\exp(\delta\phi^{\wedge}),\qquad t\leftarrow t+R\,\delta\rho.
+\end{equation}
+
+\section*{A.3 概率与滤波}
+
+\paragraph{贝叶斯公式}
+\begin{equation}
+p(x\mid z)=\frac{p(z\mid x)p(x)}{p(z)}.
+\end{equation}
+
+\paragraph{高斯分布}
+\begin{equation}
+p(x)=\frac{1}{(2\pi)^{n/2}\abs{\Sigma}^{1/2}}
+\exp\left(-\frac12(x-\mu)^{\top}\Sigma^{-1}(x-\mu)\right).
+\end{equation}
+
+\paragraph{方差与协方差}
+\begin{equation}
+\Var(X)=\E[X^{2}]-(\E[X])^{2},\qquad
+\Cov(X,Y)=\E[XY]-\E[X]\E[Y].
+\end{equation}
+
+\paragraph{卡尔曼滤波}
+预测：
+\begin{align}
+\hat{x}_{k}^{-}&=F_k\hat{x}_{k-1}+B_ku_k,\\
+P_k^{-}&=F_kP_{k-1}F_k^{\top}+Q_k.
+\end{align}
+更新：
+\begin{align}
+K_k&=P_k^{-}H_k^{\top}\left(H_kP_k^{-}H_k^{\top}+R_k\right)^{-1},\\
+\hat{x}_k&=\hat{x}_k^{-}+K_k\left(z_k-h(\hat{x}_k^{-})\right),\\
+P_k&=(I-K_kH_k)P_k^{-}.
+\end{align}
+
+\paragraph{ESKF}
+误差状态传播与更新：
+\begin{equation}
+\delta\dot{x}=F\delta x+Gn,\qquad
+K=P^{-}H^{\top}(HP^{-}H^{\top}+R)^{-1},\qquad
+\delta x\leftarrow\delta x\oplus K r.
+\end{equation}
+
+\paragraph{马氏距离与卡方检验}
+\begin{equation}
+d^{2}=r^{\top}(HPH^{\top}+R)^{-1}r\sim\chi^{2}(k).
+\end{equation}
+
+\section*{A.4 优化}
+
+\paragraph{最小二乘正规方程}
+\begin{equation}
+A^{\top}Ax=A^{\top}b.
+\end{equation}
+
+\paragraph{高斯--牛顿}
+\begin{equation}
+J^{\top}J\,\delta x=-J^{\top}r,\qquad x\leftarrow x+\delta x.
+\end{equation}
+
+\paragraph{Levenberg--Marquardt}
+\begin{equation}
+\left(J^{\top}J+\lambda I\right)\delta x=-J^{\top}r.
+\end{equation}
+
+\paragraph{Huber 鲁棒核}
+\begin{equation}
+\rho(s)=
+\begin{cases}
+s, & s\le\delta^{2},\\
+2\delta\sqrt{s}-\delta^{2}, & s>\delta^{2},
+\end{cases}
+\qquad
+w(s)=\frac{\rho'(s)}{2\sqrt{s}}=
+\begin{cases}
+1, & s\le\delta^{2},\\
+\delta/\sqrt{s}, & s>\delta^{2}.
+\end{cases}
+\end{equation}
+
+\section*{A.5 点云配准}
+
+\paragraph{ICP 闭式旋转解}
+给定去质心点对 $(p_i,q_i)$，构造
+\begin{equation}
+W=\sum_i p_iq_i^{\top}=U\Sigma V^{\top},\qquad
+R^{*}=VU^{\top},
+\end{equation}
+若 $\det(R^{*})<0$，取 $V'=[v_1,v_2,-v_3]$ 后重算。平移为 $t^{*}=\bar{q}-R^{*}\bar{p}$。
+
+\paragraph{点到面残差}
+\begin{equation}
+r_i=n_i^{\top}\left(Rp_i+t-q_i\right).
+\end{equation}
+
+\section*{A.6 SLAM 后端}
+
+\paragraph{位姿图残差}
+\begin{equation}
+r_{ij}=\log\left(T_{ij}^{-1}T_i^{-1}T_j\right)^{\vee}\in\R^{6}.
+\end{equation}
+
+\paragraph{舒尔补}
+分块系统
+\begin{equation}
+\begin{bmatrix}H_{cc}&H_{cp}\\H_{pc}&H_{pp}\end{bmatrix}
+\begin{bmatrix}\delta x_c\\\delta x_p\end{bmatrix}
+=
+\begin{bmatrix}b_c\\b_p\end{bmatrix}
+\end{equation}
+消去相机变量后：
+\begin{equation}
+\left(H_{pp}-H_{pc}H_{cc}^{-1}H_{cp}\right)\delta x_p
+=b_p-H_{pc}H_{cc}^{-1}b_c.
+\end{equation}
+
+\paragraph{边缘化}
+用舒尔补把旧状态消去，得到新的先验因子；注意这会引入线性化误差。
+
+\section*{A.7 导航}
+
+\paragraph{A* 评价函数}
+\begin{equation}
+f(n)=g(n)+h(n),
+\end{equation}
+其中 $g$ 是起点到 $n$ 的实际代价，$h$ 是到目标的启发式下界（可采纳）。
+
+\paragraph{DWA 评价函数}
+\begin{equation}
+G(v,\omega)=\alpha\cdot\mathrm{heading}(v,\omega)+\beta\cdot\mathrm{clearance}(v,\omega)+\gamma\cdot\mathrm{velocity}(v,\omega).
+\end{equation}
+
+\paragraph{Cartographer 扫描匹配得分}
+\begin{equation}
+S(T)=\sum_k M_{\mathrm{smooth}}\left(T\,h_k\right),
+\end{equation}
+其中 $M_{\mathrm{smooth}}$ 是双线性插值后的概率栅格。
+
+\paragraph{控制代价（MPC）}
+\begin{equation}
+\min_{u_{0:N-1}}\ \sum_{k=0}^{N-1}\left(x_k-x_k^{\mathrm{ref}}\right)^{\top}Q\left(x_k-x_k^{\mathrm{ref}}\right)+u_k^{\top}Ru_k
+\quad\text{s.t.}\ x_{k+1}=f(x_k,u_k).
+\end{equation}

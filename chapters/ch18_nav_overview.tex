@@ -1,0 +1,327 @@
+\chapter{导航系统总览与 Nav2}\label{ch:18-nav-overview}
+
+\usetikzlibrary{arrows.meta,positioning,calc,fit,shapes.geometric,patterns}
+
+\chapterintro{从这一章开始，我们进入全书第四部分：导航。里程计篇回答“机器人现在在哪”，SLAM 篇回答“地图长什么样”，而导航篇要回答一个更接近任务的问题——“知道自己在哪、也知道地图之后，怎么把机器人安全、平稳地送到目标点”。本章先建立导航系统的全局骨架：导航由定位、建图、规划、控制四块组成；然后正面解释一个几乎每个新队员都会问、但网上说法互相矛盾的概念——“导航的前端/后端”；最后以 ROS 2 的 Nav2 为实例，讲清行为树、代价地图、TF 树、全局/局部规划的分工。学完本章，你应该能画出 Nav2 的节点数据流图，并说出每个节点负责哪一件事、以什么频率运行、失败时由谁兜底。}
+
+\section{导航到底在做什么}\label{sec:18-what}
+
+用一句话概括：\textbf{导航是在已知或部分已知的地图上，依据自身的位姿估计，生成一条满足机器人运动约束、并且不撞障碍的可行轨迹，并把轨迹变成轮子/电机的指令。}把它写成优化问题时，输入是地图 $M$、当前位姿 $\bm{x}_0$、目标位姿 $\bm{x}_g$、机器人模型（尺寸、最大速度、最大加速度、最小转弯半径），输出是一段控制序列 $\bm{u}_{0:T}$ 或一段轨迹 $\bm{x}_{0:T}$，约束是\emph{不碰撞}、\emph{运动学可行}、\emph{动力学可行}，目标通常是最短、最平滑或最省时间。
+
+\begin{figure}[htbp]
+  \centering
+  \begin{tikzpicture}[node distance=7mm and 8mm, font=\small]
+    \node[block] (sensor) {传感器\\{\footnotesize 点云/图像/IMU/轮速}};
+    \node[block, right=of sensor] (loc) {定位与建图\\{\footnotesize 第 10--17 章}};
+    \node[block, right=of loc] (plan) {规划\\{\footnotesize 第 19--21 章}};
+    \node[block, right=of plan] (ctrl) {控制\\{\footnotesize 第 20、22 章}};
+    \node[block, below=10mm of ctrl] (phys) {真实世界\\{\footnotesize 机器人 + 环境}};
+    \draw[arrow] (sensor) -- (loc);
+    \draw[arrow] (loc) -- (plan);
+    \draw[arrow] (plan) -- (ctrl);
+    \draw[arrow] (ctrl) -- (phys);
+    \draw[arrow] (phys.west) -| (sensor.south);
+    \draw[arrow, dashed] (loc.south) |- ++(0,-4mm) -| (ctrl.south);
+  \end{tikzpicture}
+  \caption{导航系统的闭环。上半行是“信息流”：传感器数据经定位与建图变成位姿和地图，再经规划变成轨迹，经控制变成指令；下半行是“物理流”：指令驱动真实世界，真实世界的变化又被传感器观测到。虚线表示规划与控制都要使用定位结果（位姿）。}
+  \label{fig:18-loop}
+\end{figure}
+
+图~\ref{fig:18-loop} 里有两点容易忽略，却决定了工程上的成败。第一，\textbf{闭环里每一环都有延迟}，位姿估计可能比真实状态晚几十毫秒，控制指令下发又要经过通信与执行器，所以“用当前位姿算出的避障动作”实际上是在处理几十毫秒前的世界；速度越快、延迟越大，越容易撞。第二，\textbf{每一环的频率差一到两个数量级}，定位 10--50 Hz，全局规划 1 Hz 量级，局部规划 10--20 Hz，电机控制 100 Hz 以上。频率不匹配就必须靠“缓存最近的位姿与地图”和“降频重规划”来衔接，这正是 Nav2 用生命周期节点、代价地图和速度平滑器要处理的事情。
+
+\begin{table}[htbp]
+  \centering
+  \caption{导航系统的四个环节及其在本书中的位置}
+  \label{tab:18-pipeline}
+  \small
+  \begin{tabular}{llll}
+    \toprule
+    环节 & 回答的问题 & 典型频率 & 对应章节 \\
+    \midrule
+    定位与建图 & 我在哪？地图什么样？ & 10--50 Hz & 第 10--17 章 \\
+    全局规划 & 大致该往哪走？ & 1 Hz & 第 19、21 章 \\
+    局部规划 & 接下来 1--3 秒怎么走？ & 10--20 Hz & 第 20、21 章 \\
+    控制与执行 & 左右轮各转多快？ & 50--200 Hz & 第 20、22 章 \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+\section{“前端/后端”到底指什么：三种语境}\label{sec:18-fb}
+
+这是本章最需要说清楚的一节。新队员常看到三句互相打架的话：“SLAM 的后端是图优化”“导航的后端是规划与控制”“定位系统的后端负责全局修正”。三句话都不算错，但它们在说三个不同的东西。之所以混乱，是因为“前端/后端”原先是软件工程里的分层说法（\textbf{前端}负责与外界交互、做即时处理，\textbf{后端}负责汇总、优化、做全局决策），后来被三个不同领域各自借用，含义就分叉了。
+
+\subsection{语境一：SLAM 的前端/后端（第 11--13 章）}
+
+在 SLAM 里，分界线非常明确：\textbf{前端}是帧间/扫描间的数据关联与相对位姿估计（特征匹配、ICP、直接法），它只关心相邻几帧，结果快但有累积漂移；\textbf{后端}是把这些相对约束与回环约束放在一起做全局优化（位姿图、因子图、BA），它关心整段轨迹的一致性，慢但能把漂移“摊平”。判断标准是：\emph{是否对全局变量做联合优化}。前端 10--30 Hz，后端 1 Hz 或只在回环时触发。第~\ref{ch:11-slam-framework}~章给出的定义是本书的基准，后面两节都要与它对照。
+
+\subsection{语境二：定位系统的前端/后端（第 9、10、23 章）}
+
+在定位（尤其是多传感器融合定位）里，\textbf{前端}指“用高频、局部的观测做状态递推与更新”，例如 IMU 预积分 + 激光/视觉里程计的 ESKF 滤波；\textbf{后端}指“用低频、全局的观测做长期修正”，例如 AMCL 粒子滤波重定位、UWB/二维码/UWB 基站给的绝对位置、回环检测给出的位姿修正。这里的分界不再是“有没有联合优化”，而是\emph{观测是局部的还是全局的、修正的是短期还是长期漂移}。Z-Localization 那类系统把“前端滤波 + 后端全局约束检验”拆得更细，第~\ref{ch:23-zlocalization}~章会展开。
+
+\subsection{语境三：导航系统的前端/后端（本章、第 19--22 章）}
+
+在导航系统里，最常见的说法是：\textbf{前端 = 定位与地图}（回答“我在哪、哪里能走”），\textbf{后端 = 规划与控制}（回答“往哪走、怎么走”）。这个说法流行，是因为它对应了数据流的方向：感知与状态估计在前，决策与控制在后，和 Web 开发里“前端展示、后端计算”的直觉很像，讲课时容易理解。
+
+但必须指出它\textbf{不严谨}的三点：
+
+\begin{enumerate}
+  \item 导航的“后端”里并没有 SLAM 后端那种\emph{全局联合优化}。规划是搜索/采样/优化一个轨迹，控制是求解一个跟踪问题，两者都不优化“整段运行历史”。把规划叫后端，只是借了“做决策”的意思。
+  \item 导航自己内部还有一层“全局/局部”的层次（全局规划 1 Hz、局部规划 10--20 Hz），这层“全局/局部”与“前端/后端”\emph{不是一回事}。很多混淆就来自把“全局规划”误说成“导航后端”。
+  \item 被划进“导航前端”的定位模块内部，\emph{自己又有}前端/后端（语境二）。所以“导航的前端”内部还套着一个“定位的后端”，逐层嵌套时字面意思会打架。
+\end{enumerate}
+
+\begin{table}[htbp]
+  \centering
+  \caption{三种“前端/后端”语境对照（建议背下这张表）}
+  \label{tab:18-fb}
+  \small
+  \begin{tabular}{p{1.6cm}p{3.6cm}p{3.9cm}p{3.5cm}}
+    \toprule
+    语境 & 前端 & 后端 & 分界依据 \\
+    \midrule
+    SLAM & 帧间配准、数据关联 & 位姿图/因子图全局优化 & 是否联合优化全局变量 \\
+    定位系统 & 高频滤波、局部观测递推 & 全局观测重定位、长期漂移修正 & 观测是局部还是全局 \\
+    导航系统 & 定位与地图 & 规划与控制（口语说法） & 数据流先后（非严格定义） \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+\begin{keybox}{一句话判断法}
+听到“后端”时，先看它后面接什么：接“图优化/回环”$\rightarrow$ SLAM 后端；接“全局定位/绝对观测修正”$\rightarrow$ 定位后端；接“规划/控制/行为树”$\rightarrow$ 导航后端（口语）。本书此后一律使用“SLAM 前后端”“定位前后端”这种带限定词的说法，避免歧义。
+\end{keybox}
+
+\section{Nav2：ROS 2 的导航事实标准}\label{sec:18-nav2}
+
+Nav2 是 ROS 2 的导航框架，前身是 ROS 1 的 \texttt{move\_base}，其设计在 \cite{macenski2020nav2} 中系统给出，整体软件架构与 ROS 2 的设计哲学见 \cite{macenski2022ros2}。它不是一个“程序”，而是一组\textbf{可组合、可替换、由行为树调度}的节点。
+
+\subsection{节点分工}
+
+表~\ref{tab:18-nav2nodes} 是必须记住的节点清单。核心思路是：\texttt{bt\_navigator} 不自己算路径，它只负责“按行为树的剧本调用别人”；真正算路的是 \texttt{planner\_server}（全局）与 \texttt{controller\_server}（局部）；\texttt{behavior\_server} 提供“原地旋转、后退、等待”等恢复动作；\texttt{lifecycle\_manager} 负责按依赖顺序把大家从“未配置”一路带到“激活”。
+
+\begin{table}[htbp]
+  \centering
+  \caption{Nav2 主要节点及其职责}
+  \label{tab:18-nav2nodes}
+  \small
+  \begin{tabular}{lll}
+    \toprule
+    节点 & 职责 & 关键插件/接口 \\
+    \midrule
+    \texttt{bt\_navigator} & 行为树调度，对外提供导航 action & BehaviorTree.CPP \\
+    \texttt{planner\_server} & 全局路径规划 & NavFn、Smac、Smac Hybrid \\
+    \texttt{controller\_server} & 局部轨迹跟踪与避障 & DWB、TEB、MPPI、RPP \\
+    \texttt{smoother\_server} & 路径平滑（减少拐点） & Simple、Savitzky-Golay \\
+    \texttt{behavior\_server} & 恢复行为：旋转、后退、等待 & spin、backup、wait \\
+    \texttt{waypoint\_follower} & 多点巡航 & NavigateThroughPoses \\
+    \texttt{velocity\_smoother} & 速度限幅与加速度平滑 & 一阶低通 \\
+    \texttt{map\_server / amcl} & 加载地图 / 粒子滤波定位 & 第 10、14 章 \\
+    \texttt{lifecycle\_manager} & 生命周期编排 & 按序 configure/activate \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+\begin{figure}[htbp]
+  \centering
+  \begin{tikzpicture}[node distance=7mm and 10mm, font=\small]
+    \node[block] (client) {任务层/RViz2\\{\footnotesize NavigateToPose}};
+    \node[block2, below=of client] (bt) {\texttt{bt\_navigator}\\{\footnotesize 行为树}};
+    \node[block, below left=of bt] (pl) {\texttt{planner\_server}\\{\footnotesize 全局规划}};
+    \node[block, below right=of bt] (cr) {\texttt{controller\_server}\\{\footnotesize 局部控制}};
+    \node[block, left=of pl] (ms) {\texttt{map\_server}\\{\footnotesize + AMCL}};
+    \node[block, right=of cr] (vs) {\texttt{velocity\_smoother}};
+    \node[block, below=of vs] (base) {底盘驱动\\{\footnotesize /cmd\_vel}};
+    \draw[arrow] (client) -- node[label, right]{action} (bt);
+    \draw[arrow] (bt) -- node[label, above left]{\footnotesize ComputePathToPose} (pl);
+    \draw[arrow] (bt) -- node[label, above right]{\footnotesize FollowPath} (cr);
+    \draw[arrow, dashed] (ms) -- (pl);
+    \draw[arrow, dashed] (ms.south) |- (cr.west);
+    \draw[arrow] (cr) -- (vs);
+    \draw[arrow] (vs) -- (base);
+  \end{tikzpicture}
+  \caption{Nav2 的节点数据流（简化）。箭头方向是“谁调用谁/数据流向谁”。\texttt{bt\_navigator} 通过 action 调用规划与控制服务；两者都以 \texttt{map\_server} 的静态地图和 AMCL 的位姿为输入；\texttt{controller\_server} 输出的速度指令经速度平滑器限幅后下发底盘。行为树的好处是：换一套 XML 脚本就能改变“先规划、失败则旋转、再失败则后退”的策略，而不用改 C++ 代码。}
+  \label{fig:18-nav2}
+\end{figure}
+
+\subsection{action 接口：为什么不是 topic}
+
+导航是“有开始、有结束、有反馈、可能失败、可取消”的长任务，正适合 ROS 2 的 \textbf{action}（动作）接口。ROS 2 的 action 由三部分组成：goal（目标）、feedback（周期反馈）、result（最终结果）；底层复用 topic 与 service，因此天然支持“发起后先返回、执行中持续反馈、随时取消”。Nav2 最常用的 action 是 \texttt{nav2\_msgs/action/NavigateToPose}，可以这样从命令行发一个目标：
+
+\begin{lstlisting}[language=bash]
+# Send a navigation goal from the command line (Nav2 must be running)
+ros2 action send_goal /navigate_to_pose nav2_msgs/action/NavigateToPose \
+  "{pose: {header: {frame_id: map}, pose: {position: {x: 1.0, y: 2.0},
+   orientation: {w: 1.0}}}}" --feedback
+\end{lstlisting}
+
+反馈里会周期性给出当前位姿、已走时间、剩余距离、已执行的恢复次数。工程上只要盯住“剩余距离长时间不下降 + 恢复次数持续增加”，基本就能判定机器人卡住了——这比看日志快得多。
+
+\subsection{与 ROS 1 \texttt{move\_base} 的差异}
+
+\begin{table}[htbp]
+  \centering
+  \caption{\texttt{move\_base} 与 Nav2 的对比}
+  \label{tab:18-movebase}
+  \small
+  \begin{tabular}{p{2.6cm}p{4.6cm}p{5.4cm}}
+    \toprule
+    维度 & ROS 1 \texttt{move\_base} & Nav2 \\
+    \midrule
+    任务编排 & 固定流程 + 硬编码恢复行为 & 行为树 XML，可在线切换策略 \\
+    生命周期 & 无统一管理，启动顺序靠脚本 & 生命周期节点 + \texttt{lifecycle\_manager} \\
+    插件化 & 规划器/控制器插件，扩展有限 & 规划、控制、平滑、行为全部插件化 \\
+    接口 & \texttt{MoveBaseAction} & \texttt{NavigateToPose} 等一组 action \\
+    多机器人 & 需命名空间硬隔离 & 天然支持命名空间与多实例 \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+\section{代价地图：导航的“地面真相”}\label{sec:18-costmap}
+
+\begin{definition}[代价地图]
+代价地图（costmap）是叠加在二维平面上的栅格，每个格子存一个 8 位整数 $c\in\{0,1,\dots,255\}$，表示“机器人中心经过该格的风险”。约定 \textbf{0 表示自由}、\textbf{254 表示致命障碍}（\texttt{LETHAL\_OBSTACLE}）、\textbf{253 表示内切膨胀障碍}（\texttt{INSCRIBED\_INFLATED\_OBSTACLE}，即“机器人中心到这里必然碰撞”）、\textbf{255 表示未知}（\texttt{NO\_INFORMATION}）。中间值表示“离障碍越近代价越高”。
+\end{definition}
+
+举个例子：$10\ \mathrm{m}\times 10\ \mathrm{m}$ 的场地、分辨率 $0.05\ \mathrm{m}$，则每边 $10/0.05=200$ 格，共 $4\times10^4$ 格；每格 1 字节，单层约 39 KB，四层也不过 160 KB 左右，完全可以每帧全量更新。这就是为什么 2D 代价地图能在 5--20 Hz 下实时刷新。
+
+\subsection{分层结构}
+
+Nav2 的 2D 代价地图由若干 \textbf{layer}（层）叠加而成，自下而上依次是：
+
+\begin{itemize}
+  \item \textbf{静态层}（static layer）：读 \texttt{map\_server} 的 pgm 地图，给出已知障碍与未知区域，基本不变。
+  \item \textbf{障碍层/体素层}（obstacle layer / voxel layer）：把实时传感器（激光、深度相机、3D 点云）观测到的障碍投影到 2D 栅格。体素层会把 3D 点云压成带高度过滤的 2D 障碍，是 3D 传感器进入 2D 导航的桥梁。
+  \item \textbf{膨胀层}（inflation layer）：把障碍向外“扩散”出一圈代价梯度，让规划器主动远离墙壁。它不新增障碍，只改变代价值。
+\end{itemize}
+
+层的叠加规则是“取最大”：$c(x,y)=\max_k c_k(x,y)$。因此静态层里的致命障碍不会被障碍层覆盖成自由，而障碍层新看到的障碍会立即压过静态层的自由空间。
+
+\subsection{内切半径、外切半径与膨胀}
+
+设机器人俯视轮廓的最小外接圆半径为\textbf{外切半径} $r_{\mathrm{out}}$，机器人能塞进的最窄通道半宽为\textbf{内切半径} $r_{\mathrm{in}}$。对 $0.6\ \mathrm{m}\times 0.6\ \mathrm{m}$ 的方形底盘，$r_{\mathrm{in}}=0.3\ \mathrm{m}$，$r_{\mathrm{out}}=\sqrt{0.3^2+0.3^2}=0.424\ \mathrm{m}$。
+
+膨胀层的代价值由下式给出：
+\begin{equation}
+  c(d)=
+  \begin{cases}
+    254, & d<r_{\mathrm{in}} \text{（中心在障碍上）},\\[2pt]
+    253, & r_{\mathrm{in}}\le d \le r_{\mathrm{in}}+\varepsilon,\\[2pt]
+    \left\lfloor 253\,\exp\!\left[-k\,(d-r_{\mathrm{in}})\right]\right\rfloor, & r_{\mathrm{in}}<d<r_{\mathrm{infl}},\\[2pt]
+    0, & d\ge r_{\mathrm{infl}},
+  \end{cases}
+  \label{eq:18-inflation}
+\end{equation}
+其中 $d$ 是该格到最近障碍的欧氏距离，$r_{\mathrm{infl}}$ 是 \texttt{inflation\_radius}（膨胀半径），$k$ 是 \texttt{cost\_scaling\_factor}（代价衰减系数）。$d$ 用距离变换在整张图上一次算出，所以膨胀本身是 $O(N)$ 的。
+
+取 $r_{\mathrm{in}}=0.3$、$k=3.0$、$r_{\mathrm{infl}}=0.55$（单位 m），算三个数：
+\begin{itemize}
+  \item $d=0.35$：$c=253e^{-3\times0.05}=253\times0.861=217.8\to217$，很高，规划器会避开；
+  \item $d=0.45$：$c=253e^{-3\times0.15}=253\times0.638=161.4\to161$，仍然偏高；
+  \item $d=0.55$：$c=253e^{-3\times0.25}=253\times0.472=119.5\to119$，但按上界已截断为 0。
+\end{itemize}
+注意最后一行的截断：只要 $d\ge r_{\mathrm{infl}}$ 就强制归零，否则指数衰减永远到不了 0，整张图都会“有代价”。
+
+\begin{keybox}{实例：机器人过窄门}
+门宽 $0.9\ \mathrm{m}$，方形底盘 $0.6\ \mathrm{m}$。机器人中心必须离两侧门框各 $\ge r_{\mathrm{in}}=0.3\ \mathrm{m}$，可行带宽度只剩 $0.9-2\times0.3=0.3\ \mathrm{m}$，按 $0.05\ \mathrm{m}$ 分辨率约 6 格。若把 \texttt{inflation\_radius} 设成 $0.8$、$k=5$，门中心 $d=0.45$ 处代价为 $253e^{-5\times0.15}=253\times0.472=119$，两侧墙的膨胀区在门中央几乎重叠，规划器会认为“门口很贵”而绕路甚至报“无可行路径”。正确做法是：$r_{\mathrm{in}}$ 按真实车体设准（别虚大），\texttt{inflation\_radius} 取略大于 $r_{\mathrm{out}}$（如 $0.45$--$0.5$），$k$ 取 2--3；或给规划器设置“允许穿越高代价区”的阈值。
+\end{keybox}
+
+\subsection{更新频率与发布频率}
+
+\texttt{update\_frequency} 是代价地图\emph{重新计算}（融合新观测、重算膨胀）的频率，\texttt{publish\_frequency} 是把它\emph{发布}给其他节点/RViz 的频率。前者决定避障反应速度，后者只影响可视化与订阅端。常见配置是 update 5 Hz、publish 2 Hz；全局代价地图可以更低（1 Hz），因为它只服务 1 Hz 的全局规划。
+
+\section{TF 树与坐标系}\label{sec:18-tf}
+
+\begin{definition}[TF 树]
+TF 树是以坐标系为节点、以带时间戳的刚体变换为边的树。任意两个坐标系 $A$、$C$ 之间的变换，通过沿树从 $A$ 走到 $C$ 的路径逐段复合得到：若路径是 $A\to B\to C$，则 $T_{AC}=T_{AB}\,T_{BC}$。TF 库（tf2）沿路径查询并插值到指定时刻，因此每个坐标系在任意时刻都只有一个父节点——这正是“树”而不是“图”的要求。
+\end{definition}
+
+举个复合的例子。机体在世界系中位姿 $T_{WB}$：平移 $(1,2)\ \mathrm{m}$、偏航 $30^\circ$；激光雷达在机体系下 $(0.2,0)\ \mathrm{m}$、无旋转。则
+\begin{equation}
+  {}^{W}\bm{p}_{L}
+  = {}^{W}\bm{R}_{B}\,{}^{B}\bm{p}_{L}+{}^{W}\bm{p}_{B}
+  = \begin{bmatrix}\cos30^\circ & -\sin30^\circ\\ \sin30^\circ & \cos30^\circ\end{bmatrix}
+    \begin{bmatrix}0.2\\0\end{bmatrix}+\begin{bmatrix}1\\2\end{bmatrix}
+  = \begin{bmatrix}0.173\\0.1\end{bmatrix}+\begin{bmatrix}1\\2\end{bmatrix}
+  = \begin{bmatrix}1.173\\2.1\end{bmatrix}.
+\end{equation}
+也就是说，雷达看到的世界坐标要先减去这个偏移才能变回机体系——外参错了，障碍物在地图上的位置就会整体偏移，表现为“代价地图里的墙和真实墙错位”。
+
+\begin{figure}[htbp]
+  \centering
+  \begin{tikzpicture}[node distance=8mm and 10mm, font=\small,
+      frame/.style={rectangle, rounded corners=2pt, draw=structurecolor, thick,
+                    fill=structurecolor!8, minimum height=7mm, minimum width=20mm, align=center}]
+    \node[frame] (map) {\texttt{map}};
+    \node[frame, below=of map] (odom) {\texttt{odom}};
+    \node[frame, below=of odom] (foot) {\texttt{base\_footprint}};
+    \node[frame, below=of foot] (base) {\texttt{base\_link}};
+    \node[frame, below left=of base] (laser) {\texttt{laser}};
+    \node[frame, below right=of base] (imu) {\texttt{imu}};
+    \draw[arrow] (map) -- node[label, right]{\footnotesize AMCL/SLAM：可跳变} (odom);
+    \draw[arrow] (odom) -- node[label, right]{\footnotesize 轮速+IMU：连续} (foot);
+    \draw[arrow] (foot) -- node[label, right]{\footnotesize 静态} (base);
+    \draw[arrow] (base) -- node[label, left]{\footnotesize 静态外参} (laser);
+    \draw[arrow] (base) -- node[label, right]{\footnotesize 静态外参} (imu);
+  \end{tikzpicture}
+  \caption{2D 导航的标准 TF 树。\texttt{map}$\to$\texttt{odom} 由定位模块发布，可以跳变（重定位时瞬间修正）；\texttt{odom}$\to$\texttt{base\_footprint} 由里程计发布，必须连续无跳变；\texttt{base\_link} 以下的传感器外参是静态的，由 URDF 经 \texttt{robot\_state\_publisher} 广播。}
+  \label{fig:18-tf}
+\end{figure}
+
+图~\ref{fig:18-tf} 的树结构决定了三件事：
+
+\begin{enumerate}
+  \item \textbf{谁发布}：\texttt{map}$\to$\texttt{odom} 只能由定位模块（AMCL 或 SLAM）发布；\texttt{odom}$\to$\texttt{base\_footprint} 只能由里程计发布；传感器外参由 URDF 发布。重复发布会让 tf2 报“TF 树出现多个父节点”，整棵树失效。
+  \item \textbf{为什么不直接 \texttt{map}$\to$\texttt{base\_link}}：因为定位会跳变，而局部规划、控制需要平滑连续的位姿。把跳变隔离在 \texttt{map}$\to$\texttt{odom} 这一段，局部控制始终用连续的 \texttt{odom} 系，就不会因为一次重定位而急打方向。
+  \item \textbf{时间戳}：tf2 默认只缓存 10 s，查询时刻超出缓存就抛 \texttt{ExtrapolationException}。常见原因是某个节点的时间戳用了系统时间而其他节点用 ROS 时间（仿真），或者传感器驱动停了。
+\end{enumerate}
+
+\begin{lstlisting}[language=bash]
+# Check whether map->odom is actually published and how it evolves
+ros2 run tf2_ros tf2_echo map odom
+# Visualize the whole TF tree; look for disconnected branches
+ros2 run tf2_tools view_frames
+\end{lstlisting}
+
+\section{全局规划与局部规划的分工}\label{sec:18-global-local}
+
+\begin{definition}[全局规划与局部规划]
+\textbf{全局规划}（global planning）在静态或准静态的全局地图上，从起点到目标点求一条（近似）最优的几何路径，只考虑“能不能走”，不考虑“怎么拐”；\textbf{局部规划}（local planning，也叫局部轨迹规划/控制）在机器人附近几米的滚动窗口内，结合实时障碍与自身运动学、动力学约束，生成未来 1--3 秒的可执行轨迹并跟踪全局路径。
+\end{definition}
+
+两者的输入输出完全不同：全局规划输入是起点、目标、全局代价地图，输出是一串路径点（path，只有几何没有时间）；局部规划输入是这条路径、局部代价地图、当前位姿与速度，输出是带时间信息的轨迹或直接的速度指令 $(\bm{v},\omega)$。频率上差一个数量级，全局 1 Hz 足够（路径不会每秒都变），局部必须 10--20 Hz（障碍随时出现）。
+
+评价一条全局路径看四点：\textbf{长度}（是否绕远）、\textbf{平滑度}（曲率是否连续，曲率突变会让底盘抖动）、\textbf{安全性}（离障碍的净空）、\textbf{可行性}（是否满足最小转弯半径）。评价局部规划则看：\textbf{跟踪误差}、\textbf{实时性}、\textbf{避障成功率}、\textbf{舒适性}（加速度、 jerk）。第~\ref{ch:19-global-planning}~章讲全局规划的算法，第~\ref{ch:20-local-planning}~章讲局部规划与控制，第~\ref{ch:21-3d-nav}~章把两者搬到 3D 地形上，第~\ref{ch:22-nav2-practice}~章把它们串成完整链路。
+
+\begin{summary}
+
+\begin{enumerate}
+  \item 导航 = 定位/建图 + 全局规划 + 局部规划 + 控制，是一个带延迟、频率相差 1--2 个数量级的闭环；理解延迟与频率差是调参的前提。
+  \item “前端/后端”有三种语境：SLAM 看是否联合优化全局变量；定位系统看观测是局部还是全局；导航系统口语里指“定位与地图 / 规划与控制”，后者不严谨，本书一律加限定词。
+  \item Nav2 是行为树调度的插件化节点集合：\texttt{bt\_navigator} 编排，\texttt{planner\_server} 与 \texttt{controller\_server} 干活，\texttt{behavior\_server} 兜底，\texttt{lifecycle\_manager} 负责启动顺序，对外用 action 接口。
+  \item 代价地图是 0--255 的分层栅格，取最大叠加；内切半径决定“必然碰撞区”，膨胀半径与衰减系数决定“多怕墙”。式~\eqref{eq:18-inflation} 是调参的量化依据。
+  \item TF 树是一条链：\texttt{map}$\to$\texttt{odom} 可跳变、\texttt{odom}$\to$\texttt{base} 必须连续、传感器外参静态；重复发布与时间戳越界是最常见的两类故障。
+  \item 全局规划求几何路径（1 Hz，重长度/平滑/可行），局部规划求带时间的轨迹（10--20 Hz，重实时/避障）。
+\end{enumerate}
+
+
+\end{summary}
+
+\begin{problemset}
+
+  \item 用式~\eqref{eq:18-inflation} 计算：$r_{\mathrm{in}}=0.25$、$k=2.5$、$r_{\mathrm{infl}}=0.6$ 时，$d=0.3,0.4,0.5,0.6$ 四处的代价值，并解释为什么 $d=0.6$ 必须归零。
+  \item 一辆 $0.5\ \mathrm{m}\times0.4\ \mathrm{m}$ 的底盘要通过 $0.75\ \mathrm{m}$ 宽的门。请给出内切半径 $r_{\mathrm{in}}$ 与外切半径 $r_{\mathrm{out}}$，再给出一组可用的膨胀半径与代价衰减系数，并说明理由。
+  \item 如果 AMCL 和另一个建图节点同时发布 \texttt{map}$\to$\texttt{odom}，会发生什么？如何用命令行确认是谁在发布？
+  \item 为什么全局规划不需要 10 Hz？如果强行提高到 10 Hz，会带来什么代价？
+  \item 用一句话分别回答“SLAM 的后端是什么”“定位系统的后端是什么”“导航的后端是什么”，并说明三者的分界依据。
+\end{problemset}
+
+\begin{reading}
+
+\begin{itemize}
+  \item \cite{macenski2020nav2}：Nav2 的原始设计论文，读它解决“为什么要有行为树、为什么拆成这么多 server”的问题。
+  \item \cite{macenski2022ros2}：ROS 2 的设计与架构，理解 action、生命周期节点、组件化之后再读 Nav2 源码会轻松很多。
+  \item \cite{thrun2005probabilistic}：第 1 章与第 5--6 章，概率机器人视角下“定位—规划—控制”的统一框架。
+  \item Nav2 官方文档 \href{https://docs.nav2.org}{docs.nav2.org}：配置项、默认参数、行为树 XML 示例，工程落地时按图索骥。
+\end{itemize}
+
+
+\end{reading}

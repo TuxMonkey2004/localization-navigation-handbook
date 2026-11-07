@@ -1,0 +1,136 @@
+% ============================================================
+%  macros.tex —— 全书公共宏定义（由 Lead 维护，撰稿人请勿修改）
+%  使用前已加载：amsmath, amssymb, bm, booktabs, tikz, tcolorbox,
+%  listings, enumitem, pgfplots, hyperref, adforn
+% ============================================================
+
+% ---------- 数学快捷命令 ----------
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\SO}{\mathrm{SO}}
+\newcommand{\SE}{\mathrm{SE}}
+\newcommand{\so}{\mathfrak{so}}
+\newcommand{\se}{\mathfrak{se}}
+\newcommand{\norm}[1]{\left\lVert #1 \right\rVert}
+\newcommand{\abs}[1]{\left\lvert #1 \right\rvert}
+\newcommand{\diff}{\mathrm{d}}
+\newcommand{\E}{\mathbb{E}}
+\DeclareMathOperator{\tr}{tr}
+\DeclareMathOperator{\diag}{diag}
+\DeclareMathOperator{\Cov}{Cov}
+\DeclareMathOperator{\Var}{Var}
+\DeclareMathOperator*{\argmin}{arg\,min}
+\DeclareMathOperator*{\argmax}{arg\,max}
+\newcommand{\degree}{^\circ}
+\newcommand{\eg}{e.g.}
+\newcommand{\ie}{i.e.}
+
+% ---------- 本章导读（仿 ElegantBook introduction 样式）----------
+\newtcolorbox{introbox}{
+  enhanced,
+  breakable,
+  colback=structurecolor!7,
+  colframe=structurecolor,
+  boxrule=0pt,
+  toprule=0.8pt,
+  bottomrule=0.8pt,
+  sharp corners,
+  colbacktitle=structurecolor,
+  coltitle=white,
+  fonttitle=\bfseries,
+  title={本章导读},
+  attach boxed title to top center={yshift=-3mm,yshifttext=-1mm},
+  boxed title style={sharp corners, boxrule=0pt},
+  top=9pt, bottom=7pt, left=3mm, right=3mm,
+  before skip=10pt, after skip=10pt
+}
+\newcommand{\chapterintro}[1]{\begin{introbox}#1\end{introbox}}
+
+% ---------- 要点框 ----------
+\newtcolorbox{keybox}[1]{
+  enhanced,
+  breakable,
+  colback=structurecolor!4,
+  colframe=structurecolor!55,
+  fonttitle=\bfseries\small,
+  colbacktitle=structurecolor!12,
+  coltitle=structurecolor!80!black,
+  title={#1},
+  boxrule=0.5pt,
+  arc=1.5mm,
+  left=2mm, right=2mm, top=1.2mm, bottom=1.2mm,
+  before skip=6pt, after skip=6pt,
+  drop shadow={opacity=0.10}
+}
+
+% ---------- 伪代码环境 ----------
+\newtcolorbox{pseudobox}{
+  enhanced,
+  breakable,
+  colback=white,
+  colframe=black!25,
+  boxrule=0.5pt,
+  arc=1mm,
+  left=2mm, right=2mm, top=1.5mm, bottom=1.5mm,
+  drop shadow={opacity=0.08}
+}
+\newenvironment{pseudo}[1]{%
+  \begin{pseudobox}%
+  \noindent\textbf{\color{structurecolor}算法：}\textsf{#1}\par\vspace{1mm}%
+  \begin{enumerate}[label=\textbf{\arabic*.}, leftmargin=*, topsep=1pt, itemsep=0.5pt, parsep=0pt]%
+}{%
+  \end{enumerate}%
+  \end{pseudobox}%
+}
+
+% ---------- 章末练习（花饰标题，不写入目录）----------
+\renewenvironment{problemset}[1][\xchaptertitle~\exercisename]{%
+  \vspace*{10pt}%
+  \begin{center}%
+    \markright{#1}%
+    \textcolor{structurecolor}{\Large\bfseries
+      \adftripleflourishleft~#1~\adftripleflourishright}%
+  \end{center}%
+  \begin{enumerate}%
+}{%
+  \end{enumerate}%
+}
+
+% ---------- 本章小结（花饰标题）----------
+\newenvironment{summary}{%
+  \par\vspace*{12pt}%
+  \begin{center}%
+    \textcolor{structurecolor}{\Large\bfseries
+      \adftripleflourishleft~本章小结~\adftripleflourishright}%
+  \end{center}%
+  \vspace{-2pt}%
+  \noindent\ignorespaces
+}{%
+  \par\vspace*{4pt}%
+}
+
+% ---------- 延伸阅读（花饰标题）----------
+\newenvironment{reading}{%
+  \par\vspace*{10pt}%
+  \begin{center}%
+    \textcolor{structurecolor}{\large\bfseries
+      \adftripleflourishleft~延伸阅读~\adftripleflourishright}%
+  \end{center}%
+  \vspace{-2pt}%
+  \noindent\ignorespaces
+}{%
+  \par\vspace*{2pt}%
+}
+
+% ---------- 常用 TikZ 样式（可直接在图中使用）----------
+\tikzset{
+  block/.style   = {rectangle, rounded corners=2pt, draw=structurecolor,
+                    thick, fill=structurecolor!8, minimum height=8mm,
+                    minimum width=18mm, align=center, font=\small},
+  block2/.style  = {rectangle, rounded corners=2pt, draw=structurecolor!70,
+                    thick, fill=structurecolor!18, minimum height=8mm,
+                    minimum width=18mm, align=center, font=\small},
+  arrow/.style   = {-{Stealth[length=2mm]}, thick, draw=black!70},
+  darrow/.style  = {{Stealth[length=2mm]}-{Stealth[length=2mm]}, thick,
+                    draw=black!70},
+  label/.style   = {font=\footnotesize, inner sep=1pt},
+}

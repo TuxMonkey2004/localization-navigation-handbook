@@ -1,0 +1,426 @@
+﻿\chapter{里程计总论：相对定位的艺术}\label{ch:04-odom-intro}
+
+\chapterintro{从本章开始，我们正式进入「机器人如何知道自己在哪」这个核心问题。本章先不碰任何具体传感器，只建立一张地图：什么叫位姿，什么叫位姿递推，为什么里程计天然是「相对」的，它的误差为什么注定越积越大，以及我们该用什么指标评价它。学完本章，你应当能回答三个问题：里程计在整个定位系统里处于什么位置；为什么所有里程计都会漂移、漂移的数学形状是什么；为什么评价里程计要看相对误差而不是绝对误差。后六章分别是本章四种里程计来源的展开。}
+
+\section{为什么需要里程计}\label{sec:04-why}
+
+设想你在一间没有窗户的房间里闭着眼走路。你记得自己先向前迈了三步、再向右转九十度、又走了两步。凭这些「自己相对于自己的运动」，你能大致画出走过的轨迹，但你并不知道房间的绝对位置，也不知道自己的朝向与地理北方的夹角。更麻烦的是，每迈一步你都会有几厘米的估计误差，走得越久，累积的位置偏差越大。
+
+机器人的处境完全相同，只是它可以靠传感器把「迈了几步」测得更准。定位问题通常被拆成两个不同的问题：
+
+\begin{itemize}
+  \item \textbf{我在世界的哪里？}——需要地图或外部基准（GPS、已知信标、先验地图）。这类问题叫绝对定位，详见第~\ref{ch:10-global-loc}~章。
+  \item \textbf{我相对出发时动了多少？}——只需要传感器对自身运动的测量，连续、高频，不需要任何外部设施。这类问题叫相对定位，也就是本章的主角：里程计。
+\end{itemize}
+
+为什么不能只靠绝对定位？三个现实原因。其一是\textbf{频率不够}：GNSS 在室外通常只有 1--10\,Hz，而差速底盘的控制回路常常要 50--100\,Hz 的位姿反馈，用 1\,Hz 的位姿闭环，控制器在两个更新之间只能靠「猜」。其二是\textbf{室内不可用}：RoboMaster 赛场是典型室内环境，GNSS 信号被建筑强烈衰减甚至完全遮挡。其三是\textbf{绝对定位会失败}：基于地图的定位在长廊、对称场地、动态障碍物遮挡时会短时失效，而控制与规划不能因为定位模块「卡了一下」就停车。
+
+所以真实系统几乎总是「里程计 + 绝对定位修正」：里程计提供高频、平滑、局部一致的位姿，绝对定位（或 SLAM 后端、回环检测）以低频把它拉回全局正确的位置——里程计负责「连续」，绝对定位负责「不漂」。
+
+\begin{figure}[htbp]
+  \centering
+  \begin{tikzpicture}[node distance=7mm and 11mm]
+    \node[block] (s) {传感器\\编码器 / IMU\\激光 / 相机};
+    \node[block, right=of s] (o) {里程计\\位姿递推};
+    \node[block, right=of o] (tf) {TF 树\\odom$\to$base};
+    \node[block2, below=of o] (b) {后端优化\\回环检测};
+    \node[block2, below=of tf] (m) {map$\to$odom\\校正量};
+    \draw[-stealth, thick] (s) -- node[label, above] {增量} (o);
+    \draw[-stealth, thick] (o) -- node[label, above] {高频位姿} (tf);
+    \draw[-stealth, thick] (o) -- (b);
+    \draw[-stealth, thick] (b) -- (m);
+    \draw[-stealth, thick] (m) -- (tf);
+    \draw[-stealth, thick, dashed] (tf.north) to[out=90, in=90] (o.north);
+  \end{tikzpicture}
+  \caption{里程计在定位系统中的位置。里程计把传感器增量递推成高频位姿，直接发布 \texttt{odom}$\to$\texttt{base} 变换；后端优化低频地给出 \texttt{map}$\to$\texttt{odom} 的修正量，两者叠加才得到全局位姿。}
+  \label{fig:04-system}
+\end{figure}
+
+\section{位姿、绝对定位与相对定位}\label{sec:04-pose}
+
+先把最基础的对象说清楚。全书统一使用如下坐标系约定（见第~\ref{ch:02-math}~章）：世界系 $W$ 的 $z$ 轴向上（ENU 式），机体系 $B$ 与 IMU 系重合，重力 $\bm{g}=[0,0,-9.81]^{\top}$。
+
+\begin{definition}[位姿]
+机器人机体系 $B$ 在世界系 $W$ 中的\textbf{位姿}（pose）是一个二元组
+\begin{equation}
+  T_{WB} = \left(\bm{R}_{WB},\ {}^{W}\bm{p}_{B}\right),
+  \label{eq:04-pose}
+\end{equation}
+其中 $\bm{R}_{WB}\in SO(3)$ 是旋转矩阵，${}^{W}\bm{p}_{B}\in\mathbb{R}^{3}$ 是机体原点在世界系中的位置。它作用在任意一点上：
+\begin{equation}
+  {}^{W}\bm{q} = \bm{R}_{WB}\,{}^{B}\bm{q} + {}^{W}\bm{p}_{B}.
+  \label{eq:04-action}
+\end{equation}
+所有满足式~\eqref{eq:04-action} 的 $(\bm{R},\bm{p})$ 构成特殊欧氏群 $SE(3)$，即 $T_{WB}\in SE(3)$。
+\end{definition}
+
+\begin{definition}[绝对定位与相对定位]
+\textbf{绝对定位}（absolute localization）指估计机体在世界系 $W$ 中的位姿 $T_{WB}$，其结果是相对某个固定原点而言的；\textbf{相对定位}（relative localization）指只估计两个时刻之间的位姿差 $T_{k}^{-1}T_{k+1}$，其结果是相对自身历史而言的。
+\end{definition}
+
+\begin{definition}[里程计与位姿递推]
+\textbf{里程计}（odometry）是利用传感器测得的相邻时刻运动增量，从一个已知初始位姿出发，递推地累加出连续位姿序列的算法。把增量复合回历史位姿的过程称为\textbf{位姿递推}（pose propagation）：
+\begin{equation}
+  T_{k+1} = T_{k}\,\Delta T_{k},
+  \label{eq:04-propagation}
+\end{equation}
+其中 $\Delta T_{k}\in SE(3)$ 是第 $k$ 步的运动增量。
+\end{definition}
+
+递推式~\eqref{eq:04-propagation} 的合理性来自位姿复合。设 $T_{AB}$ 表示「从 $B$ 系到 $A$ 系」的变换，则连续复合满足
+\begin{equation}
+  T_{AC} = T_{AB}\,T_{BC}.
+  \label{eq:04-compose}
+\end{equation}
+把式~\eqref{eq:04-action} 代入验证：对任意点 ${}^{C}\bm{q}$，有
+\begin{align}
+  {}^{A}\bm{q}
+  &= \bm{R}_{AB}\left(\bm{R}_{BC}\,{}^{C}\bm{q} + {}^{B}\bm{p}_{C}\right) + {}^{A}\bm{p}_{B} \notag\\
+  &= \left(\bm{R}_{AB}\bm{R}_{BC}\right){}^{C}\bm{q}
+     + \left(\bm{R}_{AB}\,{}^{B}\bm{p}_{C} + {}^{A}\bm{p}_{B}\right).
+  \label{eq:04-compose-proof}
+\end{align}
+因此复合后的旋转与平移分别是
+\begin{equation}
+  \bm{R}_{AC} = \bm{R}_{AB}\bm{R}_{BC},
+  \qquad
+  {}^{A}\bm{p}_{C} = \bm{R}_{AB}\,{}^{B}\bm{p}_{C} + {}^{A}\bm{p}_{B}.
+\end{equation}
+逆变换同样可以逐项写出：在式~\eqref{eq:04-action} 两边左乘 $\bm{R}_{WB}^{\top}$，得
+\begin{equation}
+  {}^{B}\bm{q} = \bm{R}_{WB}^{\top}{}^{W}\bm{q} - \bm{R}_{WB}^{\top}{}^{W}\bm{p}_{B},
+\end{equation}
+即
+\begin{equation}
+  T_{BW} = \left(\bm{R}_{WB}^{\top},\ -\bm{R}_{WB}^{\top}\,{}^{W}\bm{p}_{B}\right).
+  \label{eq:04-inverse}
+\end{equation}
+注意式~\eqref{eq:04-inverse} 中平移不是简单取负，而是「转回本体系再取负」——新手最常见的错误之一。
+
+\section{位姿递推与指数映射}\label{sec:04-exp}
+
+里程计输出的原始量通常是速度或加速度。例如轮式底盘给出线速度 $v$ 与角速度 $\omega$，IMU 给出角速度与比力。要把「速度乘时间」变成一个位姿增量 $\Delta T_{k}\in SE(3)$，就需要指数映射。
+
+设第 $k$ 步内机体在本体系下的速度与角速度为常值，记为 $\bm{v}_{k},\bm{\omega}_{k}\in\mathbb{R}^{3}$，时间间隔 $\Delta t$。定义六维运动量
+\begin{equation}
+  \bm{\xi}_{k} = \begin{bmatrix} \bm{\rho}_{k} \\ \bm{\phi}_{k}\end{bmatrix}
+  = \begin{bmatrix} \bm{v}_{k}\Delta t \\ \bm{\omega}_{k}\Delta t\end{bmatrix}
+  \in\mathbb{R}^{6}.
+  \label{eq:04-xi}
+\end{equation}
+则位姿增量为指数映射
+\begin{equation}
+  \Delta T_{k} = \exp\left(\bm{\xi}_{k}^{\wedge}\right),
+  \qquad
+  \bm{\xi}^{\wedge} = \begin{bmatrix} \bm{\phi}^{\wedge} & \bm{\rho}\\ \bm{0}^{\top} & 0\end{bmatrix}.
+  \label{eq:04-exp-se3}
+\end{equation}
+下面把 $\exp$ 的每一块完整推出来。先定义反对称矩阵算子：对 $\bm{\omega}=[\omega_1,\omega_2,\omega_3]^{\top}$，
+\begin{equation}
+  \bm{\omega}^{\wedge} = \begin{bmatrix}
+    0 & -\omega_3 & \omega_2\\
+    \omega_3 & 0 & -\omega_1\\
+    -\omega_2 & \omega_1 & 0
+  \end{bmatrix},
+  \qquad
+  \bm{\omega}^{\wedge}\bm{x} = \bm{\omega}\times\bm{x}.
+  \label{eq:04-skew}
+\end{equation}
+它的关键性质是 $\bm{\omega}^{\wedge\top} = -\bm{\omega}^{\wedge}$（反对称）。
+
+\textbf{第一步：旋转矩阵的微分方程。}设机体以常值角速度 $\bm{\omega}$ 旋转，任意一个固连在机体上的向量 ${}^{B}\bm{q}$ 在世界系中的像为 ${}^{W}\bm{q}(t)=\bm{R}(t){}^{B}\bm{q}$。由于该向量在机体系中不变，有
+\begin{equation}
+  \dot{}^{W}\bm{q}(t) = \bm{R}(t)\left(\bm{\omega}\times{}^{B}\bm{q}\right)
+  = \bm{R}(t)\bm{\omega}^{\wedge}{}^{B}\bm{q}.
+\end{equation}
+另一方面直接对 ${}^{W}\bm{q}=\bm{R}\,{}^{B}\bm{q}$ 求导得 $\dot{}^{W}\bm{q}=\dot{\bm{R}}{}^{B}\bm{q}$。比较两式，并注意到 ${}^{B}\bm{q}$ 任意，得到
+\begin{equation}
+  \dot{\bm{R}} = \bm{R}\,\bm{\omega}^{\wedge}.
+  \label{eq:04-rdot}
+\end{equation}
+
+\textbf{第二步：把解写成级数。}常系数线性微分方程 \eqref{eq:04-rdot} 在初值 $\bm{R}(0)=\bm{I}$ 下的解可以用幂级数表示。把 $\bm{R}(t)=\sum_{n\ge 0}\frac{t^{n}}{n!}\bm{A}^{n}$ 代入式~\eqref{eq:04-rdot} 逐项求导（左端 $\sum \frac{t^{n-1}}{(n-1)!}\bm{A}^{n}$，右端 $\sum\frac{t^{n}}{n!}\bm{A}^{n}\bm{\omega}^{\wedge}$），比较 $t^{n}$ 的系数即知取 $\bm{A}=\bm{\omega}^{\wedge}$ 时逐项相等，因此
+\begin{equation}
+  \bm{R}(t) = \exp\left(t\bm{\omega}^{\wedge}\right)
+  = \sum_{n=0}^{\infty}\frac{t^{n}}{n!}\left(\bm{\omega}^{\wedge}\right)^{n}.
+  \label{eq:04-series}
+\end{equation}
+
+\textbf{第三步：化简级数。}令 $\bm{\phi}=\bm{\omega}t$，$\theta=\norm{\bm{\phi}}$，$\bm{u}=\bm{\phi}/\theta$（当 $\theta\ne0$）。先求单位轴幂次的闭式。取 $\bm{u}=\bm{e}_3=[0,0,1]^{\top}$，由式~\eqref{eq:04-skew} 直接算出
+\begin{equation}
+  \bm{e}_3^{\wedge} = \begin{bmatrix}0&-1&0\\1&0&0\\0&0&0\end{bmatrix},\qquad
+  \left(\bm{e}_3^{\wedge}\right)^{2} = \begin{bmatrix}-1&0&0\\0&-1&0\\0&0&0\end{bmatrix}
+  = \bm{e}_3\bm{e}_3^{\top} - \bm{I}.
+\end{equation}
+再用它算三次幂：
+\begin{equation}
+  \left(\bm{e}_3^{\wedge}\right)^{3}
+  = \left(\bm{e}_3^{\wedge}\right)^{2}\bm{e}_3^{\wedge}
+  = \begin{bmatrix}-1&0&0\\0&-1&0\\0&0&0\end{bmatrix}
+    \begin{bmatrix}0&-1&0\\1&0&0\\0&0&0\end{bmatrix}
+  = \begin{bmatrix}0&1&0\\-1&0&0\\0&0&0\end{bmatrix}
+  = -\bm{e}_3^{\wedge}.
+\end{equation}
+对任意单位轴 $\bm{u}$，存在旋转矩阵 $\bm{Q}$ 使 $\bm{u}=\bm{Q}\bm{e}_3$，而 $\bm{u}^{\wedge}=\bm{Q}\bm{e}_3^{\wedge}\bm{Q}^{\top}$，故上述两条关系在一般轴下同样成立：
+\begin{equation}
+  \left(\bm{u}^{\wedge}\right)^{2} = \bm{u}\bm{u}^{\top} - \bm{I},
+  \qquad
+  \left(\bm{u}^{\wedge}\right)^{3} = -\bm{u}^{\wedge}.
+  \label{eq:04-axis-powers}
+\end{equation}
+把式~\eqref{eq:04-axis-powers} 反复使用，任意整数次幂都可降到 $\bm{I}$、$\bm{u}^{\wedge}$、$(\bm{u}^{\wedge})^{2}$ 三档。代入式~\eqref{eq:04-series} 并按这三档重新分组（设 $\bm{\phi}=\theta\bm{u}$）：
+\begin{align}
+  \exp\left(\bm{\phi}^{\wedge}\right)
+  &= \bm{I}
+   + \left(\sum_{j=0}^{\infty}\frac{(-1)^{j}\theta^{2j+1}}{(2j+1)!}\right)\bm{u}^{\wedge}
+   + \left(\sum_{j=1}^{\infty}\frac{(-1)^{j+1}\theta^{2j}}{(2j)!}\right)\left(\bm{u}^{\wedge}\right)^{2} \notag\\
+  &= \bm{I} + \sin\theta\,\bm{u}^{\wedge}
+   + \left(1-\cos\theta\right)\left(\bm{u}^{\wedge}\right)^{2}.
+  \label{eq:04-rodrigues}
+\end{align}
+其中第一个括号正是 $\sin\theta$ 的泰勒级数，第二个括号是 $1-\cos\theta$ 的泰勒级数。式~\eqref{eq:04-rodrigues} 就是 \textbf{Rodrigues 公式}（李群指数映射的系统推导见 \cite{barfoot2017state,sola2017eskf}）。把 $\bm{u}^{\wedge}$ 与 $(\bm{u}^{\wedge})^{2}$ 按分量展开，令 $c=\cos\theta$、$s=\sin\theta$、$\bm{u}=[u_x,u_y,u_z]^{\top}$：
+\begin{equation}
+  \bm{R} = \begin{bmatrix}
+    c+u_x^{2}(1-c) & u_xu_y(1-c)-u_zs & u_xu_z(1-c)+u_ys\\
+    u_yu_x(1-c)+u_zs & c+u_y^{2}(1-c) & u_yu_z(1-c)-u_xs\\
+    u_zu_x(1-c)-u_ys & u_zu_y(1-c)+u_xs & c+u_z^{2}(1-c)
+  \end{bmatrix}.
+  \label{eq:04-rotmat}
+\end{equation}
+\textbf{第四步：小角度近似。}当 $\theta\to0$ 时，$\sin\theta=\theta-\theta^{3}/6+O(\theta^{5})$，$1-\cos\theta=\theta^{2}/2+O(\theta^{4})$，因此
+\begin{equation}
+  \exp\left(\bm{\phi}^{\wedge}\right)
+  = \bm{I} + \bm{\phi}^{\wedge} + \frac{1}{2}\left(\bm{\phi}^{\wedge}\right)^{2} + O(\theta^{3}),
+  \qquad
+  \bm{R}\approx\bm{I}+\bm{\phi}^{\wedge}\quad(\theta\ll1).
+  \label{eq:04-rot-approx}
+\end{equation}
+这就是「一帧内转角很小」时的线性化，它是后面所有滤波与优化推导的核心近似。
+
+\textbf{第五步：平移部分。}对 $SE(3)$ 的指数映射，把式~\eqref{eq:04-exp-se3} 写成块形式并求解微分方程。设 $T(t)=\exp(t\bm{\xi}^{\wedge})$，其块形式为
+\begin{equation}
+  T(t) = \begin{bmatrix}\bm{R}(t) & \bm{p}(t)\\ \bm{0}^{\top} & 1\end{bmatrix},
+\end{equation}
+两边对 $t$ 求导并利用 $T(t)$ 与 $\bm{\xi}^{\wedge}$ 交换，得到 $\dot{\bm{R}}=\bm{R}\bm{\phi}^{\wedge}$ 与 $\dot{\bm{p}}=\bm{R}\bm{\rho}$。第一式已由式~\eqref{eq:04-rodrigues} 解出。第二式两边积分：
+\begin{equation}
+  \bm{p}(t) = \int_{0}^{t}\bm{R}(s)\bm{\rho}\,\diff s
+  = \int_{0}^{t}\left[\bm{I} + \frac{\sin(s\theta)}{\theta}\bm{\phi}^{\wedge}
+  + \frac{1-\cos(s\theta)}{\theta^{2}}\left(\bm{\phi}^{\wedge}\right)^{2}\right]\bm{\rho}\,\diff s.
+\end{equation}
+逐项积分，注意 $\int_0^t\sin(s\theta)\,\diff s=(1-\cos(t\theta))/\theta$ 与 $\int_0^t(1-\cos(s\theta))\,\diff s=t-\sin(t\theta)/\theta$，并记 $t=1$（$\bm{\xi}$ 已包含时间），得到
+\begin{equation}
+  \bm{p} = \bm{J}\bm{\rho},\qquad
+  \bm{J} = \bm{I} + \frac{1-\cos\theta}{\theta^{2}}\bm{\phi}^{\wedge}
+  + \frac{\theta-\sin\theta}{\theta^{3}}\left(\bm{\phi}^{\wedge}\right)^{2}.
+  \label{eq:04-J}
+\end{equation}
+于是完整的 $SE(3)$ 指数映射为
+\begin{equation}
+  \exp\left(\bm{\xi}^{\wedge}\right)
+  = \begin{bmatrix}\exp\left(\bm{\phi}^{\wedge}\right) & \bm{J}\bm{\rho}\\ \bm{0}^{\top} & 1\end{bmatrix}.
+  \label{eq:04-exp-final}
+\end{equation}
+当 $\norm{\bm{\phi}}$ 很小时，$\bm{J}\approx\bm{I}$，式~\eqref{eq:04-exp-final} 退化为
+\begin{equation}
+  \Delta T \approx \begin{bmatrix}\bm{I}+\bm{\phi}^{\wedge} & \bm{\rho}\\ \bm{0}^{\top} & 1\end{bmatrix}
+  = \bm{I} + \bm{\xi}^{\wedge},
+  \label{eq:04-exp-small}
+\end{equation}
+这正好对上式~\eqref{eq:04-propagation} 的直觉：$\Delta\bm{R}\approx\bm{I}+\bm{\omega}^{\wedge}\Delta t$，$\Delta\bm{p}\approx\bm{v}\Delta t$。
+
+\begin{example}[一次增量到底转了多少]
+设 $\bm{\omega}=[0,0,1]^{\top}\,\mathrm{rad/s}$，$\Delta t=0.1\,\mathrm{s}$，则 $\bm{\phi}=[0,0,0.1]^{\top}$，$\theta=0.1\,\mathrm{rad}$，转轴 $\bm{u}=\bm{e}_3$。由式~\eqref{eq:04-rodrigues}，$\sin0.1=0.099833$，$\cos0.1=0.995004$，故
+\begin{equation}
+  \Delta\bm{R} = \begin{bmatrix}0.995004 & -0.099833 & 0\\ 0.099833 & 0.995004 & 0\\ 0&0&1\end{bmatrix}
+  \approx \begin{bmatrix}0.995 & -0.0998 & 0\\ 0.0998 & 0.995 & 0\\ 0&0&1\end{bmatrix},
+\end{equation}
+与一阶近似 $\bm{I}+0.1\bm{e}_3^{\wedge}$ 相比，对角元差约 $5\times10^{-6}$，在这个尺度上完全可以忽略。若同时有 $\bm{v}=[1,0,0]^{\top}\,\mathrm{m/s}$，则位移增量是 $\bm{J}\bm{\rho}\approx[0.1,0,0]^{\top}\,\mathrm{m}$，误差来自 $\bm{J}$ 的高阶项，量级约 $10^{-5}\,\mathrm{m}$。
+\end{example}
+
+\begin{keybox}{指数映射的三条实用结论}
+\begin{enumerate}
+  \item $\exp(\bm{\xi}^{\wedge})$ 把「本体系下的速度 $\times$ 时间」统一变成 $SE(3)$ 增量，旋转和平移可以一起处理；
+  \item 小角度时 $\exp(\bm{\phi}^{\wedge})\approx\bm{I}+\bm{\phi}^{\wedge}$，误差量级 $O(\theta^{2})$，一般 $\theta<0.1\,\mathrm{rad}$（约 $5.7\degree$）时工程上可接受；
+  \item 指数映射与矩阵乘法不可交换：$\exp(\bm{\xi}_1^{\wedge})\exp(\bm{\xi}_2^{\wedge})\ne\exp((\bm{\xi}_1+\bm{\xi}_2)^{\wedge})$。因此位姿递推必须做矩阵（或四元数）乘法，不能直接把增量相加。
+\end{enumerate}
+\end{keybox}
+
+\section{里程计的四种来源}\label{sec:04-sources}
+
+同一件事——估计本体的运动——可以用完全不同的物理量来测量。表~\ref{tab:04-sources} 给出四种主流方案的数量级对比。记住这张表比记住任何公式都有用：它决定了你在什么场景该信谁。
+
+\begin{table}[htbp]
+  \centering
+  \caption{四类里程计的数量级对比（典型值，随器件与场景变化）}
+  \label{tab:04-sources}
+  \small
+  \begin{tabular}{lcccc}
+    \toprule
+    来源 & 典型频率 & 直接观测量 & 相对精度（短期） & 主要失效场景 \\
+    \midrule
+    轮式编码器 & 50--100\,Hz & 轮转角 & 行程的 1--10\,\% & 打滑、悬空、地面沉降 \\
+    IMU & 100--1000\,Hz & 角速度、比力 & 姿态 0.1--1$\degree$，位置漂移极快 & 零偏、振动、温漂 \\
+    激光雷达 & 5--20\,Hz & 点云 & 行程的 0.1--1\,\% & 长廊、空旷、无结构 \\
+    视觉相机 & 20--60\,Hz & 图像 & 行程的 0.5--5\,\% & 弱纹理、强光、动态物体 \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+\textbf{轮式}（第~\ref{ch:05-wheel}~章）最便宜、频率最高、短时最稳，但它是「假设轮子不滑」的里程计：轮子一打滑，它测的就是轮子的转数而非车体的运动，误差立刻变成系统性偏差。\textbf{IMU}（第~\ref{ch:06-imu}~章）不依赖外部环境，短时角速度精度极高，是姿态估计的主力；但加速度要积分两次才得到位置，零偏误差随时间平方增长。\textbf{激光雷达}（第~\ref{ch:07-lidar-odom}~章）深度精度在厘米级，点云配准能给出很准的帧间位姿，是 FAST-LIO 系列的基础，代价是数据量大、对几何结构敏感。\textbf{视觉}（第~\ref{ch:08-visual-odom}~章）信息量最丰富，但受光照、纹理、动态物体影响，单目还有尺度不可观的问题。四种来源强弱互补，这正是第~\ref{ch:09-fusion}~章要讲的融合动机。
+
+\section{累积误差与漂移}\label{sec:04-drift}
+
+里程计最本质的缺陷是：它把每一步的误差都攒了下来。本节把这个「攒」字算清楚。
+
+\textbf{第一步：复习期望与方差。}（定义见第~\ref{ch:02-math}~章。）设 $X$ 是连续型随机变量，密度为 $p(x)$，则
+\begin{equation}
+  \E[X] = \int x\,p(x)\,\diff x,
+  \qquad
+  \Var(X) = \E\left[(X-\E[X])^{2}\right] = \E[X^{2}] - \left(\E[X]\right)^{2}.
+  \label{eq:04-var-def}
+\end{equation}
+方差衡量 $X$ 围绕均值的散布程度；它的平方根 $\sigma=\sqrt{\Var(X)}$ 叫标准差，与 $X$ 同量纲。
+
+\textbf{第二步：两个独立变量之和的方差。}由式~\eqref{eq:04-var-def}，
+\begin{align}
+  \Var(X+Y)
+  &= \E\left[(X+Y)^{2}\right] - \left(\E[X+Y]\right)^{2} \notag\\
+  &= \E[X^{2}]+2\E[XY]+\E[Y^{2}]
+     - \left(\E[X]^{2}+2\E[X]\E[Y]+\E[Y]^{2}\right) \notag\\
+  &= \left(\E[X^{2}]-\E[X]^{2}\right) + \left(\E[Y^{2}]-\E[Y]^{2}\right)
+     + 2\left(\E[XY]-\E[X]\E[Y]\right) \notag\\
+  &= \Var(X)+\Var(Y)+2\Cov(X,Y).
+  \label{eq:04-var-sum}
+\end{align}
+若 $X$ 与 $Y$ 独立，则 $\E[XY]=\E[X]\E[Y]$，协方差项为零，于是
+\begin{equation}
+  \Var(X+Y)=\Var(X)+\Var(Y).
+  \label{eq:04-var-independent}
+\end{equation}
+
+\textbf{第三步：$n$ 步的累积误差。}设第 $i$ 步的位置误差为 $\epsilon_i$，各步相互独立、同分布，均值为零、方差为 $\sigma^{2}$。$n$ 步后的总误差为 $E_n=\sum_{i=1}^{n}\epsilon_i$。对式~\eqref{eq:04-var-independent} 反复使用 $n-1$ 次（每加一项只用一次两变量结论），得
+\begin{equation}
+  \Var(E_n) = \sum_{i=1}^{n}\Var(\epsilon_i) = n\sigma^{2},
+  \qquad
+  \sigma_{n} = \sqrt{n}\,\sigma.
+  \label{eq:04-drift-var}
+\end{equation}
+这就是全书反复出现的\textbf{随机游走}（random walk）结论：误差的方差随步数线性增长，标准差随步数按 $\sqrt{n}$ 增长。
+
+\textbf{第四步：换成时间与距离。}设里程计频率为 $f=1/\Delta t$，运行时间 $t$，则 $n=ft$，于是 $\sigma(t)=\sigma\sqrt{f\,t}$：它不是随时间线性增长，而是随时间开方增长，这一点常常被误解。但如果每步误差有非零均值 $b$（称为\textbf{系统误差}或\textbf{零偏}），则
+\begin{equation}
+  \E[E_n] = \sum_{i=1}^{n}\E[\epsilon_i] = nb,
+  \label{eq:04-bias}
+\end{equation}
+偏差随时间线性增长，是比随机游走更危险的一类误差。真实里程计是两者叠加：随时间一长，系统误差必然主导。
+
+\begin{example}[一步一厘米，一百秒后差多少]
+设 $\Delta t=0.1\,\mathrm{s}$，每步位置误差标准差 $\sigma=0.01\,\mathrm{m}$，各步独立。运行 $t=100\,\mathrm{s}$ 共 $n=1000$ 步，则 $\sigma_n=\sqrt{1000}\times0.01\approx0.316\,\mathrm{m}$。若同样的误差里还藏着 $b=0.5\,\mathrm{mm}$ 的均值偏差，则 $1000$ 步后平均偏差是 $1000\times0.0005=0.5\,\mathrm{m}$，反而比随机部分更大。
+\end{example}
+
+\textbf{第五步：漂移率。}为了横向比较不同里程计，定义\textbf{漂移率}（drift rate）
+\begin{equation}
+  \rho_{\text{drift}} = \frac{\norm{\hat{\bm{p}}(t)-\bm{p}(t)}_{\text{RMS}}}{L(t)},
+  \label{eq:04-drift-rate}
+\end{equation}
+即位置误差的均方根除以累计行程 $L(t)$，常用百分数表示。轮式里程计典型值 1--10\,\%，激光/视觉 0.1--1\,\%。注意漂移率是「误差/距离」而不是「误差/时间」，因为大多数里程计误差主要来自走过的距离与转弯次数，而不是纯粹的时间。
+
+\begin{figure}[htbp]
+  \centering
+  \begin{tikzpicture}[x=1.15cm,y=0.9cm]
+    \draw[-stealth] (0,0) -- (5.2,0) node[right]{\footnotesize 时间 $t$};
+    \draw[-stealth] (0,0) -- (0,4.4) node[above]{\footnotesize 误差};
+    \draw[thick, red!60!black, domain=0:4.6, samples=40] plot (\x, {0.75*\x});
+    \draw[thick, structurecolor, domain=0:4.6, samples=40] plot (\x, {1.05*sqrt(\x)});
+    \node[font=\footnotesize, red!60!black] at (3.3,3.4) {系统误差 $\propto t$};
+    \node[font=\footnotesize, structurecolor] at (3.3,1.9) {随机误差 $\propto\sqrt{t}$};
+    \draw[dashed, black!40] (2,0) -- (2,1.05*1.414) -- (0,1.05*1.414);
+    \node[font=\footnotesize, below] at (2,0) {$2t_0$};
+    \node[font=\footnotesize, left] at (0,1.48) {$\sqrt{2}\,\sigma_0$};
+  \end{tikzpicture}
+  \caption{两类误差的增长形状。随机误差按 $\sqrt{t}$ 增长（蓝线），系统误差按 $t$ 线性增长（红线）。长时间运行后，系统的零偏一定是主要矛盾，这也是为什么所有里程计都需要外部修正。}
+  \label{fig:04-drift}
+\end{figure}
+
+\section{里程计的评价}\label{sec:04-eval}
+
+评价里程计不能用「我觉得挺准」这种描述，工程上使用两个标准指标（工具链见第~\ref{ch:28-evaluation}~章，这里只给定义）。
+
+\textbf{绝对轨迹误差 ATE。}设估计位姿序列为 $\{\hat{T}_i\}_{i=1}^{N}$，真值序列为 $\{T_i\}$。先求一个全局对齐变换 $\bm{S}\in SE(3)$（通常是第一帧对齐或 Umeyama 对齐，消除初始位姿的任意性），定义第 $i$ 个误差
+\begin{equation}
+  \bm{E}_i = T_i^{-1}\,\bm{S}\,\hat{T}_i \in SE(3).
+  \label{eq:04-ate-error}
+\end{equation}
+绝对轨迹误差（absolute trajectory error, ATE）定义为平移部分的均方根：
+\begin{equation}
+  \mathrm{ATE}_{\text{RMSE}} = \sqrt{\frac{1}{N}\sum_{i=1}^{N}\norm{\mathrm{trans}\left(\bm{E}_i\right)}^{2}},
+  \label{eq:04-ate}
+\end{equation}
+其中 $\mathrm{trans}(\cdot)$ 表示取 $SE(3)$ 的平移分量。
+
+\textbf{相对位姿误差 RPE。}ATE 会随着轨迹变长而系统性变大，不适合单独评价「里程计本身」。相对位姿误差（relative pose error, RPE）只比较固定间隔 $\Delta$ 内的相对运动：
+\begin{equation}
+  \bm{E}_i = \left(T_i^{-1}T_{i+\Delta}\right)^{-1}
+  \left(\hat{T}_i^{-1}\hat{T}_{i+\Delta}\right),
+  \label{eq:04-rpe-error}
+\end{equation}
+再对平移部分取 RMSE 得到 $\mathrm{RPE}_{\text{RMSE}}$；对旋转部分取 $\mathrm{SO}(3)$ 上的角度误差 RMSE 得到 $\mathrm{RPE}_{\text{rot}}$。
+
+为什么里程计要特别看 RPE？因为里程计的输出本来就是一系列相对增量，它没有全局原点；完美的里程计应当「任意两帧之间的相对变换都准」，式~\eqref{eq:04-rpe-error} 恰好把全局漂移消掉，只留下局部一致性。
+
+\begin{keybox}{ATE 与 RPE 的使用场景}
+\begin{itemize}
+  \item \textbf{ATE}：评价「整个系统」——把里程计 + 回环 + 后端作为一个黑箱，看最终轨迹与真值的偏离。SLAM 论文一般报 ATE。
+  \item \textbf{RPE}：评价「里程计本身」——只看局部相对运动，不受累计漂移干扰。调里程计参数（如 ICP 阈值、噪声协方差）时应多看 RPE。
+  \item 两者必须一起看：ATE 小可能是回环在「救场」，掩盖了里程计本身很差；RPE 小但 ATE 大，说明里程计准但存在未修正的长期漂移。
+\end{itemize}
+\end{keybox}
+
+\section{工程视角：里程计模块的输入输出}\label{sec:04-engineering}
+
+不管底层用哪种传感器，一个里程计节点在工程上的接口几乎是固定的：输入带时间戳的传感器测量与外参 $T_{SB}$，输出每个时刻的位姿 $T_{OB}$（$O$ 为里程计系，连续、无跳变）及协方差，并约定 $T_{OB}(t_0)=\bm{I}$。全局修正由 \texttt{map}$\to$\texttt{odom} 这个额外的变换承担，绝不直接改里程计输出——这样短期控制器拿到的位姿不会因为一次回环而突变。
+
+\begin{pseudo}{通用里程计递推循环}
+  \item 初始化：$T_{OB}\leftarrow\bm{I}$，$t\leftarrow t_0$
+  \item 当收到时间戳 $t_k$ 的测量 $\bm{z}_k$ 时：
+  \item \quad 计算时间间隔 $\Delta t\leftarrow t_k-t_{k-1}$
+  \item \quad 由 $\bm{z}_k$ 得到本体系速度估计 $(\hat{\bm{v}}_k,\hat{\bm{\omega}}_k)$
+  \item \quad 构造增量 $\bm{\xi}_k\leftarrow[\hat{\bm{v}}_k\Delta t;\ \hat{\bm{\omega}}_k\Delta t]$
+  \item \quad $T_{OB}\leftarrow T_{OB}\exp(\bm{\xi}_k^{\wedge})$
+  \item \quad 按式~\eqref{eq:04-drift-var} 同款逻辑传播协方差
+  \item \quad 发布 $T_{OB}$、协方差与 \texttt{odom}$\to$\texttt{base} 变换
+\end{pseudo}
+
+\begin{summary}
+
+\begin{enumerate}
+  \item 定位问题分为绝对定位与相对定位；里程计解决相对定位，特点是高频、连续、局部一致，但会累积漂移。
+  \item 位姿 $T_{WB}=(\bm{R}_{WB},{}^{W}\bm{p}_B)$ 属于 $SE(3)$；复合 $T_{AC}=T_{AB}T_{BC}$ 对应旋转相乘、平移按「先转再加」；逆变换的平移是 $-\bm{R}^{\top}\bm{p}$ 而不是 $-\bm{p}$。
+  \item 位姿递推是 $T_{k+1}=T_{k}\Delta T_k$，增量由指数映射给出：$\Delta T_k=\exp(\bm{\xi}_k^{\wedge})$；$\mathrm{SO}(3)$ 的闭式是 Rodrigues 公式 $\bm{R}=\bm{I}+\sin\theta\,\bm{u}^{\wedge}+(1-\cos\theta)(\bm{u}^{\wedge})^{2}$，小角度时 $\bm{R}\approx\bm{I}+\bm{\phi}^{\wedge}$。
+  \item $SE(3)$ 指数映射为 $\exp(\bm{\xi}^{\wedge})=[\exp(\bm{\phi}^{\wedge}),\bm{J}\bm{\rho};\bm{0}^{\top},1]$，其中 $\bm{J}$ 由式~\eqref{eq:04-J} 给出，小角度时 $\bm{J}\approx\bm{I}$。
+  \item 四种里程计来源各有短长：轮式便宜但怕打滑，IMU 高频但位置漂移快，激光/视觉几何精度高但怕退化与光照。
+  \item 独立同分布误差的方差相加：$\Var(\sum\epsilon_i)=n\sigma^{2}$，标准差按 $\sqrt{n}$ 增长；有零偏时均值按 $n$ 线性增长，长时间后前者必被后者超过。
+  \item 评价里程计用 ATE 与 RPE，前者看整体、后者看局部一致性；工程上里程计输出接在 \texttt{odom}$\to$\texttt{base}，全局修正接在 \texttt{map}$\to$\texttt{odom}。
+\end{enumerate}
+
+
+\end{summary}
+
+\begin{problemset}
+
+  \item 设初始位姿 $T_{WB}=(\bm{R}_{WB},{}^{W}\bm{p}_B)$，验证式~\eqref{eq:04-compose} 的逆变换为 $T_{BW}=(\bm{R}_{WB}^{\top},-\bm{R}_{WB}^{\top}{}^{W}\bm{p}_B)$，并用一个具体的二维例子（$\bm{R}$ 为 $90\degree$ 旋转，${}^{W}\bm{p}_B=[1,0,0]^{\top}$）算一遍。
+  \item 用 Rodrigues 公式计算 $\bm{\omega}=[0,0,\pi/2]^{\top}\,\mathrm{rad/s}$、$\Delta t=1\,\mathrm{s}$ 时的 $\Delta\bm{R}$，并与 $\bm{I}+\bm{\phi}^{\wedge}$ 比较误差的量级。
+  \item 证明：若每步误差独立且标准差为 $\sigma$，走 $n$ 步后的位置标准差为 $\sigma\sqrt{n}$；若每步误差都带同样大小的均值 $b$，则期望误差为 $nb$。当 $n$ 从 $10^{2}$ 增到 $10^{4}$ 时，两者比例如何变化？
+  \item 某轮式里程计在 $10\,\mathrm{m}$ 直线行程中位置误差 $0.3\,\mathrm{m}$，在 $50\,\mathrm{m}$ 行程中位置误差 $1.2\,\mathrm{m}$。分别计算漂移率，并判断误差更像随机游走还是系统偏差。
+  \item 一个团队报告「ATE 为 $0.05\,\mathrm{m}$，RPE 为 $0.4\,\mathrm{m}$」，请你解释这组数字可能意味着什么，以及应当先排查哪个模块。
+\end{problemset}
+
+\begin{reading}
+
+\begin{itemize}
+  \item Sola 的 ESKF 教程（\href{https://arxiv.org/abs/1711.02508}{arXiv:1711.02508}）：$SO(3)/SE(3)$ 求导与误差状态。
+  \item Barfoot《State Estimation for Robotics》（\href{https://books.google.com/books?id=jfZFDwAAQBAJ}{Cambridge, 2017}）：李群上的估计理论。
+\end{itemize}
+
+
+\end{reading}

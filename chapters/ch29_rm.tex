@@ -1,0 +1,174 @@
+\chapter{RoboMaster 场景实践建议}\label{ch:29-rm}
+\usetikzlibrary{arrows.meta}
+
+\chapterintro{前面各章讲的是"通用技术"，本章只回答一个问题：\textbf{在自己的车上、自己的场地里该怎么选、怎么装、怎么验}。RM 赛场有几个和实验室完全不同的约束：场地对称、动态目标多、弹丸与撞击干扰传感器、算力与功耗被严格限制、比赛期间没有时间调参。因此本章写成一份"实战清单"——方案选型表、各兵种需求对比、坐标系与标定清单、上车检查表、备赛流程与验收标准、以及几个最容易踩的坑。它不展开成比赛教程，只给你决策时需要的判断依据。}
+
+\section{赛场环境特点}\label{sec:29-env}
+
+以近年 $28\,\mathrm{m}\times15\,\mathrm{m}$ 的标准场地为例，定位系统要面对的环境特征有六条：
+
+\begin{enumerate}
+  \item \textbf{高度对称}。场地两侧结构几乎镜像，中央高地、环形通道、基地位置对称。对全局定位（先验地图匹配）来说这是"歧义源"：局部特征几乎一样，容易匹配到镜像位置。
+  \item \textbf{动态障碍多}。对方机器人（$3$--$4$\,m/s）、己方队友、飞舞的弹丸都在点云里。弹丸对激光雷达是"瞬时噪声"，对视觉是"遮挡+光斑"。
+  \item \textbf{结构重复且低矮}。围栏、装甲板、基地支架都是同一种几何，垂直方向的纹理少，容易出现"走廊式退化"。
+  \item \textbf{光照变化剧烈}。顶灯、装甲板 LED、能量机关的强光、以及比赛期间的明暗切换，对相机是灾难，对激光雷达影响小。
+  \item \textbf{地面材质与平整度}。场地地胶、坡道、上下坡的过渡区域会让轮式里程计打滑。
+  \item \textbf{观众与人员干扰}。场边走动的人会被 VIO 当成运动目标，也曾出现过观众入场导致的定位跳变。
+\end{enumerate}
+
+这些特征直接决定了技术选型：\textbf{以 3D 激光惯性里程计为主，用先验地图做全局校正，用 UWB 做兜底}，而不是反过来。
+
+\section{定位方案选型}\label{sec:29-scheme}
+
+\begin{table}[htbp]
+  \centering
+  \caption{定位方案对比（按 RM 场景的实际表现）}\label{tab:29-scheme}
+  \footnotesize
+  \begin{tabular}{p{2.6cm}p{4.4cm}p{4.6cm}p{2.4cm}}
+    \toprule
+    方案 & 优点 & 主要风险 & 建议 \\
+    \midrule
+    3D LIO（FAST-LIO2 / Point-LIO） & 精度 2--5\,cm，不依赖场地改造，输出频率高 & 退化场景（长走廊、空旷区）漂移；动态目标进地图 & 主方案，必装 \\
+    先验地图 + 全局定位 & 消除累积漂移，冷启动可重定位 & 地图过期、场地布置变化、对称场景误匹配 & 主方案，每场前更新地图 \\
+    UWB & 全局绝对、无累积误差、可跨区 & 多径、金属反射、非视距、安装基站耗时 & 辅助与兜底 \\
+    雷达站全局感知 & 上帝视角，可给全队共享位置 & 标定复杂、通信延迟、遮挡 & 有条件就上 \\
+    轮式 + IMU 航迹推算 & 便宜、连续、不受视觉影响 & 打滑、累积漂移快 & 只作为短时补充 \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+选型的原则是\textbf{异构冗余}：激光退化时靠 UWB 兜底，UWB 跳变时靠激光与先验地图压住，先验地图失效时至少还有连续里程计能让车停下来而不是撞墙。表~\ref{tab:29-scheme} 中任何单一方案都不足以支撑一场比赛。
+
+\section{哨兵、步兵与雷达站的差异}\label{sec:29-platform}
+
+三个兵种对定位系统的需求完全不同（表~\ref{tab:29-platform}），用同一套参数配置是常见错误。
+
+\begin{table}[htbp]
+  \centering
+  \caption{三个兵种的定位需求对比}\label{tab:29-platform}
+  \footnotesize
+  \begin{tabular}{p{2.0cm}p{3.2cm}p{3.2cm}p{3.2cm}}
+    \toprule
+    维度 & 哨兵 & 步兵 & 雷达站 \\
+    \midrule
+    平台 & 悬挂/滑轨，云台可 $360\degree$ 转 & 全向底盘，可冲坡 & 静止，可升降 \\
+    速度 & 平移 2--3\,m/s & 冲刺 4\,m/s 以上 & 0 \\
+    算力预算 & 高（Jetson 级） & 中（受限功耗） & 最高（可上台式机） \\
+    动态性 & 云台转动使雷达视角变化 & 最剧烈：撞击、跳跃、急停 & 几乎静止 \\
+    定位重点 & 底盘稳定 + 云台姿态解耦 & 高速下短时精度与抗打滑 & 全局精度与多目标跟踪 \\
+    关键风险 & 云台转动导致 TF 抖动 & 碰撞使 IMU 饱和 & 与车载机的通信延迟 \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+具体到实现：
+
+\begin{itemize}
+  \item \textbf{哨兵}：云台与底盘必须解耦。底盘定位用 \lstinline{map}$\to$\lstinline{odom}$\to$\lstinline{base\_link}，云台角由编码器反馈单独发布，不要试图用雷达去估计云台角（云台转动时雷达点云在动，容易被误当成底盘在转）。
+  \item \textbf{步兵}：撞击与急停会让 IMU 瞬时超量程。Point-LIO 的 \lstinline{imu_satu_en} 与合理的零偏随机游走参数是必备的；同时要限制单帧修正量，避免定位跳变导致规划器输出暴力动作。
+  \item \textbf{雷达站}：几乎静止，重点在全局精度与多目标跟踪，而不是高频里程计。可以把算力全部投给全局匹配与多机器人状态估计，并把结果通过低延迟链路广播给队友。
+\end{itemize}
+
+\section{坐标系与标定清单}\label{sec:29-frames}
+
+\begin{figure}[htbp]
+  \centering
+  \begin{tikzpicture}[
+      frame/.style={rectangle, rounded corners=2pt, draw=structurecolor, thick,
+        fill=structurecolor!8, minimum height=7mm, minimum width=19mm, font=\small},
+      lab/.style={font=\footnotesize, inner sep=1.5pt, draw=black!60, rounded corners=1pt,
+        fill=white},
+      arr/.style={-{Stealth[length=2mm]}, thick, draw=black!70}
+    ]
+    \node[frame] (map) at (0,0) {map};
+    \node[frame] (odom) at (3.4,0) {odom};
+    \node[frame] (base) at (6.8,0) {base\_link};
+    \node[frame] (gim) at (10.2,0) {gimbal};
+    \node[frame] (lidar) at (13.4,0.9) {lidar};
+    \node[frame] (cam) at (13.4,-0.9) {camera};
+    \node[frame, text width=20mm] (chassis) at (6.8,-1.9) {轮式/IMU};
+    \draw[arr] (map) -- node[above=1pt,lab]{全局定位} (odom);
+    \draw[arr] (odom) -- node[above=1pt,lab]{LIO} (base);
+    \draw[arr] (base) -- node[above=1pt,lab]{云台反馈} (gim);
+    \draw[arr] (gim) -- node[above=1pt,lab]{外参} (lidar);
+    \draw[arr] (gim) -- node[below=1pt,lab]{外参} (cam);
+    \draw[arr] (chassis) -- node[right=1pt,lab]{里程计} (base);
+  \end{tikzpicture}
+  \caption{RM 机器人的坐标系与模块关系。注意云台是独立的一节：底盘到云台由编码器反馈，云台到传感器是标定出的常数外参。}\label{fig:29-frames}
+\end{figure}
+
+标定顺序必须是"从底盘往外扩"：\textbf{底盘 $\to$ 雷达 $\to$ 云台 $\to$ 相机内参 $\to$ 云台-相机外参 $\to$ UWB 坐标系}。每一环都依赖上一环，跳步会导致误差叠加且难以定位。
+
+\begin{keybox}{上车检查表（10 条，每次上车都过一遍）}
+\begin{enumerate}
+  \item IMU 静止 60\,s，重力模长 $9.81\pm0.1$\,m/s$^2$，三轴零偏稳定。
+  \item 正前方 5\,m 放箱子，点云坐标 $x\approx5$、$y\approx0$、$z\approx0$，误差 $<5$\,cm。
+  \item \lstinline{tf2_tools view_frames} 无断链，\lstinline{map}$\to$\lstinline{odom} 与 \lstinline{odom}$\to$\lstinline{base\_link} 的发布频率正常。
+  \item 点云与 IMU 时间戳差值 $<5$\,ms（回放 bag 时检查）。
+  \item 静止叠加 20 帧，墙厚 $<2$\,cm。
+  \item 云台零位与底盘前向一致，偏差 $<0.5\degree$；转一圈云台后底盘位姿不跳。
+  \item UWB 标定点与实际坐标一致，静态抖动 $<10$\,cm。
+  \item 先验地图与当前场地一致（对照场地尺寸与标志物）。
+  \item 冷启动重定位：10 次至少 9 次成功，耗时 $<10$\,s。
+  \item 连续运行 30\,min，无内存持续增长、无 TF 超时、无频率下降。
+\end{enumerate}
+\end{keybox}
+
+\section{备赛流程与验收标准}\label{sec:29-process}
+
+备赛是一条流水线，每一步都有可验收的输出，没通过就不要进下一步。
+
+\begin{table}[htbp]
+  \centering
+  \caption{备赛流程与验收标准}\label{tab:29-process}
+  \footnotesize
+  \begin{tabular}{p{2.4cm}p{5.6cm}p{5.6cm}}
+    \toprule
+    阶段 & 要做的事 & 验收标准 \\
+    \midrule
+    建图 & 场地空场时多圈扫描，含高地、坡道、边界 & 回环闭合误差 $<10$\,cm，无明显重影 \\
+    地图清理 & 去掉动态物体、修复空洞、统一分辨率 & 地图文件可被定位节点加载且帧率达标 \\
+    先验地图包 & 建立 \lstinline{map} 与场地坐标系的对齐 & 标定点误差 $<5$\,cm \\
+    定位验证 & 静置、慢走、快跑、旋转四组测试 & 位置误差 $<10$\,cm，姿态 $<1\degree$ \\
+    导航联调 & 与规划、控制、行为树联跑 & 10 次导航任务全部到达，无碰撞 \\
+    压力测试 & 连续 1\,h、撞击、遮挡、对手干扰 & 不崩、不持续漂移、可自动恢复 \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+\section{常见坑}\label{sec:29-pitfalls}
+
+\begin{itemize}
+  \item \textbf{动态残影}：对手机器人被写进先验地图，之后每次定位都在"幻影"附近拉扯。建图时必须保证场地无人，或事后人工清理动态区域。
+  \item \textbf{地图过期}：场地布置（基地、能量机关、围栏位置）每场都可能改。带着上一场的地图下场，重定位会稳定地匹配到错误位置——而且"看起来很稳定"，最难发现。
+  \item \textbf{UWB 多径}：金属结构、装甲板、地面反射会产生非视距测量，表现为偶发的几十厘米跳变。要加抗差（Huber/卡方检验）并做限幅融合，不要直接当观测用。
+  \item \textbf{对称导致的误重定位}：场地镜像结构使全局匹配出现双解。解决办法是用不对称特征（基地、飞镖架、观众席）做优先级加权，或把上一帧位置作为先验。
+  \item \textbf{算力不足}：哨兵/步兵上同时跑 LIO、导航、视觉识别，CPU 一满，LIO 首先掉帧。要在集成阶段就做资源预算，而不是比赛前才发现。
+  \item \textbf{云台转动被误当成底盘运动}：雷达装在云台上时必须用云台角做补偿，否则底盘定位会被云台转动"带偏"。
+  \item \textbf{弹丸与撞击}：弹丸命中雷达或车体会造成瞬时点云爆点、IMU 饱和。要有饱和检测与单帧异常剔除。
+\end{itemize}
+
+\begin{summary}
+
+\begin{enumerate}
+  \item RM 赛场的关键约束：高度对称、动态障碍多、光照剧变、算力受限、比赛期无法调参；这些决定了必须做异构冗余而不是押注单一方案。
+  \item 推荐方案：3D LIO 为主、先验地图全局定位校正、UWB 兜底、雷达站有条件就上；轮式只作短时补充。
+  \item 哨兵、步兵、雷达站的算力、动态性与风险差异很大，不能共用一套参数；哨兵的核心是云台与底盘解耦。
+  \item 标定顺序从底盘往外扩：底盘 $\to$ 雷达 $\to$ 云台 $\to$ 相机内参 $\to$ 云台-相机 $\to$ UWB；上车前按 10 条检查表逐项确认。
+  \item 备赛分六步走（建图 $\to$ 清理 $\to$ 地图包 $\to$ 定位验证 $\to$ 导航联调 $\to$ 压力测试），每步都有量化验收标准。
+  \item 最容易踩的坑：动态残影、地图过期、UWB 多径、对称误匹配、算力不足、云台转动干扰、弹丸撞击。
+\end{enumerate}
+
+
+\end{summary}
+
+\begin{reading}
+
+\begin{itemize}
+  \item 第~\ref{ch:23-zlocalization} 章的 Z-Localization 深度解析与官方仓库 \cite{zloc2026}：先验地图定位在 RM 场景的完整工程实现，本章"方案选型"里"先验地图 + 全局定位"一栏就是它。
+  \item 第~\ref{ch:22-nav2-practice} 章的完整链路实战：建图到导航联调的具体操作，本章的验收标准可以在那里逐项执行。
+  \item 第~\ref{ch:17-advanced-lio} 章：FAST-LIO2 与 Point-LIO 的内部机制，理解它们才能判断"退化场景该加什么约束"。
+\end{itemize}
+
+
+\end{reading}

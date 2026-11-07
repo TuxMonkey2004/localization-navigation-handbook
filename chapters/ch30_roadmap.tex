@@ -1,0 +1,195 @@
+\chapter{学习路线与资源清单}\label{ch:30-roadmap}
+
+\chapterintro{这本书很厚，没人能一周读完。更现实的问题是：一个刚进组的新队员，应该按什么顺序读、读到哪里算"够用"、什么时候该去碰真代码。本章给出四条时间尺度的路线（0--1 月、1--3 月、3--6 月、6--12 月），每条都配"读哪几章、跑哪份代码、做成什么事、怎么算过关"；然后给出开源代码的阅读顺序与每份代码"先看哪个文件"；最后是书单、工具链与实践建议。这一章不是知识，是路线图——它可以被反复翻，每次看都能确认自己走到了哪。}
+
+\section{分阶段路线}\label{sec:30-stages}
+
+\subsection{第 0--1 月：把环境与概念立起来}
+
+目标不是"懂 SLAM"，而是\textbf{能独立编译、跑通、录包、看数据}。
+
+\begin{table}[htbp]
+  \centering
+  \caption{第 0--1 月：环境与概念}\label{tab:30-s1}
+  \small
+  \begin{tabular}{lp{3.4cm}p{3.6cm}p{3.6cm}}
+    \toprule
+    项 & 内容 & 验收标准 \\
+    \midrule
+    读书 & 第~\ref{ch:01-overview}、\ref{ch:02-math}、\ref{ch:03-sensors} 章 & 能画出定位/建图/导航的整体框图 \\
+    概念 & 里程计、SLAM、TF、QoS、外参 & 能口头解释每个词解决什么问题 \\
+    环境 & Ubuntu + ROS 2 + 编译工具链 & 独立从零装好并跑通 demo \\
+    代码 & 跑通 FAST-LIO2 的示例 bag & 能录自己的 bag 并回放 \\
+    工具 & \lstinline{ros2 topic/tf2/bag}、RViz2 & 能查出"数据没来"是哪一环 \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+这个月最容易走的弯路是"一开始就啃公式"。先让数据在屏幕上动起来，再回头看公式，效率高得多。
+
+\subsection{第 1--3 月：里程计与 IMU}
+
+\begin{table}[htbp]
+  \centering
+  \caption{第 1--3 月：里程计、IMU 与 LIO 入门}\label{tab:30-s2}
+  \small
+  \begin{tabular}{lp{3.4cm}p{3.6cm}p{3.6cm}}
+    \toprule
+    项 & 内容 & 验收标准 \\
+    \midrule
+    读书 & 第~\ref{ch:04-odom-intro}--\ref{ch:07-lidar-odom} 章、第~\ref{ch:16-lio-evolution} 章 & 能推导位姿递推与 ICP 残差 \\
+    理论 & 四元数、ESKF、预积分、扫描匹配 & 能手推一维卡尔曼更新 \\
+    代码 & KISS-ICP、FAST-LIO2 & 能改一行代码并解释影响 \\
+    实验 & 同一段 bag 上比较轮式/激光/IMU 轨迹 & 能画出三条轨迹与误差 \\
+    标定 & 第~\ref{ch:26-calibration} 章的 IMU 与外参部分 & 独立完成一次 IMU 零偏与 Allan 分析 \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+\subsection{第 3--6 月：SLAM 与导航}
+
+\begin{table}[htbp]
+  \centering
+  \caption{第 3--6 月：SLAM 后端与导航链路}\label{tab:30-s3}
+  \small
+  \begin{tabular}{lp{3.4cm}p{3.6cm}p{3.6cm}}
+    \toprule
+    项 & 内容 & 验收标准 \\
+    \midrule
+    读书 & 第~\ref{ch:11-slam-framework}--\ref{ch:17-advanced-lio} 章 & 能解释前端/后端/回环各管什么 \\
+    读书 & 第~\ref{ch:18-nav-overview}--\ref{ch:23-zlocalization} 章 & 能画出 Nav2 的节点与数据流 \\
+    代码 & Cartographer、Point-LIO & 读懂 \lstinline{submap} 与逐点更新 \\
+    实验 & 建图 $\to$ 保存 $\to$ 定位 $\to$ 导航全链路 & 让车在自己建的地图上走完一条路径 \\
+    工程 & 第~\ref{ch:25-ros2}、\ref{ch:27-tuning} 章 & 能独立排掉一次"定位跳变" \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+\subsection{第 6--12 月：工程化与独立思考}
+
+\begin{table}[htbp]
+  \centering
+  \caption{第 6--12 月：工程化、评测与改进}\label{tab:30-s4}
+  \small
+  \begin{tabular}{lp{3.4cm}p{3.6cm}p{3.6cm}}
+    \toprule
+    项 & 内容 & 验收标准 \\
+    \midrule
+    读书 & 第~\ref{ch:24-frontier}、\ref{ch:28-evaluation} 章与本书全部 & 能判断一篇新论文值不值得跟进 \\
+    评测 & evo、ATE/RPE、消融实验 & 能设计并执行一次可复现对比 \\
+    改进 & 在某个模块上做一处真实改进 & 公开数据集上指标提升且可复现 \\
+    落地 & 第~\ref{ch:29-rm} 章的清单 & 在实车上稳定运行一整场比赛 \\
+    输出 & 写文档、做分享 & 能把一个模块讲给新队员听懂 \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+\section{代码阅读顺序}\label{sec:30-code}
+
+读代码的顺序应该\textbf{由简到繁}，每份代码只读它的"核心那几百行"。表~\ref{tab:30-code} 给出建议。
+
+\begin{table}[htbp]
+  \centering
+  \caption{开源代码阅读顺序与入口文件}\label{tab:30-code}
+  \footnotesize
+  \begin{tabular}{p{2.5cm}p{4.4cm}p{6.6cm}}
+    \toprule
+    顺序 & 仓库 & 先看什么 \\
+    \midrule
+    1 & KISS-ICP \cite{vizzo2023kissicp} & \lstinline{src/kiss_icp} 的配准与自适应阈值；这是最小可用的激光里程计，一天能读完 \\
+    2 & FAST-LIO2 \cite{xu2022fastlio2} & \lstinline{include/ikd-Tree} 与 \lstinline{src/laserMapping.cpp}：先看"点如何进地图"，再看 IEKF 迭代 \\
+    3 & Point-LIO \cite{he2023pointlio} & 逐点更新的主循环与 IMU 饱和处理，理解"为什么它能扛高动态" \\
+    4 & Cartographer \cite{hess2016cartographer} & \lstinline{cartographer/mapping} 下的 \lstinline{submap} 与 \lstinline{constraint_builder}：分支定界回环 \\
+    5 & Nav2 \cite{macenski2020nav2} & 从 \lstinline{bt_navigator} 的行为树 XML 入口，依次看 planner 与 controller 插件接口 \\
+    6 & Z-Localization \cite{zloc2026} & 先验地图定位的完整工程：从地图加载、全局匹配到 \lstinline{map}$\to$\lstinline{odom} 修正 \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+读代码的三个技巧：
+
+\begin{enumerate}
+  \item \textbf{先画数据流，再读函数}。每个仓库先写出"输入话题 $\to$ 主要处理函数 $\to$ 输出话题"，再挑中间最核心的一个函数精读。上来从 \lstinline{main} 一行行读到底，必然迷路。
+  \item \textbf{带着问题读}。"它的地图怎么存？""重定位失败会怎样？""时间戳在哪里对齐？"带着三个具体问题去读，比通读效率高一个量级。
+  \item \textbf{改一行，跑一遍}。把降采样体素改大一倍，看轨迹怎么变；把迭代次数改成 1，看什么时候炸。动手是最快的理解方式。
+\end{enumerate}
+
+\section{书、课程与文档}\label{sec:30-books}
+
+\begin{itemize}
+  \item \textbf{概率机器人}：Thrun 等的 \emph{Probabilistic Robotics} \cite{thrun2005probabilistic}。定位与 SLAM 的概率视角经典，重点读第 2、3、6、7、8 章，配合第~\ref{ch:02-math} 章。
+  \item \textbf{状态估计}：Barfoot 的 \emph{State Estimation for Robotics} \cite{barfoot2017state}。李群、SE(3) 上的估计讲得最系统，是读懂 FAST-LIO 的钥匙。
+  \item \textbf{ESKF 手册}：Sola 的 \emph{Quaternion Kinematics for the Error-State Kalman Filter} \cite{sola2017eskf}。免费且短，建议打印精读。
+  \item \textbf{视觉 SLAM}：高翔等的《视觉 SLAM 十四讲》。若要做视觉/视觉惯性，这是中文最好的入门书。
+  \item \textbf{课程}：深蓝学院的多传感器融合定位、激光 SLAM 课程体系完整，作业即代码；Coursera 的 Robotics 专项适合补基础。
+  \item \textbf{文档}：ROS 2 官方文档、Nav2 文档、各仓库 README 与 issue 区。\textbf{issue 区是被低估的教材}——你能想到的问题，九成已经有人问过并得到了作者解释。
+\end{itemize}
+
+\section{工具链清单}\label{sec:30-tools}
+
+\begin{table}[htbp]
+  \centering
+  \caption{定位与建图常用工具链}\label{tab:30-tools}
+  \small
+  \begin{tabular}{llp{6.4cm}}
+    \toprule
+    类别 & 工具 & 用在哪 \\
+    \midrule
+    系统 & Ubuntu 22.04、ROS 2 Humble & 全部工程 \\
+    语言 & C++17、Python 3 & 算法与脚本 \\
+    数学 & Eigen、Sophus & 矩阵、李群 \\
+    点云 & PCL、Open3D & 点云处理与可视化 \\
+    优化 & Ceres Solver、GTSAM & 后端与标定 \\
+    视觉 & OpenCV、Kalibr & 内参与相机-IMU 标定 \\
+    可视化 & RViz2、Foxglove、CloudCompare & 调试与地图检查 \\
+    评测 & evo & ATE/RPE 与轨迹对比 \\
+    录包 & \lstinline{ros2 bag}（mcap） & 数据采集与复现 \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+\section{给新队员的 10 条建议}\label{sec:30-advice}
+
+\begin{enumerate}
+  \item \textbf{先跑通，再改代码}。跑不通的东西，读再多论文也没用。
+  \item \textbf{先看数据，再看代码}。点云长什么样、时间戳差多少、TF 对不对，比读实现更快定位问题。
+  \item \textbf{记录每一次实验}。参数、指标、现象三列，坚持三个月你就比同龄人快一倍。
+  \item \textbf{学会看 TF}。定位问题里有一半最终能追溯到某条 TF 断链或方向反了。
+  \item \textbf{重视标定}。外参与时间戳是"调不回来"的误差，第~\ref{ch:26-calibration} 章请至少精读一遍。
+  \item \textbf{从失败案例学习}。录下"炸掉"的那段数据，比录十段成功数据更有价值。
+  \item \textbf{多读 issue 与提交历史}。作者的修复往往比文档更接近真相。
+  \item \textbf{一次只改一个变量}。无论调参还是做实验，这条纪律都成立。
+  \item \textbf{写文档}。能写清楚一个模块，说明你真的懂了；这也是团队里最稀缺的能力。
+  \item \textbf{不要怕数学，但要按需学}。遇到不懂的公式，先解决眼前问题，再回头补推导。
+\end{enumerate}
+
+\section{结语}\label{sec:30-end}
+
+写到这里，全书的主线其实只有一句话：\textbf{定位是"用带噪声的观测去估计一个不确定的位姿，并承认它有多不确定"}。里程计篇讲如何递推，SLAM 篇讲如何用历史约束修正，导航篇讲如何用这个位姿去做决策，工程篇讲如何让它在一台真实的车上稳定运行。四条线索在最后一章汇合——你会发现，前面觉得"用不上"的数学，最后都变成了排错时判断"这到底是参数问题还是数据问题"的依据。
+
+技术会变：FAST-LIO 之后有 Point-LIO，Cartographer 之后有新的图优化框架，Nav2 也在持续演进。但"观测—模型—优化—验证"这套方法论不会变。希望这本书不只是让你会用某几个仓库，而是让你在面对一个从没见过的传感器或算法时，知道该问哪几个问题。
+
+\begin{summary}
+
+\begin{enumerate}
+  \item 学习路线分四段：0--1 月环境与概念、1--3 月里程计与 IMU、3--6 月 SLAM 与导航、6--12 月工程化与改进，每段都有"读什么、跑什么、做成什么、怎么过关"。
+  \item 代码阅读由简到繁：KISS-ICP $\to$ FAST-LIO2 $\to$ Point-LIO $\to$ Cartographer $\to$ Nav2 $\to$ Z-Localization；先画数据流，再精读核心函数。
+  \item 推荐的"少而精"资源：Probabilistic Robotics、State Estimation for Robotics、Sola 的 ESKF 文档、视觉 SLAM 十四讲，以及各仓库的 issue 区。
+  \item 工具链的核心是"能复现"：统一环境、固定 bag、用 evo 量化，任何改动都必须能回到同一段数据上验证。
+  \item 十条建议的核心可以压缩成三条：先跑通再改、一次只改一个变量、写文档。
+  \item 全书主线：观测—模型—优化—验证；技术会变，方法论不会。
+\end{enumerate}
+
+
+\end{summary}
+
+\begin{reading}
+
+\begin{itemize}
+  \item 第~\ref{ch:01-overview} 章与书末附录 A、B：全书的入口与速查工具，建议在按本章路线学习时反复回看。
+  \item 各开源仓库的 README 与 issue 区：KISS-ICP、FAST-LIO2、Point-LIO、Cartographer、Nav2、Z-Localization \cite{zloc2026}。遇到具体报错时先搜 issue。
+  \item \href{https://github.com/gaoxiang12/slambook2}{视觉 SLAM 十四讲}配套代码：若要做视觉惯性方向，这是最好的动手起点。
+\end{itemize}
+
+
+\end{reading}

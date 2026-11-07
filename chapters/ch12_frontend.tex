@@ -1,0 +1,370 @@
+% 本章使用 TikZ 的 arrows.meta / positioning 库（main.tex 与 tests 均已加载，此行幂等无害）
+\usetikzlibrary{arrows.meta, positioning}
+
+\chapter{SLAM 前端详解}\label{ch:12-frontend}
+
+\chapterintro{第~\ref{ch:11-slam-framework}~章把 SLAM 拆成了``造约束的前端''和``解约束的后端''。本章专门讲前端：它从传感器原始数据出发，经过预处理、数据关联、位姿估计、外点剔除、关键帧选取、局部地图维护，最终给后端交出一串可信的相对位姿约束。前端是整套系统里离传感器最近、也最容易出错的一环——后端的数学再漂亮，前端喂进去一条错误约束，整张地图照样会歪。本章会逐个环节讲清楚``它解决什么问题、怎么做、什么时候会失效''，重点讲透三件事：数据关联为什么是前端的心脏、为什么``帧到局部地图''比``帧到帧''稳、以及回环检测为什么属于前端而不属于后端。}
+
+\section{前端流水线}\label{sec:12-pipeline}
+
+一个典型的激光 SLAM 前端每收到一帧点云，都会走一遍图~\ref{fig:12-pipeline} 的流程。视觉前端结构类似，只是把``点云''换成``图像 + 特征''。
+
+\begin{figure}[htbp]
+  \centering
+  \begin{tikzpicture}[font=\footnotesize]
+    \node[block] (p1) at (0,0)    {预处理};
+    \node[block] (p2) at (2.8,0)  {数据关联};
+    \node[block] (p3) at (5.6,0)  {位姿估计};
+    \node[block] (p4) at (8.4,0)  {外点剔除};
+    \node[block] (p5) at (11.2,0) {关键帧判定};
+    \node[block, fill=black!5] (out) at (11.2,-1.9) {关键帧 + 约束};
+    \node[block] (lm)  at (2.8,-1.9) {局部地图};
+    \draw[arrow] (p1) -- (p2);
+    \draw[arrow] (p2) -- (p3);
+    \draw[arrow] (p3) -- (p4);
+    \draw[arrow] (p4) -- (p5);
+    \draw[arrow] (p5) -- (out);
+    \draw[arrow] (out) -- node[label,below]{加入窗口} (lm);
+    \draw[arrow] (lm) -- node[label,left,align=center]{匹配\\目标} (p2);
+  \end{tikzpicture}
+  \caption{SLAM 前端流水线。主链是``预处理 $\rightarrow$ 数据关联 $\rightarrow$ 位姿估计 $\rightarrow$ 外点剔除 $\rightarrow$ 关键帧判定''；下方闭环表示关键帧被加入局部地图窗口，成为下一帧匹配的目标。}\label{fig:12-pipeline}
+\end{figure}
+
+每一步的输入输出见表~\ref{tab:12-pipeline}。读源码时，只要能把一个函数映射到表里的某一行，就基本知道它在干什么。
+
+\begin{table}[htbp]
+  \centering
+  \caption{前端各环节的输入与输出}\label{tab:12-pipeline}
+  \small
+  \begin{tabular}{p{0.18\linewidth}p{0.36\linewidth}p{0.36\linewidth}}
+    \toprule
+    环节 & 输入 & 输出 \\
+    \midrule
+    预处理 & 原始 scan/图像、IMU、时间戳 & 去畸变点云、降采样点云、地面/动态点标记 \\
+    数据关联 & 当前帧 + 局部地图 & 点—点、点—面、点—体素对应关系 \\
+    位姿估计 & 对应关系 + 初值 & 当前帧相对位姿 $\hat{T}$ 及协方差 \\
+    外点剔除 & 对应关系 + 残差 & 内点集合、内点比例、是否跟踪失败 \\
+    关键帧判定 & 位姿、视角变化、观测新区域比例 & 是否为关键帧的布尔量 \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+为什么要拆成这么多步？因为每一步的\textbf{失败模式}不同，拆开才能分别监控、分别兜底。比如``内点比例骤降''是关联出了问题的信号，而``海森矩阵最小特征值过小''是几何退化（\S\ref{sec:12-fail}）的信号。把所有步骤揉成一个黑盒，出了问题就无从下手。
+
+\section{数据关联：前端的心脏}\label{sec:12-association}
+
+\begin{definition}[数据关联（工程视角）]
+在 SLAM 前端中，数据关联指：给当前帧中的每个观测（点、特征、整帧），在局部地图或历史帧中找到它所对应的那个物理实体，并给出对应关系集合 $\mathcal{C}=\{(i,j)\}$，其中 $i$ 是当前帧观测的编号，$j$ 是地图元素的编号。
+\end{definition}
+
+第~\ref{ch:11-slam-framework}~章已经说明关联错了后果严重，这里把它落到具体做法上。最常用的三种手段如下。
+
+\textbf{（1）最近邻（Nearest Neighbor，NN）。}对当前帧的每个点 $\bm{p}_i$，在局部地图里找欧氏距离最近的元素：
+\begin{equation}
+j^{\star}(i) = \argmin_{j}\ \norm{\bm{p}_i-\bm{q}_j}_2 ,
+\qquad \text{若}\ \norm{\bm{p}_i-\bm{q}_{j^{\star}}}_2 > \tau_d\ \text{则丢弃}.
+\label{eq:12-nn}
+\end{equation}
+式中 $\tau_d$ 是距离阈值，通常取``期待的最大位移加上若干倍点间距''。直接用 NN 的问题是对称性：点 $i$ 认为 $j$ 最近，但 $j$ 可能认为别的点更近。
+
+\textbf{（2）相互最近邻（Mutual NN，MNN）。}要求双向成立，即 $j^{\star}(i)=j$ 且 $i^{\star}(j)=i$ 才保留。这在两帧点密度接近时能剔除大量错误对应，代价是内点变少。
+
+\textbf{（3）RANSAC 外点剔除。}先随机抽最少的点对（2D 刚体变换最少 2 对，3D 最少 3 对）解出一个候选变换，统计有多少点对在该变换下残差小于阈值（内点），重复若干次取内点最多的一次。它能容忍高比例的错关联，代价是需要多次抽样。
+
+图~\ref{fig:12-badassoc} 展示了错误关联的破坏力：当机器人从侧面靠近时，由于初值不准，$A$ 墙上的点被错误地关联到 $B$ 墙，优化器为了``满足''这条约束，会把两堵墙拉近，于是在地图上出现一堵``重影墙''。
+
+\begin{figure}[htbp]
+  \centering
+  \begin{tikzpicture}[font=\footnotesize]
+    % legend
+    \fill[structurecolor] (0.35,3.55) circle (1.4pt);
+    \node[label, anchor=west] at (0.5,3.55) {当前帧观测};
+    \fill[red!60!black] (3.6,3.55) circle (1.4pt);
+    \node[label, anchor=west] at (3.75,3.55) {局部地图点};
+    % left: correct association
+    \draw[line width=3pt, black!25] (1.0,0) -- (1.0,3.0);
+    \node[label] at (1.0,-0.35) {同一面墙};
+    \foreach \y in {0.5,1.5,2.5}{
+      \fill[structurecolor] (0.72,\y) circle (1.4pt);
+      \fill[red!60!black] (1.28,\y) circle (1.4pt);
+      \draw[arrow] (0.72,\y) -- (1.28,\y);
+    }
+    \node[align=center] at (1.0,-1.05) {正确关联：\\箭头短且彼此一致};
+    % right: wrong association
+    \begin{scope}[xshift=6.4cm]
+    \draw[line width=3pt, black!25] (0,0) -- (0,3.0);
+    \draw[line width=3pt, black!25] (2.4,0) -- (2.4,3.0);
+    \node[label] at (0,-0.35) {墙 A};
+    \node[label] at (2.4,-0.35) {墙 B};
+    \fill[structurecolor] (-0.3,0.4) circle (1.4pt);
+    \fill[structurecolor] (-0.3,1.5) circle (1.4pt);
+    \fill[structurecolor] (-0.3,2.6) circle (1.4pt);
+    \fill[red!60!black] (2.7,0.4) circle (1.4pt);
+    \fill[red!60!black] (2.7,1.5) circle (1.4pt);
+    \fill[red!60!black] (2.7,2.6) circle (1.4pt);
+    \draw[arrow, red!60!black] (-0.3,0.4) -- (2.7,2.6);
+    \draw[arrow, red!60!black] (-0.3,1.5) -- (2.7,1.5);
+    \draw[arrow, red!60!black] (-0.3,2.6) -- (2.7,0.4);
+    \node[align=center, red!60!black] at (1.2,-1.05) {错误关联：\\A 墙的点被配到 B 墙};
+    \end{scope}
+  \end{tikzpicture}
+  \caption{左：正确关联——两次观测落在同一面墙上，对应箭头短且彼此一致；右：错误关联——初值偏差使 A 墙的观测点被配到 B 墙，对应箭头跨越两墙、互相交叉。后者会在优化中产生巨大残差，迫使轨迹或地图扭曲，形成``重影墙''。}\label{fig:12-badassoc}
+\end{figure}
+
+\begin{keybox}{前端的第一原则}
+前端的第一原则不是``算得准''，而是\textbf{``别把错误关联喂给后端''}。一条错误约束的破坏力，远大于十条正确约束的收益：正确约束只是让结果更精确一点，错误约束足以让整段轨迹塌陷。所以外点剔除、鲁棒核（第~\ref{ch:13-backend}~章）、回环几何校验这些``保险''，在工程上比提升匹配精度更重要。
+\end{keybox}
+
+\section{从``帧到帧''升级到``帧到局部地图''}\label{sec:12-ftm}
+
+第~\ref{ch:07-lidar-odom}~章讲的扫描匹配是帧到帧（frame-to-frame）：把当前帧和上一帧配准，得到两帧之间的相对位姿。这在里程计里够用，但在 SLAM 前端里不够，原因是误差会沿着链式匹配累积。
+
+假设每一帧匹配都有独立、零均值、标准差为 $\sigma$ 的误差。那么第 $k$ 帧相对第 0 帧的误差是 $k$ 个误差之和。由方差的可加性（独立随机变量之和的方差等于方差之和，见第~\ref{ch:02-math}~章）：
+\begin{equation}
+\Var\Big(\sum_{i=1}^{k}\epsilon_i\Big) = \sum_{i=1}^{k}\Var(\epsilon_i) = k\sigma^{2}
+\quad\Longrightarrow\quad
+\sigma_k = \sqrt{k}\,\sigma .
+\label{eq:12-drift}
+\end{equation}
+$k=100$ 时标准差已经放大 10 倍。这就是漂移的数学本质：误差按``随机游走''的方式增长。
+
+帧到局部地图（frame-to-map）改动了一个关键设定：\textbf{匹配目标不再是单帧，而是多帧融合成的局部地图}。于是问题变成``当前帧在该地图坐标系下处于什么位姿''，误差不沿着链传递。
+
+\begin{definition}[局部地图]
+局部地图（local map）是以当前位姿为中心、由最近若干个关键帧的观测融合而成的、用于当前帧匹配的地图子集。它只覆盖机器人附近的一小块区域，因而可以实时查询与更新。
+\end{definition}
+
+局部地图的工程组织方式有三种，各有取舍：
+\begin{itemize}
+  \item \textbf{滑动窗口}：保留最近 $N$ 个关键帧的原始点云，匹配时全部拼起来。实现最简单，内存随 $N$ 线性增长。
+  \item \textbf{体素地图}：把点云按体素栅格（\S\ref{sec:12-preprocess}）降采样后长期保存，查询时取当前位姿邻域的体素。内存可控，适合大场景。
+  \item \textbf{子图（submap）}：把连续若干帧融合成一张概率栅格（第~\ref{ch:15-cartographer}~章），匹配时直接对栅格做插值查询。Cartographer 用的就是它。
+\end{itemize}
+
+为什么帧到地图更稳？有三个原因。第一，\textbf{目标更``干净''}：多帧融合相当于对同一个表面做了平均，若 $n$ 次独立观测的噪声标准差为 $\sigma$，平均后降到 $\sigma/\sqrt{n}$。第二，\textbf{约束更多}：一帧只和上一帧比，只能约束两帧之间的相对关系；而帧到地图同时受地图中所有可见表面的约束。第三，\textbf{误差不进入目标}：帧到帧时，上一帧本身带着误差，等于用``错的东西''当基准；帧到地图时，基准是后端优化过的全局一致地图（或至少是融合后的局部地图），误差被摊平了。
+
+\begin{note}
+\textbf{帧到帧并非一无是处。}它不需要维护地图、计算量小，非常适合做``里程计''（第~\ref{ch:07-lidar-odom}~章），也常被用作帧到地图匹配的初值。实际系统里两者往往同时存在：先用帧到帧（或 IMU 预测）给出初值，再用帧到地图精化。
+\end{note}
+
+\section{关键帧策略}\label{sec:12-keyframe}
+
+\begin{definition}[关键帧]
+关键帧（keyframe）是从连续帧序列中挑选出的、代表局部观测的子集帧。只有关键帧参与地图维护与后端约束构建；非关键帧只用于帧间追踪，不进入优化。
+\end{definition}
+
+为什么要有关键帧？因为相邻帧之间信息高度冗余：机器人以 $0.5\ \mathrm{m/s}$ 运动、雷达 $10\ \mathrm{Hz}$ 时，相邻两帧只差 $5\ \mathrm{cm}$，把它们都塞进后端，节点数会爆炸而信息量几乎不增加。
+
+关键帧的触发条件通常有四类，工程上取它们的``或''：
+\begin{enumerate}
+  \item \textbf{平移足够大}：$\norm{\bm{t}_k-\bm{t}_{\mathrm{last}}}_2 > d_{\max}$，典型 $d_{\max}=0.5\sim1.0\ \mathrm{m}$；
+  \item \textbf{旋转足够大}：$\abs{\Delta\theta_k} > \theta_{\max}$，典型 $\theta_{\max}=10^{\circ}\sim20^{\circ}$（3D 时要分别看 roll/pitch/yaw 或转角轴）；
+  \item \textbf{时间足够长}：距上一关键帧超过 $t_{\max}$，典型 $0.5\sim2\ \mathrm{s}$，防止静止时长时间没有关键帧、导致地图更新停滞；
+  \item \textbf{信息量足够大}：当前帧观测到的``新区域''（从未见过的栅格/体素）占比超过阈值，或匹配协方差的迹（trace，见第~\ref{ch:02-math}~章）超过阈值。这条最接近本质，但实现最复杂。
+\end{enumerate}
+
+合起来写成一个判定式：
+\begin{equation}
+\text{新关键帧} \;\Longleftrightarrow\;
+\Big(\norm{\bm{t}_k-\bm{t}_{\mathrm{last}}}_2>d_{\max}\Big)\ \vee\
+\Big(\abs{\Delta\theta_k}>\theta_{\max}\Big)\ \vee\
+\Big(t_k-t_{\mathrm{last}}>t_{\max}\Big)\ \vee\
+\Big(\text{新区域占比}>\eta\Big).
+\label{eq:12-kf}
+\end{equation}
+式~\eqref{eq:12-kf} 中四个条件互相独立，工程上取``或''是为了在任意一种情况下都能及时更新地图：走得快时靠平移条件，原地转身时靠旋转条件，静止时靠时间条件，进入新房间时靠信息量条件。
+
+关键帧太多或太少都有问题，见表~\ref{tab:12-kf}。取值的``甜点''取决于场景：室内小场地 $0.5\ \mathrm{m}$ 一帧比较合适，大场地可以放宽到 $1\sim2\ \mathrm{m}$。
+
+\begin{table}[htbp]
+  \centering
+  \caption{关键帧数量对系统的影响}\label{tab:12-kf}
+  \small
+  \begin{tabular}{p{0.16\linewidth}p{0.36\linewidth}p{0.36\linewidth}}
+    \toprule
+    情形 & 好处 & 代价 \\
+    \midrule
+    关键帧过多 & 地图细节丰富、约束密集、回环易检测 & 后端节点多、优化变慢、内存与存储膨胀 \\
+    关键帧过少 & 后端轻量、优化快 & 约束稀疏、回环描述子区分度低、地图轮廓破碎 \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+\section{点云预处理}\label{sec:12-preprocess}
+
+预处理决定了``喂给匹配的数据质量''。这里讲三个最常用、也最影响效果的步骤。
+
+\subsection{体素降采样}
+
+原始雷达一帧可能有十万个点，直接匹配太慢。体素降采样（voxel grid downsampling）把空间切成边长为 $r$ 的小立方体（体素），每个体素只保留一个代表点。体素索引由坐标直接算出：
+\begin{equation}
+(i,j,k)=\left(\left\lfloor\frac{x-x_{\min}}{r}\right\rfloor,\;
+\left\lfloor\frac{y-y_{\min}}{r}\right\rfloor,\;
+\left\lfloor\frac{z-z_{\min}}{r}\right\rfloor\right),
+\label{eq:12-voxel-index}
+\end{equation}
+其中 $\lfloor\cdot\rfloor$ 是向下取整，$x_{\min},y_{\min},z_{\min}$ 是点云包围盒的最小角。同一体素内的点被划分为一组。
+
+代表点取体素质心，即
+\begin{equation}
+\bar{\bm{p}}_{ijk}=\frac{1}{n_{ijk}}\sum_{m=1}^{n_{ijk}}\bm{p}_m ,
+\label{eq:12-voxel-centroid}
+\end{equation}
+其中 $n_{ijk}$ 是该体素内的点数。为什么取质心而不是随便取一个点？因为质心是这个体素内所有点的最小二乘代表：我们要找一个点 $\bm{q}$，使得到体内所有点的距离平方和最小，
+\begin{equation}
+J(\bm{q})=\sum_{m=1}^{n}\norm{\bm{q}-\bm{p}_m}_2^{2}.
+\end{equation}
+对 $\bm{q}$ 求导并令其为零：
+\begin{equation}
+\frac{\partial J}{\partial \bm{q}}=2\sum_{m=1}^{n}\big(\bm{q}-\bm{p}_m\big)=\bm{0}
+\;\Longrightarrow\;
+n\bm{q}=\sum_{m=1}^{n}\bm{p}_m
+\;\Longrightarrow\;
+\bm{q}=\frac{1}{n}\sum_{m=1}^{n}\bm{p}_m .
+\end{equation}
+可见式~\eqref{eq:12-voxel-centroid} 不是``约定俗成''，而是``误差平方和最小''的直接结果。分辨率 $r$ 的取法：太小则降采样无效，太大则丢失结构，经验值是略大于点间距（如 $0.1\sim0.2\ \mathrm{m}$）。
+
+\subsection{地面分割（RANSAC 平面拟合）}
+
+地面点占一帧点云的很大比例，且对匹配帮助不大（平坦地面在任何水平平移下都能配上，反而会``吸住''错误的位姿），所以先把它分出来。最常用的方法是 RANSAC 拟合平面。
+
+平面用单位法向 $\bm{n}$ 和截距 $d$ 表示：$\bm{n}^{\top}\bm{p}=d$，$\norm{\bm{n}}=1$。取三个不共线的点 $\bm{p}_1,\bm{p}_2,\bm{p}_3$，法向由叉积给出：
+\begin{equation}
+\bm{n}=\frac{(\bm{p}_2-\bm{p}_1)\times(\bm{p}_3-\bm{p}_1)}
+{\norm{(\bm{p}_2-\bm{p}_1)\times(\bm{p}_3-\bm{p}_1)}},
+\qquad d=\bm{n}^{\top}\bm{p}_1 .
+\label{eq:12-plane}
+\end{equation}
+点到该平面的距离是 $\abs{\bm{n}^{\top}\bm{p}-d}$（因为 $\bm{n}$ 是单位向量，投影长度就是距离）。距离小于阈值 $\tau_p$ 的点称为内点。重复抽样 $k$ 次，取内点最多的平面作为地面。
+
+抽多少次才够？设内点占全体的比例为 $w$，一次抽样三个点都落在内点的概率是 $w^{3}$（近似认为独立），则 $k$ 次中都失败的概率为 $(1-w^{3})^{k}$，至少成功一次的概率为
+\begin{equation}
+P_{\mathrm{succ}}=1-(1-w^{3})^{k}.
+\end{equation}
+要求 $P_{\mathrm{succ}}\ge P_{0}$，解出
+\begin{equation}
+k\;\ge\;\frac{\log(1-P_{0})}{\log(1-w^{3})}.
+\label{eq:12-ransac-k}
+\end{equation}
+代入数字：若地面点占六成（$w=0.6$），要求 $P_0=0.99$，则 $1-w^{3}=1-0.216=0.784$，
+\begin{equation}
+k\ge\frac{\log 0.01}{\log 0.784}=\frac{-4.605}{-0.243}=18.9\;\Rightarrow\;k=19 .
+\end{equation}
+所以 20 次抽样就能以 99\% 的概率找到地面，这就是 RANSAC 快的原因。
+
+\subsection{去畸变与动态点剔除}
+
+激光雷达一帧的采集需要时间（$0.1\ \mathrm{s}$ 量级），机器人在这段时间里一直在动，于是``同一帧''里的点其实是在不同位姿下测到的——这就是运动畸变。去畸变要用 IMU 或匀速模型把每个点补偿到同一时刻，做法与第~\ref{ch:16-lio-evolution}~章相同。动态点（行人、另一个机器人、传送带）则会违反``环境静止''的假设，简单做法是检查该点在后几帧是否稳定存在，或直接用鲁棒核把大残差降权（第~\ref{ch:13-backend}~章）。
+
+\section{描述子与回环检测}\label{sec:12-loop}
+
+回环检测要回答一个全局问题：\textbf{当前帧是不是回到了很久以前来过的地方？}这属于``全局范围的数据关联''。它不能靠暴力匹配所有历史帧（太慢），所以要先算一个紧凑的``场景描述子''做粗筛，再做几何校验。
+
+激光 SLAM 里最常用的描述子之一是 Scan Context\cite{kim2018scancontext}。它的构造非常直观：把点云按极坐标切成 $N_r$ 个同心环（ring）、$N_s$ 个扇区（sector），得到一个 $N_r\times N_s$ 的矩阵，第 $(r,s)$ 个元素取落入该 bin 的所有点的最大高度：
+\begin{equation}
+I_{rs}=\max\Big\{\,z_k \;\Big|\; \frac{r-1}{N_r}R< \rho_k\le\frac{r}{N_r}R,\;
+\frac{2\pi(s-1)}{N_s}\le\varphi_k<\frac{2\pi s}{N_s}\Big\},
+\label{eq:12-scancontext}
+\end{equation}
+其中 $(\rho_k,\varphi_k,z_k)$ 是第 $k$ 个点的柱坐标，$R$ 是最大量程。若某 bin 没有点，取 $0$。图~\ref{fig:12-scancontext} 是它的示意。
+
+\begin{figure}[htbp]
+  \centering
+  \begin{tikzpicture}[font=\footnotesize]
+    \draw[thick, structurecolor] (0,0) circle (2.4);
+    \foreach \r in {0.6,1.2,1.8}
+      \draw[structurecolor!55] (0,0) circle (\r);
+    \foreach \a in {0,30,...,330}
+      \draw[structurecolor!40] (0,0) -- (\a:2.4);
+    \fill[structurecolor!35] (0:0.6) -- (30:0.6) arc (30:0:0.6) -- cycle;
+    \fill[structurecolor!35] (0:1.2) -- (30:1.2) arc (30:0:1.2) -- cycle;
+    \node[label] at (0,2.62) {环 $r$（径向距离）};
+    \node[label, align=center] at (0,-2.85) {扇区 $s$（方位角）};
+    \node[label, structurecolor] at (15:1.5) {bin $(r,s)$};
+  \end{tikzpicture}
+  \caption{Scan Context 的环—扇区划分。极坐标平面被切为 $N_r$ 个同心环与 $N_s$ 个扇区，每个 bin 记录该区域内点的最大高度，于是环境被压缩成一个 $N_r\times N_s$ 的矩阵描述子。}\label{fig:12-scancontext}
+\end{figure}
+
+为什么要这么切？因为\textbf{平移会让点云的笛卡尔坐标剧变，但旋转只会让极坐标矩阵的列发生循环移位}。所以比较两帧时，只需在列方向上做循环移位搜索：
+\begin{equation}
+D(I^{q},I^{c})=\min_{\delta\in\{0,1,\dots,N_s-1\}}
+\frac{1}{N_s}\sum_{s=1}^{N_s}\Big(1-\frac{\bm{c}^{q\top}_{s}\bm{c}^{c}_{s+\delta}}
+{\norm{\bm{c}^{q}_{s}}\norm{\bm{c}^{c}_{s+\delta}}}\Big),
+\label{eq:12-sc-distance}
+\end{equation}
+其中 $\bm{c}_s\in\R^{N_r}$ 是矩阵的第 $s$ 列，$\delta$ 是候选的列移位量，相当于``假设机器人转过 $\delta\cdot360^{\circ}/N_s$''；下标 $s+\delta$ 在超过 $N_s$ 时按模 $N_s$ 回绕（循环移位）。两列方向一致时余弦相似度为 1、距离为 0；正交时为 1。取所有移位中的最小值 $D$，若 $D$ 小于阈值，就认为``这两帧很可能在同一个地方''。
+
+\begin{keybox}{回环检测为什么属于前端}
+回环检测的本质是\textbf{数据关联}——判断``这两帧观测的是不是同一个地方''，其输出是一条相对位姿约束（回环边），交给后端去优化。它不负责改轨迹，只负责``提出并校验假设''。把它放到后端会有两个问题：一是后端要接触原始点云，破坏了``前端造因子、后端解因子''的接口；二是回环检测必须按帧执行（频率高），而后端是低频的。所以正确划分是：\textbf{回环检测归前端，回环优化归后端。}
+\end{keybox}
+
+Scan Context 只是粗筛：$D$ 小不代表真是回环（相似的走廊、对称的房间都会骗过它），还必须做几何校验。典型做法是用粗筛给出的位姿作初值，做一次 ICP/NDT（第~\ref{ch:07-lidar-odom}~章）或分支定界搜索（第~\ref{ch:15-cartographer}~章），用匹配得分与内点比例确认；校验不过就丢掉这个候选。
+
+\section{前端的失效模式}\label{sec:12-fail}
+
+前端失效是 SLAM 最常见的故障来源。表~\ref{tab:12-fail} 把四类典型失效整理成``场景—信号—对策''，工程上可以照着做监控。
+
+\begin{table}[htbp]
+  \centering
+  \caption{前端典型失效模式与对策}\label{tab:12-fail}
+  \footnotesize
+  \begin{tabular}{p{0.13\linewidth}p{0.20\linewidth}p{0.31\linewidth}p{0.26\linewidth}}
+    \toprule
+    失效类型 & 典型场景 & 可观测信号 & 对策 \\
+    \midrule
+    几何退化 & 长走廊、隧道、空旷场地：某一方向没有约束 & 海森矩阵最小特征值接近 0、条件数骤增、匹配得分对该方向不敏感 & 引入 IMU 强约束、对该方向降权或锁定、切换匹配特征 \\
+    动态物体 & 行人、对方机器人、传送带 & 内点比例骤降、残差分布重尾、匹配得分忽高忽低 & 动态点剔除、鲁棒核降权、多帧一致性检验 \\
+    传感器失效 & 遮挡、强光、雨雾、断流 & 点数骤减、强度分布异常、时间戳不连续 & 健康检查、故障切换、用运动模型预测维持 \\
+    时间不同步 & 多传感器融合、急加速 & 残差随速度增大、标定外参漂移 & 硬件触发同步/PTP、在线估计时延、重新标定 \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+\textbf{几何退化}值得单独强调，因为它最隐蔽：机器人走在一条笔直的长走廊里，两侧墙壁平行，前后方向几乎没有可区分的结构，于是这个方向的位姿是``不可观''的。此时匹配照样会给出一个数，但这个数完全不可信。检测方法是对海森矩阵做特征值分解，若最小特征值 $\lambda_{\min}$ 太小（相对于最大特征值 $\lambda_{\max}$），就说明该方向退化。对策是``承认自己不知道''：在这个方向上相信 IMU 或保持上一时刻的估计，而不是相信匹配结果。
+
+\begin{pseudo}{前端单帧处理主循环}
+  \item 读取一帧点云、IMU 与时间戳，做时间同步
+  \item 去畸变，体素降采样，地面分割，标记动态点
+  \item 用 IMU 或匀速模型预测当前位姿作为初值
+  \item 在局部地图中按最近邻建立对应关系，用距离阈值粗筛
+  \item 以初值为起点迭代求解位姿（扫描匹配），期间用鲁棒核降权
+  \item 统计内点比例：低于阈值则判定跟踪失败，进入重定位流程
+  \item 检查海森矩阵条件数：过大则标记该方向退化，切换融合策略
+  \item 按式~\eqref{eq:12-kf} 判定是否生成关键帧
+  \item 若是关键帧：加入局部地图窗口，计算描述子并检索回环候选
+  \item 把相对位姿约束与回环候选发送给后端
+\end{pseudo}
+
+\begin{summary}
+\begin{enumerate}
+  \item 前端流水线是``预处理 $\rightarrow$ 数据关联 $\rightarrow$ 位姿估计 $\rightarrow$ 外点剔除 $\rightarrow$ 关键帧判定''（图~\ref{fig:12-pipeline}），分步的目的是让每类失败都可监控、可兜底。
+  \item 数据关联是前端的心脏，常用 NN（式~\eqref{eq:12-nn}）、MNN、RANSAC 三件套；一条错误关联的破坏力大于十条正确关联的收益。
+  \item 帧到帧匹配的误差按 $\sqrt{k}$ 放大（式~\eqref{eq:12-drift}）；帧到局部地图匹配把目标换成多帧融合地图，噪声按 $\sigma/\sqrt{n}$ 降低，且误差不进入匹配目标，所以更稳。
+  \item 关键帧由平移、旋转、时间、信息量四类条件触发（式~\eqref{eq:12-kf}），数量过多与过少都有代价（表~\ref{tab:12-kf}）。
+  \item 体素降采样用式~\eqref{eq:12-voxel-index} 划分、式~\eqref{eq:12-voxel-centroid} 代表，质心是``误差平方和最小''的解；RANSAC 平面拟合的抽样次数由式~\eqref{eq:12-ransac-k} 决定。
+  \item Scan Context 把点云压成``环—扇区''矩阵（式~\eqref{eq:12-scancontext}），用列移位最小距离（式~\eqref{eq:12-sc-distance}）做旋转不变的粗筛，再用几何校验确认。
+  \item 回环检测属于前端（全局数据关联），回环优化属于后端；前端典型失效有几何退化、动态物体、传感器失效、时间不同步四类（表~\ref{tab:12-fail}）。
+\end{enumerate}
+
+
+\end{summary}
+
+\begin{problemset}
+  \item 设每帧匹配误差标准差 $\sigma=1\ \mathrm{cm}$，$k=400$ 帧后按式~\eqref{eq:12-drift} 的标准差是多少？若改成帧到地图匹配、局部地图由 $n=9$ 帧融合，目标噪声标准差降为多少？两者相差几个数量级？
+  \item 在式~\eqref{eq:12-nn} 中，如果 $\tau_d$ 取得过大和过小分别会发生什么？请结合``重影墙''现象说明。
+  \item 为什么 RANSAC 的抽样次数只与内点比例 $w$ 有关，而与点的总数无关？这个结论在什么条件下不成立？
+  \item Scan Context 的列移位为什么能处理旋转、却处理不了明显的平移？如果两帧之间存在较大平移，$D$ 会怎样变化？
+  \item 机器人走在长走廊里，匹配器仍然输出了位姿。你会用哪些信号判断它其实已经退化？请给出至少两个可计算的指标。
+  \item 把表~\ref{tab:12-fail} 中``动态物体''一行扩写成一段伪代码：你会怎样判断一个点是不是动态点？
+\end{problemset}
+
+\begin{reading}
+\begin{enumerate}
+  \item Kim \& Kim, ``Scan Context''\cite{kim2018scancontext}：本章回环描述子的原始论文，重点看第三节的列移位距离与第四节的候选校验。
+  \item 第~\ref{ch:07-lidar-odom}~章：扫描匹配与 ICP/NDT 的完整推导，本章默认你已经掌握，只做了``升级''讨论。
+  \item Cartographer 论文\cite{hess2016cartographer} 的前端部分：帧到子图匹配的工业级实现，可与本章 \S\ref{sec:12-ftm} 对照阅读。
+  \item FAST-LIO2\cite{xu2022fastlio2}：直接法前端的代表，看看``不做特征提取''时数据关联如何组织。
+\end{enumerate}
+
+
+\end{reading}
