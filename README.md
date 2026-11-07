@@ -1,7 +1,7 @@
 # 定位与导航技术文档
 
 基于 [ElegantLaTeX/ElegantBook](https://github.com/ElegantLaTeX/ElegantBook) 模板编写的中文教材，
-面向 RoboMaster 算法组新队员，由浅入深讲解定位、建图与导航。
+面向 RoboMaster C·ONE 战队算法组新队员，由浅入深讲解定位、建图与导航。
 
 - **成书**：`定位与导航技术文档.pdf`（A4，约 237 页，30 章 + 2 个附录）
 - **模板**：ElegantBook 4.7（`elegantbook.cls` 已随项目附带）

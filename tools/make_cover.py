@@ -160,7 +160,7 @@ def make_cover():
 
     # 底部信息
     d.line([(140, H - 360), (W - 140, H - 360)], fill=(90, 200, 215, 70), width=1)
-    d.text((140, H - 320), "算法组  ·  RoboMaster", font=f_meta, fill=(190, 215, 230))
+    d.text((140, H - 320), "C·ONE 战队  ·  算法组", font=f_meta, fill=(190, 215, 230))
     d.text((W - 140, H - 320), "2026.11", font=f_meta, fill=(190, 215, 230), anchor="ra")
     d.text((140, H - 250),
            "FAST-LIO2 / Point-LIO / Cartographer / Nav2 / Z-Localization",
